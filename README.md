@@ -98,34 +98,27 @@ schreibt den Zustand nie.
 
 ## Auf dem Raspberry Pi einrichten
 
-Python 3.10+ ist auf Raspberry Pi OS (Bookworm) vorinstalliert, weitere Pakete
-braucht es nicht.
+**➜ Ausführliche Schritt-für-Schritt-Anleitung: [docs/RASPBERRY-PI.md](docs/RASPBERRY-PI.md)**
 
-### 1. Ablegen
+Dort steht alles von der Zeitzone über die SMTP-Konfiguration bis zur
+Fehlersuche. Die Kurzfassung für Ungeduldige:
 
 ```bash
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin securityfeed
 sudo install -d -m 0755 /opt/securityfeed
 sudo install -m 0755 vulnfeed.py /opt/securityfeed/vulnfeed.py
-```
-
-### 2. Zugangsdaten hinterlegen
-
-```bash
 sudo install -d -m 0750 -o root -g securityfeed /etc/securityfeed
 sudo install -m 0640 -o root -g securityfeed deploy/securityfeed.env.example /etc/securityfeed/securityfeed.env
 sudo nano /etc/securityfeed/securityfeed.env
 ```
 
-`0640 root:securityfeed` heißt: der Dienst darf lesen, sonst niemand außer root.
-
-### 3. Testlauf als Service-User
+Testen, ohne zu verschicken:
 
 ```bash
-sudo -u securityfeed env $(grep -v '^#' /etc/securityfeed/securityfeed.env | xargs) python3 /opt/securityfeed/vulnfeed.py --email --dry-run --since 2
+sudo -u securityfeed python3 /opt/securityfeed/vulnfeed.py --env-file /etc/securityfeed/securityfeed.env --email --dry-run --since 2
 ```
 
-### 4. Timer aktivieren
+Timer aktivieren:
 
 ```bash
 sudo install -m 0644 deploy/securityfeed.service deploy/securityfeed.timer /etc/systemd/system/
@@ -133,20 +126,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now securityfeed.timer
 ```
 
-Voreingestellt sind Mo–Fr um 07:00 und 17:00 mit bis zu 5 Minuten zufälliger
+Voreingestellt sind täglich 07:00 und 18:00 mit bis zu 5 Minuten zufälliger
 Verzögerung. `Persistent=true` holt einen Lauf nach, wenn der Pi zum Zeitpunkt
-aus war. Anpassen in `securityfeed.timer`, dann `daemon-reload` und
-`systemctl restart securityfeed.timer`.
-
-### Kontrollieren
-
-```bash
-systemctl list-timers securityfeed.timer
-```
-
-```bash
-sudo systemctl start securityfeed.service && journalctl -u securityfeed.service -n 30 --no-pager
-```
+aus war.
 
 ### Alternative: cron
 

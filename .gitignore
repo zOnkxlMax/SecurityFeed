@@ -10,7 +10,9 @@ venv/
 !*.env.example
 seen.json
 
-# Generierte Reports
-*.json
-*.md
-!README.md
+# Generierte Reports - nur der Ausgabeordner, damit Doku nicht versehentlich
+# ausgeschlossen wird.
+/out/
+report*.json
+report*.md
+vulns.json

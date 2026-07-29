@@ -1,0 +1,342 @@
+# SecurityFeed auf dem Raspberry Pi: früh und abends eine Mail
+
+Schritt-für-Schritt-Anleitung. Am Ende schickt dir der Pi täglich um 07:00 und
+18:00 eine Mail mit den neuen Schwachstellen-Meldungen — ohne Wiederholungen,
+weil sich das Tool merkt, was es schon gemeldet hat.
+
+Rechne mit 15–20 Minuten.
+
+---
+
+## Was du vorher brauchst
+
+**Auf dem Pi:** Raspberry Pi OS Bookworm oder neuer. Python 3.11 ist dort
+vorinstalliert, weitere Pakete braucht es nicht. Prüfen:
+
+```bash
+python3 --version
+```
+
+Alles ab 3.10 ist in Ordnung.
+
+**Von deinem Mailserver** — das ist der Teil, den nur du beschaffen kannst.
+Leg dir diese fünf Angaben bereit:
+
+| Angabe | Beispiel | Woher |
+| --- | --- | --- |
+| Relay-Hostname | `smtp.firma.de` | IT / Mailprovider |
+| Port | `587` | siehe Tabelle unten |
+| Verschlüsselung | `starttls` | siehe Tabelle unten |
+| Benutzer + Passwort | `feed@firma.de` | entfällt bei internem Relay |
+| Absenderadresse | `pi@firma.de` | muss das Relay akzeptieren |
+
+Falls du unsicher bist, welcher Fall bei dir zutrifft:
+
+| Situation | Port | `SECFEED_SMTP_SECURITY` | Anmeldung |
+| --- | --- | --- | --- |
+| Internes Relay im Firmen-/Heimnetz | `25` | `none` | keine |
+| Provider mit STARTTLS (Standardfall) | `587` | `starttls` | ja |
+| Provider mit implizitem TLS | `465` | `ssl` | ja |
+| Microsoft 365 | `587` | `starttls` | ja, App-Passwort |
+| Gmail | `587` | `starttls` | ja, App-Passwort |
+
+> Bei Microsoft 365 und Gmail funktioniert dein normales Anmeldepasswort **nicht**.
+> Beide verlangen ein separat erzeugtes App-Passwort, und bei M365 muss die
+> SMTP-Authentifizierung für das Postfach überhaupt erst freigeschaltet sein —
+> sie ist bei neuen Tenants standardmäßig aus. Das klärst du im jeweiligen
+> Admin-Portal, bevor du hier weitermachst.
+
+---
+
+## Schritt 1: Zeitzone des Pi prüfen
+
+Der Timer feuert in der **lokalen** Zeit des Pi. Steht der auf UTC, kommt die
+„Morgenmail" im Sommer um 09:00.
+
+```bash
+timedatectl
+```
+
+Steht dort nicht `Europe/Berlin`, korrigieren:
+
+```bash
+sudo timedatectl set-timezone Europe/Berlin
+```
+
+---
+
+## Schritt 2: Programm auf den Pi kopieren
+
+SecurityFeed ist eine einzige Datei ohne Abhängigkeiten. Der einfachste Weg ist
+`scp` von deinem Windows-Rechner aus — dann brauchst du auf dem Pi keine
+GitHub-Zugangsdaten:
+
+```powershell
+scp "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed\vulnfeed.py" pi@raspberrypi.local:/tmp/
+```
+
+Ebenso die drei Dateien aus `deploy/`:
+
+```powershell
+scp "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed\deploy\*" pi@raspberrypi.local:/tmp/
+```
+
+<details>
+<summary>Alternative: per <code>git clone</code> vom Pi aus</summary>
+
+Das Repo ist **privat**, ein einfaches `git clone` schlägt darum fehl. Du
+bräuchtest ein Personal Access Token oder einen Deploy Key auf dem Pi. Für eine
+einzelne Datei ist das unnötiger Aufwand und legt zusätzlich GitHub-Zugriff auf
+ein Gerät, das nur Mails verschicken soll. Nimm `scp`, außer du willst den Pi
+später per `git pull` aktualisieren.
+
+</details>
+
+Jetzt auf dem Pi an den endgültigen Platz legen:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin securityfeed
+sudo install -d -m 0755 /opt/securityfeed
+sudo install -m 0755 /tmp/vulnfeed.py /opt/securityfeed/vulnfeed.py
+```
+
+Der eigene Systembenutzer sorgt dafür, dass der Dienst nicht als `root` läuft
+und nur an sein eigenes Zustandsverzeichnis kommt.
+
+---
+
+## Schritt 3: Zugangsdaten eintragen — das musst du anpassen
+
+Vorlage kopieren:
+
+```bash
+sudo install -d -m 0750 -o root -g securityfeed /etc/securityfeed
+sudo install -m 0640 -o root -g securityfeed /tmp/securityfeed.env.example /etc/securityfeed/securityfeed.env
+sudo nano /etc/securityfeed/securityfeed.env
+```
+
+Die Rechte `0640 root:securityfeed` bedeuten: root darf schreiben, der Dienst
+darf lesen, alle anderen Benutzer auf dem Pi kommen nicht an das Passwort.
+
+Trage deine Werte ein:
+
+```bash
+SECFEED_SMTP_HOST=smtp.firma.de
+SECFEED_SMTP_PORT=587
+SECFEED_SMTP_SECURITY=starttls
+SECFEED_SMTP_USER=feed@firma.de
+SECFEED_SMTP_PASSWORD=dein-app-passwort
+SECFEED_MAIL_FROM=feed@firma.de
+SECFEED_MAIL_TO=max@firma.de
+SECFEED_SUBJECT_PREFIX=[SecurityFeed]
+```
+
+**Hast du ein internes Relay ohne Anmeldung?** Dann `SECFEED_SMTP_USER` und
+`SECFEED_SMTP_PASSWORD` auskommentiert lassen. Ohne gesetzten Benutzer versucht
+das Tool gar keine Anmeldung — genau das wollen offene Relays.
+
+**Mehrere Empfänger?** Mit Komma trennen:
+
+```bash
+SECFEED_MAIL_TO=max@firma.de,security@firma.de
+```
+
+---
+
+## Schritt 4: Testen, ohne etwas zu verschicken
+
+Erst der Trockenlauf. Er baut die komplette Mail und gibt sie aus, verschickt
+aber nichts und fasst den Zustand nicht an:
+
+```bash
+sudo -u securityfeed python3 /opt/securityfeed/vulnfeed.py --env-file /etc/securityfeed/securityfeed.env --email --dry-run --since 2
+```
+
+Du solltest einen `Subject:`-Header, deine Adressen und darunter die Meldungen
+sehen. Kommt stattdessen `Mailversand nicht konfiguriert`, fehlt ein Wert in der
+env-Datei. Kommt `Permission denied`, stimmen die Rechte aus Schritt 3 nicht.
+
+Wenn das passt, ein **echter** Testversand:
+
+```bash
+sudo -u securityfeed python3 /opt/securityfeed/vulnfeed.py --env-file /etc/securityfeed/securityfeed.env --email --since 2 --no-state
+```
+
+`--no-state` sorgt dafür, dass dieser Test nichts als „schon gemeldet" markiert.
+Schau in dein Postfach — inklusive Spam-Ordner, die erste Mail von einer neuen
+Absenderadresse landet gern dort.
+
+Erst weitermachen, wenn diese Mail angekommen ist.
+
+---
+
+## Schritt 5: Zeitplan einrichten
+
+```bash
+sudo install -m 0644 /tmp/securityfeed.service /tmp/securityfeed.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now securityfeed.timer
+```
+
+Fertig. Voreingestellt sind **täglich 07:00 und 18:00**.
+
+### Zeiten ändern
+
+```bash
+sudo systemctl edit --full securityfeed.timer
+```
+
+Die `OnCalendar`-Zeilen addieren sich, du kannst also beliebig viele angeben:
+
+| Wunsch | Zeilen |
+| --- | --- |
+| Früh und abends (Standard) | `OnCalendar=*-*-* 07:00:00`<br>`OnCalendar=*-*-* 18:00:00` |
+| Nur werktags | `OnCalendar=Mon..Fri 07:00`<br>`OnCalendar=Mon..Fri 18:00` |
+| Nur einmal morgens | `OnCalendar=*-*-* 07:00:00` |
+| Stündlich | `OnCalendar=hourly` |
+
+Danach immer:
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart securityfeed.timer
+```
+
+Ob deine Zeitangabe stimmt, verrät dir systemd vorab:
+
+```bash
+systemd-analyze calendar "*-*-* 07:00:00" --iterations 3
+```
+
+### Zwei Einstellungen, die du kennen solltest
+
+`RandomizedDelaySec=300` in der Timer-Datei verzögert den Start um bis zu fünf
+Minuten. Die Mail kommt also zwischen 07:00 und 07:05 — gewollt, damit nicht
+alle Installationen gleichzeitig auf die Feeds losgehen. Wer es auf die Minute
+genau will, setzt den Wert auf `0`.
+
+`Persistent=true` holt einen verpassten Lauf nach, sobald der Pi wieder läuft.
+War er über Nacht aus, bekommst du die Morgenmail beim Hochfahren.
+
+---
+
+## Schritt 6: Kontrollieren
+
+Wann läuft es das nächste Mal?
+
+```bash
+systemctl list-timers securityfeed.timer
+```
+
+Einen Lauf sofort auslösen, ohne auf 07:00 zu warten:
+
+```bash
+sudo systemctl start securityfeed.service
+```
+
+Was ist beim letzten Lauf passiert?
+
+```bash
+journalctl -u securityfeed.service -n 30 --no-pager
+```
+
+---
+
+## Wie das mit den Wiederholungen funktioniert
+
+Zwei Mechanismen greifen ineinander, und es hilft, den Unterschied zu kennen:
+
+**`--since 2`** begrenzt, wie weit zurück überhaupt geschaut wird — hier zwei
+Tage. Das ist der Puffer, falls ein Lauf ausfällt.
+
+**Der Zustand** in `/var/lib/securityfeed/seen.json` merkt sich jeden bereits
+gemeldeten Link (die letzten 2000). Deshalb bekommst du abends nur, was seit dem
+Morgen dazugekommen ist, obwohl das Zeitfenster zwei Tage umfasst.
+
+Gab es nichts Neues, verschickt der Lauf **keine** Mail. Willst du stattdessen
+eine „nichts los"-Meldung, hänge `--send-empty` in der Service-Datei an.
+
+Gespeichert wird erst **nach** erfolgreichem Versand. Ist dein Relay morgens
+kurz weg, gehen die Meldungen nicht verloren — sie kommen abends mit.
+
+---
+
+## Was du sonst noch anpassen kannst
+
+Alles in der `ExecStart`-Zeile, erreichbar über:
+
+```bash
+sudo systemctl edit --full securityfeed.service
+```
+
+| Wunsch | Änderung |
+| --- | --- |
+| Nur deutsche Advisories | `--source heise-alerts` ergänzen |
+| Nur Meldungen mit CVE-Nummer | `--details` durch `--cve-only` ersetzen |
+| Schneller, ohne CVE-Nummern | `--details` streichen |
+| Größeres Zeitfenster | `--since 2` auf `--since 7` |
+| Höchstens 10 Meldungen pro Mail | `--limit 10` ergänzen |
+| Auch Nicht-Schwachstellen-News | `--all` ergänzen |
+
+Nach jeder Änderung:
+
+```bash
+sudo systemctl daemon-reload
+```
+
+---
+
+## Wenn etwas nicht klappt
+
+| Symptom | Ursache und Lösung |
+| --- | --- |
+| `Mailversand nicht konfiguriert` | Wert fehlt in der env-Datei. Die Meldung listet auf, welcher. |
+| `Connection refused` | Falscher Port oder Relay nicht erreichbar. Test: `nc -vz smtp.firma.de 587` |
+| `authentication failed` | Bei M365/Gmail ein App-Passwort nötig, nicht das Anmeldepasswort. Bei M365 zusätzlich SMTP-AUTH fürs Postfach freischalten. |
+| `STARTTLS extension not supported` | Relay will kein STARTTLS. Auf `none` (Port 25) oder `ssl` (Port 465) wechseln. |
+| `relay access denied` | Das Relay akzeptiert deine `SECFEED_MAIL_FROM`-Adresse nicht. Absender auf eine erlaubte Domain ändern. |
+| Timer läuft, aber keine Mail | Meist schlicht: nichts Neues. Prüfen mit `journalctl -u securityfeed.service -n 20` |
+| Mail kommt zur falschen Zeit | Zeitzone des Pi, siehe Schritt 1. |
+| Erste Mail nie angekommen | Spam-Ordner prüfen, dann `journalctl` lesen. |
+| Timer taucht nicht auf | `sudo systemctl enable --now securityfeed.timer` vergessen. |
+
+Detaillierter Blick auf den letzten Lauf, inklusive Exit-Code:
+
+```bash
+systemctl status securityfeed.service
+```
+
+Die Exit-Codes bedeuten: `0` alles gut, `1` harter Fehler (keine Quelle
+erreichbar oder Versand gescheitert), `2` Konfigurationsfehler, `3` Lauf
+erfolgreich, aber eine einzelne Quelle war nicht erreichbar.
+
+---
+
+## Später aktualisieren
+
+Neue Version von Windows aus einspielen:
+
+```powershell
+scp "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed\vulnfeed.py" pi@raspberrypi.local:/tmp/
+```
+
+```bash
+sudo install -m 0755 /tmp/vulnfeed.py /opt/securityfeed/vulnfeed.py
+```
+
+Ein Neustart des Timers ist nicht nötig — der nächste Lauf nimmt automatisch die
+neue Datei.
+
+## Wieder abschalten
+
+```bash
+sudo systemctl disable --now securityfeed.timer
+```
+
+Vollständig entfernen:
+
+```bash
+sudo rm /etc/systemd/system/securityfeed.{service,timer}
+sudo rm -rf /opt/securityfeed /etc/securityfeed /var/lib/securityfeed
+sudo systemctl daemon-reload
+sudo userdel securityfeed
+```

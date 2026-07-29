@@ -3,9 +3,12 @@ Description=SecurityFeed taeglich ausfuehren
 Documentation=https://github.com/zOnkxlMax/SecurityFeed
 
 [Timer]
-# Werktags 07:00 und 17:00. Fuer nur einmal taeglich: OnCalendar=*-*-* 07:00:00
-OnCalendar=Mon..Fri 07:00
-OnCalendar=Mon..Fri 17:00
+# Taeglich frueh und abends. Mehrere OnCalendar-Zeilen addieren sich.
+# Nur werktags stattdessen:  OnCalendar=Mon..Fri 07:00
+# Nur einmal taeglich:       nur die erste Zeile stehen lassen
+# ACHTUNG: gilt in der lokalen Zeitzone des Pi - vorher timedatectl pruefen.
+OnCalendar=*-*-* 07:00:00
+OnCalendar=*-*-* 18:00:00
 
 # War der Pi zum Zeitpunkt aus, wird der Lauf beim naechsten Boot nachgeholt.
 Persistent=true
