@@ -1,0 +1,44 @@
+[Unit]
+Description=SecurityFeed - Schwachstellen-Meldungen per Mail
+Documentation=https://github.com/zOnkxlMax/SecurityFeed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=securityfeed
+Group=securityfeed
+
+# Zugangsdaten fuer das SMTP-Relay. Datei muss root:securityfeed 0640 gehoeren.
+EnvironmentFile=/etc/securityfeed/securityfeed.env
+
+# Legt /var/lib/securityfeed an und uebergibt es dem Service-User.
+StateDirectory=securityfeed
+Environment=SECFEED_STATE=/var/lib/securityfeed/seen.json
+
+ExecStart=/usr/bin/python3 /opt/securityfeed/vulnfeed.py --email --since 2 --details --quiet
+
+# Exit 3 = Lauf war erfolgreich, aber eine einzelne Quelle war nicht erreichbar.
+# Soll den Timer nicht als "failed" markieren.
+SuccessExitStatus=3
+
+TimeoutStartSec=300
+
+# Haertung - das Tool braucht nur Netzwerk und sein State-Verzeichnis.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

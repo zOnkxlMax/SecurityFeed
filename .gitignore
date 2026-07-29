@@ -5,6 +5,11 @@ venv/
 .vscode/
 .idea/
 
+# Zugangsdaten - niemals committen
+*.env
+!*.env.example
+seen.json
+
 # Generierte Reports
 *.json
 *.md

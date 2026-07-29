@@ -1,0 +1,19 @@
+[Unit]
+Description=SecurityFeed taeglich ausfuehren
+Documentation=https://github.com/zOnkxlMax/SecurityFeed
+
+[Timer]
+# Werktags 07:00 und 17:00. Fuer nur einmal taeglich: OnCalendar=*-*-* 07:00:00
+OnCalendar=Mon..Fri 07:00
+OnCalendar=Mon..Fri 17:00
+
+# War der Pi zum Zeitpunkt aus, wird der Lauf beim naechsten Boot nachgeholt.
+Persistent=true
+
+# Nicht alle Installationen exakt zur vollen Stunde auf die Feeds loslassen.
+RandomizedDelaySec=300
+
+Unit=securityfeed.service
+
+[Install]
+WantedBy=timers.target
