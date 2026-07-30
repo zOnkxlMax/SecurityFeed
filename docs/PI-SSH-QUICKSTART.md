@@ -311,6 +311,8 @@ erhalten, es kommen keine Wiederholungen.
 | `permission denied while trying to connect to the Docker daemon` | Block B nicht abgeschlossen — neu anmelden nach `usermod`. |
 | `env file .env not found` | Block D übersprungen. |
 | `Mailversand nicht konfiguriert` | Wert fehlt in der `.env`. Die Meldung nennt welchen. |
+| `No address associated with hostname` / `Name or service not known` | DNS: der Hostname löst nicht auf. Siehe Abschnitt unten. |
+| `Es stehen noch Beispielwerte` | Die `.env` enthält unveränderte Werte aus der Vorlage. |
 | `Connection refused` | Falscher Port oder Relay nicht erreichbar. |
 | `authentication failed` | App-Passwort nötig, nicht das Anmeldepasswort. |
 | `STARTTLS extension not supported` | Relay will kein STARTTLS — auf `none` (25) oder `ssl` (465) wechseln. |
@@ -326,3 +328,58 @@ Vollständige Diagnose der Konfiguration, ohne etwas zu starten:
 ```bash
 cd ~/securityfeed && docker compose config
 ```
+
+### Hostname löst nicht auf
+
+`No address associated with hostname` bedeutet: DNS liefert keine IP. Anmeldung,
+Port und Firewall sind daran unbeteiligt.
+
+Erst schauen, was überhaupt konfiguriert ist:
+
+```bash
+grep -v PASSWORD ~/securityfeed/.env
+```
+
+Steht dort noch `smtp.firma.de` aus der Vorlage, ist das die Ursache — dieser
+Name existiert nicht. Sonst prüfen, ob der Pi ihn auflösen kann:
+
+```bash
+getent hosts DEIN-RELAY-HOSTNAME
+```
+
+Kommt nichts, liegt es nicht am Container. Dann ist der Name falsch geschrieben,
+oder er löst nur im Firmennetz auf und der Pi hängt woanders.
+
+Löst der Pi ihn auf, der Container aber nicht, teste dort direkt:
+
+```bash
+cd ~/securityfeed && docker compose run --rm --entrypoint getent securityfeed hosts DEIN-RELAY-HOSTNAME
+```
+
+Der typische Grund für „Host ja, Container nein" ist ein **kurzer Hostname**, der
+auf dem Pi nur über eine Suchdomain funktioniert. Zwei Auswege — entweder den
+vollqualifizierten Namen verwenden:
+
+```bash
+SECFEED_SMTP_HOST=relay.intern.firma.de
+```
+
+oder die Suchdomain in einer `compose.override.yaml` nachreichen:
+
+```yaml
+services:
+  securityfeed:
+    dns_search:
+      - intern.firma.de
+```
+
+Wenn der Relay überhaupt keinen DNS-Namen hat, geht auch die IP direkt:
+
+```bash
+SECFEED_SMTP_HOST=192.168.1.25
+```
+
+Bei `starttls` oder `ssl` schlägt dann allerdings die Zertifikatsprüfung fehl,
+weil das Zertifikat auf den Namen ausgestellt ist und nicht auf die IP. Für ein
+Relay im eigenen Netz ist in dem Fall `SECFEED_SMTP_SECURITY=none` mit Port `25`
+der übliche Weg.

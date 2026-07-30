@@ -318,6 +318,8 @@ es kommen also keine Wiederholungen.
 | Container startet immer neu | `SECFEED_SCHEDULE` fehlt oder ist leer. Ohne Zeitplan endet der Prozess nach einem Lauf und `restart: unless-stopped` startet ihn erneut. Prüfen mit `docker compose config`. |
 | Log zeigt `UTC` statt `CEST` | `TZ` in `compose.yaml` nicht gesetzt, oder das Image wurde ohne `tzdata` gebaut. Neu bauen mit `docker compose build --no-cache`. |
 | `env file .env not found` | Schritt 2 vergessen: `cp .env.example .env` |
+| `No address associated with hostname` | DNS: der Name löst nicht auf. Prüfen mit `getent hosts <name>` auf dem Pi und `docker compose run --rm --entrypoint getent securityfeed hosts <name>` im Container. Kurzer Hostname, der nur über eine Suchdomain geht? Dann FQDN verwenden oder `dns_search` in einer `compose.override.yaml` setzen. Details in [PI-SSH-QUICKSTART.md](PI-SSH-QUICKSTART.md). |
+| `Es stehen noch Beispielwerte` | Die `.env` enthält unveränderte Werte aus `.env.example`. |
 | `Connection refused` | Falscher Port oder Relay nicht erreichbar. Test aus dem Container: `docker compose run --rm --entrypoint sh securityfeed -c "python3 -c \"import socket;socket.create_connection(('smtp.firma.de',587),10)\""` |
 | `authentication failed` | App-Passwort nötig, nicht das Anmeldepasswort. Bei M365 zusätzlich SMTP-AUTH freischalten. |
 | `STARTTLS extension not supported` | Relay will kein STARTTLS. Auf `none` (Port 25) oder `ssl` (465) wechseln. |

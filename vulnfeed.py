@@ -29,6 +29,7 @@ import os
 import re
 import signal
 import smtplib
+import socket
 import ssl
 import sys
 import threading
@@ -392,6 +393,15 @@ class ConfigError(Exception):
     """Fehlende oder widerspruechliche Konfiguration -> Exit-Code 2."""
 
 
+# Werte aus .env.example bzw. deploy/securityfeed.env.example. Bleiben sie
+# stehen, ist die Konfiguration garantiert unbrauchbar.
+PLACEHOLDER_HOSTS = frozenset({"smtp.firma.de", "relay.intern.example", "relay.example.local"})
+PLACEHOLDER_ADDRESSES = frozenset({
+    "feed@firma.de", "max@firma.de", "securityfeed@example.com",
+    "max@example.com", "pi@example.local", "max@example.local",
+})
+
+
 @dataclass
 class MailConfig:
     host: str
@@ -446,6 +456,24 @@ def mail_config_from_env(args: argparse.Namespace) -> MailConfig:
     if missing:
         raise ConfigError("Mailversand nicht konfiguriert, es fehlt:\n  - " + "\n  - ".join(missing))
 
+    # Unveraenderte Platzhalter aus .env.example koennen nie funktionieren. Ohne
+    # diesen Hinweis aeussert sich das erst spaet als DNS-Fehler beim Versand.
+    placeholders = {
+        "SECFEED_SMTP_HOST": (host, PLACEHOLDER_HOSTS),
+        "SECFEED_MAIL_FROM": (sender, PLACEHOLDER_ADDRESSES),
+        "SECFEED_MAIL_TO": (recipients[0] if recipients else "", PLACEHOLDER_ADDRESSES),
+    }
+    still_example = [
+        f"{key} = {value}" for key, (value, known) in placeholders.items()
+        if value.lower() in known
+    ]
+    if still_example:
+        raise ConfigError(
+            "Es stehen noch Beispielwerte aus .env.example in der Konfiguration:\n  - "
+            + "\n  - ".join(still_example)
+            + "\nTrage die Daten deines echten Mailservers ein."
+        )
+
     security = (args.smtp_security or env("SECFEED_SMTP_SECURITY") or "starttls").lower()
     if security not in ("none", "starttls", "ssl"):
         raise ConfigError(f"Unbekannter Wert fuer --smtp-security: {security}")
@@ -487,6 +515,46 @@ def build_message(cfg: MailConfig, entries: list[Entry], subtitle: str) -> Email
     msg.set_content(render_table(entries))
     msg.add_alternative(render_html(entries, subtitle), subtype="html")
     return msg
+
+
+def smtp_error_hints(cfg: MailConfig, exc: BaseException) -> list[str]:
+    """Konkrete naechste Schritte zum jeweiligen Fehlerbild."""
+    if isinstance(exc, socket.gaierror):
+        return [
+            f"Der Hostname '{cfg.host}' laesst sich nicht aufloesen - das ist ein",
+            "DNS-Problem, nicht Anmeldung, Port oder Firewall.",
+            "Pruefen:  getent hosts " + cfg.host,
+            "Tippfehler im Hostnamen? Interner Name, der nur im Firmennetz",
+            "aufloest? Oder steht noch ein Beispielwert in der Konfiguration?",
+        ]
+    if isinstance(exc, ConnectionRefusedError):
+        return [
+            f"Port {cfg.port} ist auf {cfg.host} nicht offen.",
+            "Pruefen:  nc -vz " + f"{cfg.host} {cfg.port}",
+            "Anderer Port noetig? 25 (none), 587 (starttls), 465 (ssl).",
+        ]
+    if isinstance(exc, TimeoutError) or isinstance(exc, socket.timeout):
+        return [
+            f"Keine Antwort von {cfg.host}:{cfg.port} innerhalb {cfg.timeout:.0f}s.",
+            "Meist eine Firewall, die das Paket verwirft statt es abzulehnen.",
+        ]
+    if isinstance(exc, smtplib.SMTPAuthenticationError):
+        return [
+            "Anmeldung abgelehnt. Bei Microsoft 365 und Gmail ist ein",
+            "App-Passwort noetig, nicht das Kontopasswort - bei M365 muss",
+            "SMTP-AUTH fuer das Postfach zusaetzlich freigeschaltet sein.",
+        ]
+    if isinstance(exc, smtplib.SMTPNotSupportedError):
+        return [
+            "Das Relay beherrscht die verlangte Erweiterung nicht.",
+            "Bei STARTTLS-Fehlern SECFEED_SMTP_SECURITY auf 'none' (Port 25)",
+            "oder 'ssl' (Port 465) umstellen.",
+        ]
+    if isinstance(exc, smtplib.SMTPSenderRefused):
+        return [f"Das Relay akzeptiert den Absender '{cfg.sender}' nicht."]
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        return ["Das Relay akzeptiert keinen der angegebenen Empfaenger."]
+    return []
 
 
 def send_mail(cfg: MailConfig, msg: EmailMessage) -> None:
@@ -633,7 +701,10 @@ def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
                 try:
                     send_mail(mail_cfg, msg)
                 except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:
-                    print(f"Mailversand fehlgeschlagen: {exc}", file=sys.stderr)
+                    print(f"Mailversand an {mail_cfg.host}:{mail_cfg.port} "
+                          f"({mail_cfg.security}) fehlgeschlagen: {exc}", file=sys.stderr)
+                    for hint in smtp_error_hints(mail_cfg, exc):
+                        print(f"  {hint}", file=sys.stderr)
                     return 1
                 if not args.quiet:
                     print(f"Mail an {', '.join(mail_cfg.recipients)} verschickt "

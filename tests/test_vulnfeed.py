@@ -349,6 +349,29 @@ class TestMailConfig(unittest.TestCase):
         self.assertIn("SECFEED_MAIL_FROM", message)
         self.assertIn("SECFEED_MAIL_TO", message)
 
+    def test_unchanged_placeholders_are_rejected(self):
+        """Beispielwerte koennen nie funktionieren und aeusserten sich sonst erst
+        spaet als DNS-Fehler beim Versand."""
+        with self.assertRaises(vf.ConfigError) as ctx:
+            vf.mail_config_from_env(self._args(
+                "--email", "--smtp-host", "smtp.firma.de",
+                "--mail-from", "feed@firma.de", "--mail-to", "max@firma.de"))
+        message = str(ctx.exception)
+        self.assertIn("Beispielwerte", message)
+        self.assertIn("smtp.firma.de", message)
+
+    def test_placeholder_check_is_case_insensitive(self):
+        with self.assertRaises(vf.ConfigError):
+            vf.mail_config_from_env(self._args(
+                "--email", "--smtp-host", "SMTP.Firma.DE",
+                "--mail-from", "a@echt.de", "--mail-to", "b@echt.de"))
+
+    def test_real_values_pass(self):
+        cfg = vf.mail_config_from_env(self._args(
+            "--email", "--smtp-host", "relay.echte-firma.de",
+            "--mail-from", "feed@echte-firma.de", "--mail-to", "max@echte-firma.de"))
+        self.assertEqual(cfg.host, "relay.echte-firma.de")
+
     def test_invalid_port_raises_config_error(self):
         with self.assertRaises(vf.ConfigError):
             vf.mail_config_from_env(self._args(
@@ -500,6 +523,38 @@ class TestSendMail(unittest.TestCase):
         msg = vf.build_message(cfg, [entry()], "Untertitel")
         with self.assertRaises(OSError):
             vf.send_mail(cfg, msg)
+
+
+class TestSmtpErrorHints(unittest.TestCase):
+    def _cfg(self):
+        return vf.MailConfig(host="relay.test", port=587, sender="a@test.invalid",
+                             recipients=["b@test.invalid"], security="starttls")
+
+    def test_dns_failure_names_the_host_and_points_at_dns(self):
+        hints = " ".join(vf.smtp_error_hints(
+            self._cfg(), socket.gaierror(-5, "No address associated with hostname")))
+        self.assertIn("relay.test", hints)
+        self.assertIn("DNS", hints)
+        self.assertIn("getent hosts relay.test", hints)
+
+    def test_refused_connection_points_at_the_port(self):
+        hints = " ".join(vf.smtp_error_hints(self._cfg(), ConnectionRefusedError()))
+        self.assertIn("587", hints)
+        self.assertIn("nc -vz relay.test 587", hints)
+
+    def test_auth_failure_mentions_app_password(self):
+        exc = vf.smtplib.SMTPAuthenticationError(535, b"nope")
+        hints = " ".join(vf.smtp_error_hints(self._cfg(), exc))
+        self.assertIn("App-Passwort", hints)
+
+    def test_starttls_unsupported_suggests_other_modes(self):
+        exc = vf.smtplib.SMTPNotSupportedError("STARTTLS extension not supported")
+        hints = " ".join(vf.smtp_error_hints(self._cfg(), exc))
+        self.assertIn("ssl", hints)
+        self.assertIn("none", hints)
+
+    def test_unknown_error_yields_no_hints(self):
+        self.assertEqual(vf.smtp_error_hints(self._cfg(), ValueError("etwas anderes")), [])
 
 
 class TestSchedulerLoop(unittest.TestCase):
