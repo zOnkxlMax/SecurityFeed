@@ -1,0 +1,48 @@
+name: Feeds erreichbar
+
+# Bewusst getrennt von der CI: dieser Workflow greift auf die echten Feeds zu.
+# Er soll melden, wenn eine Quelle ihre URL aendert, ihr Format umstellt oder
+# Requests aus Rechenzentren blockiert - aber keinen Pull Request blockieren.
+on:
+  schedule:
+    - cron: "17 5 * * 1" # montags 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    name: Echte Feeds abrufen
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Jede Quelle einzeln prüfen
+        run: |
+          status=0
+          for source in bleeping heise-alerts heise-security; do
+            echo "::group::$source"
+            if python vulnfeed.py --source "$source" --since 14 --no-state --limit 3; then
+              echo "$source: ok"
+            else
+              echo "::warning title=Feed nicht abrufbar::$source konnte nicht gelesen werden"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - name: Mail bauen, ohne sie zu verschicken
+        run: |
+          python vulnfeed.py --email --dry-run --no-state --since 14 --limit 3 \
+            --smtp-host relay.invalid --mail-from ci@invalid --mail-to ci@invalid \
+            | head -20
+
+      - name: CVE-Extraktion aus Artikelseiten
+        run: |
+          python vulnfeed.py --cve-only --no-state --since 14 --limit 5 --detail-limit 10

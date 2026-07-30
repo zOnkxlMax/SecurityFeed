@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Läufe auf demselben Branch abbrechen, wenn schnell hintereinander gepusht wird.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Syntax prüfen
+        run: python -m compileall -q vulnfeed.py tests
+
+      - name: Testsuite
+        run: python -m unittest discover -s tests -v
+
+      - name: CLI startet und zeigt Hilfe
+        run: python vulnfeed.py --help
+
+      - name: Konfigurationsfehler ergibt Exit-Code 2
+        run: |
+          set +e
+          python vulnfeed.py --email
+          code=$?
+          set -e
+          echo "Exit-Code: $code"
+          test "$code" -eq 2
+
+      - name: Ungültiger Zeitplan ergibt Exit-Code 2
+        run: |
+          set +e
+          python vulnfeed.py --schedule "25:00"
+          code=$?
+          set -e
+          echo "Exit-Code: $code"
+          test "$code" -eq 2
+
+  docker:
+    name: Docker-Image und Compose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: .env aus Vorlage erzeugen
+        # compose.yaml verlangt eine .env. Im CI reichen die Platzhalterwerte,
+        # es wird keine Verbindung zum Relay aufgebaut.
+        run: cp .env.example .env
+
+      - name: compose.yaml validieren
+        run: docker compose config
+
+      - name: Image bauen
+        run: docker build -t securityfeed:ci .
+
+      - name: Läuft als unprivilegierter Benutzer
+        run: |
+          id_output=$(docker run --rm --entrypoint id securityfeed:ci -u)
+          echo "UID im Container: $id_output"
+          test "$id_output" = "10001"
+
+      - name: Zeitzonendaten sind im Image vorhanden
+        # Ohne tzdata liefe der Zeitplan still in UTC.
+        run: |
+          docker run --rm --entrypoint python3 -e TZ=Europe/Berlin securityfeed:ci \
+            -c "import time; print(time.tzname); assert time.tzname[0] in ('CET','CEST'), time.tzname"
+
+      - name: CLI im Container
+        run: docker run --rm securityfeed:ci --help
+
+      - name: Konfigurationsfehler ergibt Exit-Code 2
+        run: |
+          set +e
+          docker run --rm securityfeed:ci --email
+          code=$?
+          set -e
+          echo "Exit-Code: $code"
+          test "$code" -eq 2
+
+      - name: Scheduler startet und beendet sich auf SIGTERM
+        run: |
+          docker run -d --name sf-sched \
+            -e SECFEED_SCHEDULE=03:00 -e TZ=Europe/Berlin \
+            securityfeed:ci --no-state
+          for i in $(seq 1 20); do
+            docker logs sf-sched 2>&1 | grep -q "im Dauerbetrieb" && break
+            sleep 1
+          done
+          docker logs sf-sched
+          docker logs sf-sched 2>&1 | grep -q "im Dauerbetrieb"
+          docker logs sf-sched 2>&1 | grep -q "Naechster Lauf"
+
+          # docker stop schickt SIGTERM. Der Scheduler muss die Warteschleife
+          # verlassen, statt bis zum Timeout abgewuergt zu werden.
+          start=$(date +%s)
+          docker stop sf-sched
+          echo "Beendet nach $(( $(date +%s) - start ))s"
+
+          code=$(docker inspect -f '{{.State.ExitCode}}' sf-sched)
+          echo "Exit-Code: $code"
+          docker logs sf-sched 2>&1 | grep -q "Beendet."
+          test "$code" -eq 0
+          docker rm sf-sched
+
+      - name: Compose-Stack startet mit read-only Dateisystem
+        run: |
+          docker compose up -d
+          for i in $(seq 1 20); do
+            docker compose logs 2>&1 | grep -q "im Dauerbetrieb" && break
+            sleep 1
+          done
+          docker compose logs
+          docker compose logs 2>&1 | grep -q "im Dauerbetrieb"
+          # Zeitzone muss aus der compose.yaml durchgereicht werden.
+          docker compose logs 2>&1 | grep -qE "Zeitzone CES?T"
+          docker compose ps
+
+      - name: Compose-Stack stoppen
+        if: always()
+        run: docker compose down -v
+
+  build-arm64:
+    name: Image für Raspberry Pi (arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Für linux/arm64 bauen
+        run: docker buildx build --platform linux/arm64 -t securityfeed:arm64 --load .
+
+      - name: Unter QEMU starten
+        run: docker run --rm --platform linux/arm64 securityfeed:arm64 --help
