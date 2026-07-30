@@ -12,6 +12,10 @@ venv/
 !.env.example
 seen.json
 
+# Lokale Compose-Anpassungen, damit compose.yaml aenderungsfrei bleibt
+compose.override.yaml
+compose.override.yml
+
 # Generierte Reports - nur der Ausgabeordner, damit Doku nicht versehentlich
 # ausgeschlossen wird.
 /out/

@@ -67,37 +67,35 @@ sudo timedatectl set-timezone Europe/Berlin
 
 ## Schritt 2: Programm auf den Pi kopieren
 
-SecurityFeed ist eine einzige Datei ohne Abhängigkeiten. Der einfachste Weg ist
-`scp` von deinem Windows-Rechner aus — dann brauchst du auf dem Pi keine
-GitHub-Zugangsdaten:
+Mit dem GitHub-Token auf dem Pi klonen:
 
-```powershell
-scp "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed\vulnfeed.py" pi@raspberrypi.local:/tmp/
+```bash
+cd ~ && git clone https://github.com/zOnkxlMax/SecurityFeed.git securityfeed
 ```
 
-Ebenso die drei Dateien aus `deploy/`:
-
-```powershell
-scp "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed\deploy\*" pi@raspberrypi.local:/tmp/
-```
+Fragt Git nach Zugangsdaten, ist das Passwort der **Token**, nicht dein
+Kontopasswort. Die folgenden Befehle nutzen `~/securityfeed` als Quelle.
 
 <details>
-<summary>Alternative: per <code>git clone</code> vom Pi aus</summary>
+<summary>Alternative ohne Git: per <code>scp</code> von Windows aus</summary>
 
-Das Repo ist **privat**, ein einfaches `git clone` schlägt darum fehl. Du
-bräuchtest ein Personal Access Token oder einen Deploy Key auf dem Pi. Für eine
-einzelne Datei ist das unnötiger Aufwand und legt zusätzlich GitHub-Zugriff auf
-ein Gerät, das nur Mails verschicken soll. Nimm `scp`, außer du willst den Pi
-später per `git pull` aktualisieren.
+```powershell
+$src = "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed"
+scp "$src\vulnfeed.py" pi@raspberrypi.local:/tmp/
+scp "$src\deploy\*" pi@raspberrypi.local:/tmp/
+```
+
+Dann in den folgenden Befehlen `~/securityfeed` und `~/securityfeed/deploy`
+jeweils durch `/tmp` ersetzen.
 
 </details>
 
-Jetzt auf dem Pi an den endgültigen Platz legen:
+Jetzt an den endgültigen Platz legen:
 
 ```bash
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin securityfeed
 sudo install -d -m 0755 /opt/securityfeed
-sudo install -m 0755 /tmp/vulnfeed.py /opt/securityfeed/vulnfeed.py
+sudo install -m 0755 ~/securityfeed/vulnfeed.py /opt/securityfeed/vulnfeed.py
 ```
 
 Der eigene Systembenutzer sorgt dafür, dass der Dienst nicht als `root` läuft
@@ -111,7 +109,7 @@ Vorlage kopieren:
 
 ```bash
 sudo install -d -m 0750 -o root -g securityfeed /etc/securityfeed
-sudo install -m 0640 -o root -g securityfeed /tmp/securityfeed.env.example /etc/securityfeed/securityfeed.env
+sudo install -m 0640 -o root -g securityfeed ~/securityfeed/deploy/securityfeed.env.example /etc/securityfeed/securityfeed.env
 sudo nano /etc/securityfeed/securityfeed.env
 ```
 
@@ -173,7 +171,7 @@ Erst weitermachen, wenn diese Mail angekommen ist.
 ## Schritt 5: Zeitplan einrichten
 
 ```bash
-sudo install -m 0644 /tmp/securityfeed.service /tmp/securityfeed.timer /etc/systemd/system/
+sudo install -m 0644 ~/securityfeed/deploy/securityfeed.service ~/securityfeed/deploy/securityfeed.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now securityfeed.timer
 ```
@@ -313,15 +311,16 @@ erfolgreich, aber eine einzelne Quelle war nicht erreichbar.
 
 ## Später aktualisieren
 
-Neue Version von Windows aus einspielen:
-
-```powershell
-scp "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed\vulnfeed.py" pi@raspberrypi.local:/tmp/
+```bash
+cd ~/securityfeed && git pull
 ```
 
 ```bash
-sudo install -m 0755 /tmp/vulnfeed.py /opt/securityfeed/vulnfeed.py
+sudo install -m 0755 ~/securityfeed/vulnfeed.py /opt/securityfeed/vulnfeed.py
 ```
+
+Deine Konfiguration liegt in `/etc/securityfeed/securityfeed.env`, also außerhalb
+des Repos — `git pull` fasst sie nicht an.
 
 Ein Neustart des Timers ist nicht nötig — der nächste Lauf nimmt automatisch die
 neue Datei.

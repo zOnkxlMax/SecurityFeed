@@ -12,11 +12,13 @@ services:
     env_file:
       - .env
 
+    # Alle anpassbaren Werte kommen aus der .env, damit diese Datei unveraendert
+    # bleibt und "git pull" nicht mit lokalen Aenderungen kollidiert.
     environment:
       # Zeitplan in lokaler Zeit. Mehrere Uhrzeiten per Komma.
-      SECFEED_SCHEDULE: "07:00,18:00"
+      SECFEED_SCHEDULE: ${SECFEED_SCHEDULE:-07:00,18:00}
       # Muss zur gewuenschten Zeitzone passen, sonst laeuft der Plan in UTC.
-      TZ: Europe/Berlin
+      TZ: ${TZ:-Europe/Berlin}
 
     # Merkt sich ueber Neustarts hinweg, was schon gemeldet wurde.
     volumes:
@@ -24,10 +26,12 @@ services:
 
     # Ueberschreibt CMD aus dem Dockerfile. --schedule fehlt hier absichtlich,
     # der Zeitplan kommt aus SECFEED_SCHEDULE oben.
+    # Weitere Argumente ergaenzt du ueber eine compose.override.yaml, siehe
+    # docs/DOCKER.md - dann bleibt auch diese Datei aenderungsfrei.
     command:
       - --email
       - --since
-      - "2"
+      - ${SECFEED_SINCE:-2}
       - --details
 
     # Haertung. Das Programm schreibt ausschliesslich in sein State-Volume.

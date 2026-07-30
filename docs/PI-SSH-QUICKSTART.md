@@ -1,17 +1,55 @@
 # Copy-Paste-Anleitung für die SSH-Konsole
 
-Blöcke der Reihe nach abarbeiten. Achte auf die Kennzeichnung — **A** läuft in
-der PowerShell auf deinem Windows-Rechner, **B** bis **G** in der SSH-Sitzung
-auf dem Pi.
+Alle Blöcke der Reihe nach in der SSH-Sitzung auf dem Pi einfügen. Ein
+Windows-Zwischenschritt ist nicht nötig, weil der Pi einen GitHub-Token für das
+private Repo hat.
 
 Erklärungen zu allem hier findest du in [DOCKER.md](DOCKER.md).
 
-Ersetze `pi@raspberrypi.local` überall durch deinen Benutzer und Hostnamen —
-falls unbekannt, auf dem Pi mit `whoami` und `hostname -I` nachsehen.
-
 ---
 
-## A — Dateien auf den Pi kopieren
+## A — Repo klonen
+
+```bash
+cd ~ && git clone https://github.com/zOnkxlMax/SecurityFeed.git securityfeed
+```
+
+Fragt Git nach Zugangsdaten, gib deinen GitHub-Benutzernamen und als **Passwort
+den Token** ein — nicht dein Kontopasswort.
+
+Kontrollieren:
+
+```bash
+cd ~/securityfeed && ls
+```
+
+Erwartung: `Dockerfile compose.yaml vulnfeed.py .env.example deploy docs tests`
+und weitere.
+
+<details>
+<summary>Token dauerhaft hinterlegen, falls Git jedes Mal fragt</summary>
+
+```bash
+git config --global credential.helper store
+```
+
+Beim nächsten `git pull` einmal eingeben, danach merkt Git ihn sich. Der Token
+liegt dann im Klartext in `~/.git-credentials` — auf einem Pi, der nur diese
+Aufgabe hat, ein üblicher Kompromiss. Rechte einschränken:
+
+```bash
+chmod 600 ~/.git-credentials
+```
+
+Alternativ ohne gespeicherten Token: Token in die Remote-URL setzen mit
+`git remote set-url origin https://<TOKEN>@github.com/zOnkxlMax/SecurityFeed.git`.
+Er steht dann in `.git/config` — dieselbe Klartext-Abwägung, nur an anderer
+Stelle.
+
+</details>
+
+<details>
+<summary>Alternative ohne Git: Dateien per scp kopieren</summary>
 
 **In der Windows-PowerShell**, nicht auf dem Pi:
 
@@ -21,9 +59,11 @@ ssh pi@raspberrypi.local "mkdir -p ~/securityfeed"
 scp "$src\vulnfeed.py" "$src\Dockerfile" "$src\compose.yaml" "$src\.env.example" pi@raspberrypi.local:~/securityfeed/
 ```
 
-Erwartung: vier Zeilen mit `100%`.
+Ersetze `pi@raspberrypi.local` durch deinen Benutzer und Hostnamen. Damit
+entfällt später aber `git pull` — Updates musst du dann jedes Mal erneut per
+`scp` schieben.
 
-Ab hier alles per `ssh pi@raspberrypi.local` auf dem Pi.
+</details>
 
 ---
 
@@ -109,9 +149,16 @@ SECFEED_SMTP_PASSWORD=dein-app-passwort
 SECFEED_MAIL_FROM=feed@firma.de
 SECFEED_MAIL_TO=max@firma.de
 SECFEED_SUBJECT_PREFIX=[SecurityFeed]
+SECFEED_SCHEDULE=07:00,18:00
+TZ=Europe/Berlin
+SECFEED_SINCE=2
 ENDE
 chmod 600 ~/securityfeed/.env
 ```
+
+Die unteren drei Zeilen steuern Zeitplan, Zeitzone und Zeitfenster. Sie stehen
+absichtlich hier und nicht in der `compose.yaml` — so bleibt die getrackte Datei
+unverändert und `git pull` konfliktfrei.
 
 Das `<<'ENDE'` steht in Anführungszeichen — dadurch bleiben `$`, Backticks und
 Anführungszeichen in deinem Passwort unverändert. `chmod 600` sorgt dafür, dass
@@ -216,11 +263,15 @@ Lauf sofort auslösen, ohne auf 07:00 zu warten:
 cd ~/securityfeed && docker compose run --rm securityfeed --email --since 2
 ```
 
-Zeiten ändern — `SECFEED_SCHEDULE` in der `compose.yaml`, danach übernehmen:
+Zeiten ändern — `SECFEED_SCHEDULE` in der `.env`, danach übernehmen:
 
 ```bash
-cd ~/securityfeed && nano compose.yaml && docker compose up -d
+cd ~/securityfeed && nano .env && docker compose up -d
 ```
+
+Die `compose.yaml` musst du dafür **nicht** anfassen. Sie liest Zeitplan,
+Zeitzone und Zeitfenster aus der `.env`, die per `.gitignore` ausgeschlossen ist —
+so bleibt `git pull` konfliktfrei.
 
 Stoppen:
 
@@ -228,11 +279,16 @@ Stoppen:
 cd ~/securityfeed && docker compose down
 ```
 
-Neue Programmversion einspielen (Datei vorher per `scp` wie in Block A kopieren):
+Neue Programmversion einspielen — holt den aktuellen Stand aus GitHub, baut neu
+und ersetzt den Container:
 
 ```bash
-cd ~/securityfeed && docker compose up -d --build
+cd ~/securityfeed && git pull && docker compose up -d --build
 ```
+
+Deine `.env` bleibt dabei unangetastet: sie ist per `.gitignore` ausgeschlossen,
+`git pull` überschreibt sie also nicht. Das State-Volume bleibt ebenfalls
+erhalten, es kommen keine Wiederholungen.
 
 ---
 
@@ -249,6 +305,8 @@ cd ~/securityfeed && docker compose up -d --build
 | `relay access denied` | Das Relay akzeptiert deine `SECFEED_MAIL_FROM` nicht. |
 | Container startet immer neu | `SECFEED_SCHEDULE` fehlt in der `compose.yaml`. |
 | `no such file or directory: compose.yaml` | Du bist nicht in `~/securityfeed`. |
+| `Authentication failed` beim `git clone` | Als Passwort den Token eingeben, nicht das Kontopasswort. Token abgelaufen? Auf GitHub unter Settings → Developer settings prüfen. |
+| `git pull` meldet lokale Änderungen | Du hast eine getrackte Datei bearbeitet. Zeitplan und Zeitzone gehören in die `.env`, nicht in die `compose.yaml`. Mit `git stash` beiseitelegen, `git pull`, dann `git stash pop`. |
 
 Vollständige Diagnose der Konfiguration, ohne etwas zu starten:
 

@@ -54,18 +54,27 @@ bist, welcher Fall zutrifft:
 
 ## Schritt 1: Projekt auf den Pi bringen
 
-Das Repo ist privat, `git clone` bräuchte auf dem Pi ein Token. Für vier Dateien
-ist `scp` der kürzere Weg. Von deinem Windows-Rechner aus:
-
-```powershell
-scp "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed\vulnfeed.py" "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed\Dockerfile" "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed\compose.yaml" "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed\.env.example" pi@raspberrypi.local:~/securityfeed/
-```
-
-Falls das Zielverzeichnis noch nicht existiert, vorher auf dem Pi:
+Mit einem GitHub-Token auf dem Pi direkt klonen:
 
 ```bash
-mkdir -p ~/securityfeed
+cd ~ && git clone https://github.com/zOnkxlMax/SecurityFeed.git securityfeed
 ```
+
+Fragt Git nach Zugangsdaten, ist das Passwort der **Token**, nicht dein
+Kontopasswort. Damit gehen spätere Updates per `git pull`.
+
+<details>
+<summary>Alternative ohne Git: per <code>scp</code> von Windows aus</summary>
+
+```powershell
+$src = "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed"
+ssh pi@raspberrypi.local "mkdir -p ~/securityfeed"
+scp "$src\vulnfeed.py" "$src\Dockerfile" "$src\compose.yaml" "$src\.env.example" pi@raspberrypi.local:~/securityfeed/
+```
+
+Updates musst du dann jedes Mal erneut per `scp` schieben.
+
+</details>
 
 ---
 
@@ -107,9 +116,13 @@ Umgebungsvariablen ein.
 
 ## Schritt 3: Zeitzone prüfen
 
-In der `compose.yaml` steht `TZ: Europe/Berlin`. Der Zeitplan gilt in dieser
-Zeitzone. Wenn du woanders sitzt, dort anpassen — sonst kommt die Morgenmail zur
-falschen Stunde.
+In der `.env` steht `TZ=Europe/Berlin`. Der Zeitplan gilt in dieser Zeitzone.
+Wenn du woanders sitzt, dort anpassen — sonst kommt die Morgenmail zur falschen
+Stunde.
+
+Alle anpassbaren Werte liegen bewusst in der `.env` und nicht in der
+`compose.yaml`: die ist getrackt, und so kollidiert `git pull` später nicht mit
+deinen lokalen Änderungen.
 
 ---
 
@@ -171,19 +184,18 @@ Fehlersuche unten.
 
 ## Zeiten ändern
 
-In der `compose.yaml`:
+In der `.env`, nicht in der `compose.yaml`:
 
-```yaml
-    environment:
-      SECFEED_SCHEDULE: "07:00,18:00"
+```bash
+SECFEED_SCHEDULE=07:00,18:00
 ```
 
 | Wunsch | Wert |
 | --- | --- |
-| Früh und abends (Standard) | `"07:00,18:00"` |
-| Nur morgens | `"07:00"` |
-| Dreimal täglich | `"07:00,13:00,18:00"` |
-| Alle vier Stunden | `"00:00,04:00,08:00,12:00,16:00,20:00"` |
+| Früh und abends (Standard) | `07:00,18:00` |
+| Nur morgens | `07:00` |
+| Dreimal täglich | `07:00,13:00,18:00` |
+| Alle vier Stunden | `00:00,04:00,08:00,12:00,16:00,20:00` |
 
 Übernehmen:
 
@@ -202,20 +214,48 @@ systemd-Variante aus [RASPBERRY-PI.md](RASPBERRY-PI.md).
 
 ## Weitere Optionen anpassen
 
-Alles unter `command:` in der `compose.yaml`:
+Das Zeitfenster geht direkt über die `.env`:
 
-| Wunsch | Änderung |
+```bash
+SECFEED_SINCE=7
+```
+
+Für alles Weitere leg eine `compose.override.yaml` neben die `compose.yaml`.
+Compose führt beide automatisch zusammen, und die Override-Datei ist per
+`.gitignore` ausgeschlossen — `git pull` bleibt damit konfliktfrei:
+
+```yaml
+services:
+  securityfeed:
+    command:
+      - --email
+      - --since
+      - "2"
+      - --cve-only
+      - --limit
+      - "10"
+```
+
+`command` wird dabei komplett ersetzt, nicht ergänzt — liste also alle
+gewünschten Argumente auf.
+
+| Wunsch | Argumente |
 | --- | --- |
-| Nur deutsche Advisories | `- --source` und `- heise-alerts` ergänzen |
-| Nur Meldungen mit CVE-Nummer | `- --details` durch `- --cve-only` ersetzen |
-| Schneller, ohne CVE-Nummern | `- --details` streichen |
-| Größeres Zeitfenster | `"2"` unter `--since` auf `"7"` |
-| Höchstens 10 Meldungen pro Mail | `- --limit` und `- "10"` ergänzen |
-| Auch „nichts los"-Mails | `- --send-empty` ergänzen |
-| Beim Start sofort einmal laufen | `- --run-at-start` ergänzen |
+| Nur deutsche Advisories | `--source`, `heise-alerts` |
+| Nur Meldungen mit CVE-Nummer | `--cve-only` statt `--details` |
+| Schneller, ohne CVE-Nummern | `--details` weglassen |
+| Höchstens 10 Meldungen pro Mail | `--limit`, `"10"` |
+| Auch „nichts los"-Mails | `--send-empty` |
+| Beim Start sofort einmal laufen | `--run-at-start` |
 
 Zahlen müssen in YAML als Zeichenkette in Anführungszeichen stehen, sonst
 beschwert sich Compose über den Typ. Danach `docker compose up -d`.
+
+Prüfen, was Compose aus beiden Dateien zusammensetzt:
+
+```bash
+docker compose config
+```
 
 ---
 
@@ -255,17 +295,13 @@ abends mit.
 
 ## Aktualisieren
 
-Neue Version von Windows aus einspielen:
-
-```powershell
-scp "C:\Users\Max.Lang\OneDrive - DATAGROUP SE\Dokumente\VSC\SecurityFeed\vulnfeed.py" pi@raspberrypi.local:~/securityfeed/
-```
-
-Auf dem Pi neu bauen und ersetzen:
-
 ```bash
-cd ~/securityfeed && docker compose up -d --build
+cd ~/securityfeed && git pull && docker compose up -d --build
 ```
+
+Deine `.env` und eine etwaige `compose.override.yaml` bleiben unangetastet, beide
+sind per `.gitignore` ausgeschlossen. Das State-Volume bleibt ebenfalls erhalten,
+es kommen also keine Wiederholungen.
 
 ---
 
