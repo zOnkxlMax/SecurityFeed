@@ -62,16 +62,40 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: .env aus Vorlage erzeugen
-        # compose.yaml verlangt eine .env. Im CI reichen die Platzhalterwerte,
-        # es wird keine Verbindung zum Relay aufgebaut.
-        run: cp .env.example .env
+      - name: .env für den Testlauf erzeugen
+        # compose.yaml verlangt eine .env. Bewusst NICHT .env.example kopieren:
+        # das Programm weist unveraenderte Platzhalter ab. Die .invalid-Adressen
+        # sind per RFC 2606 garantiert nicht aufloesbar - es wird ohnehin keine
+        # Verbindung aufgebaut, weil kein Lauf faellig ist.
+        run: |
+          cat > .env <<'ENDE'
+          SECFEED_SMTP_HOST=relay.ci.invalid
+          SECFEED_SMTP_PORT=587
+          SECFEED_SMTP_SECURITY=starttls
+          SECFEED_MAIL_FROM=ci@ci.invalid
+          SECFEED_MAIL_TO=ci@ci.invalid
+          SECFEED_SUBJECT_PREFIX=[CI]
+          SECFEED_SCHEDULE=07:00,18:00
+          TZ=Europe/Berlin
+          SECFEED_SINCE=2
+          ENDE
 
       - name: compose.yaml validieren
         run: docker compose config
 
       - name: Image bauen
         run: docker build -t securityfeed:ci .
+
+      - name: Platzhalter aus der Vorlage werden abgewiesen
+        # Gegenprobe: mit .env.example muss der Start fehlschlagen, sonst laeuft
+        # jemand mit einer garantiert unbrauchbaren Konfiguration los.
+        run: |
+          set +e
+          docker run --rm --env-file .env.example securityfeed:ci --email --once
+          code=$?
+          set -e
+          echo "Exit-Code: $code"
+          test "$code" -eq 2
 
       - name: Läuft als unprivilegierter Benutzer
         run: |
