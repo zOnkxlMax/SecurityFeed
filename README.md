@@ -67,6 +67,20 @@ py -3 vulnfeed.py --cve-only --since 3
 | `--send-empty`      | —                          | Auch mailen, wenn nichts Neues da ist  |
 | `--dry-run`         | —                          | Mail ausgeben statt verschicken        |
 
+### Dauerbetrieb
+
+| Option              | Umgebungsvariable     | Bedeutung                                  |
+| ------------------- | --------------------- | ------------------------------------------ |
+| `--schedule`        | `SECFEED_SCHEDULE`    | `07:00,18:00` — läuft dann selbst zu diesen Zeiten |
+| `--run-at-start`    | —                     | Zusätzlich sofort beim Start einmal laufen  |
+
+Mit `--schedule` bleibt der Prozess im Vordergrund, schläft bis zur nächsten
+Uhrzeit und protokolliert jeden Lauf mit Zeitstempel nach stdout. Ein Fehlschlag
+beendet ihn nicht — er wird geloggt, und zur nächsten Zeit geht es weiter.
+`SIGTERM` und `SIGINT` beenden sauber, `docker stop` funktioniert also ohne
+Wartezeit. Ohne `--schedule` verhält sich das Tool wie bisher: ein Lauf, dann
+Ende.
+
 Das Passwort gibt es bewusst **nur** als Umgebungsvariable — als CLI-Argument
 stünde es in der Prozessliste und in der Shell-History.
 
@@ -96,7 +110,38 @@ Gespeichert wird erst **nach** erfolgreichem Versand. Scheitert das Relay, bleib
 der Zustand unverändert und der nächste Lauf holt die Meldungen nach. `--dry-run`
 schreibt den Zustand nie.
 
-## Auf dem Raspberry Pi einrichten
+## Geplanter Betrieb
+
+Zwei Wege, je nachdem was auf deinem Pi läuft:
+
+| | Docker Compose | systemd-Timer |
+| --- | --- | --- |
+| Anleitung | [docs/DOCKER.md](docs/DOCKER.md) | [docs/RASPBERRY-PI.md](docs/RASPBERRY-PI.md) |
+| Scheduler | im Container (`--schedule`) | systemd |
+| Einrichtung | `.env` ausfüllen, `docker compose up -d` | User, env-Datei, Unit-Dateien |
+| Wochentagsauswahl | nein, nur Uhrzeiten | ja (`OnCalendar=Mon..Fri`) |
+| Voraussetzung | Docker | nichts, Python ist vorinstalliert |
+
+Beide erledigen dasselbe. Nimm Docker, wenn auf dem Pi ohnehin Container laufen,
+sonst den systemd-Timer.
+
+### Docker Compose in drei Befehlen
+
+```bash
+cp .env.example .env && nano .env
+```
+
+```bash
+docker compose run --rm securityfeed --email --dry-run --since 2
+```
+
+```bash
+docker compose up -d
+```
+
+Details, Zeitanpassung und Fehlersuche in [docs/DOCKER.md](docs/DOCKER.md).
+
+## Auf dem Raspberry Pi ohne Docker einrichten
 
 **➜ Ausführliche Schritt-für-Schritt-Anleitung: [docs/RASPBERRY-PI.md](docs/RASPBERRY-PI.md)**
 

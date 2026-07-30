@@ -6,8 +6,10 @@ venv/
 .idea/
 
 # Zugangsdaten - niemals committen
+.env
 *.env
 !*.env.example
+!.env.example
 seen.json
 
 # Generierte Reports - nur der Ausgabeordner, damit Doku nicht versehentlich

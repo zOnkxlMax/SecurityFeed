@@ -9,8 +9,11 @@ Beispiele:
     python3 vulnfeed.py --source heise-alerts --format markdown
     python3 vulnfeed.py --format json > vulns.json
 
-Geplanter Lauf auf einem Raspberry Pi (siehe README):
+Geplanter Lauf auf einem Raspberry Pi (siehe docs/RASPBERRY-PI.md):
     python3 vulnfeed.py --email --env-file /etc/securityfeed.env --since 1
+
+Dauerbetrieb im Container, plant selbst (siehe docs/DOCKER.md):
+    python3 vulnfeed.py --email --schedule 07:00,18:00 --since 2
 
 Exit-Codes: 0 = ok, 1 = harter Fehler (alle Quellen tot / Mail fehlgeschlagen),
 2 = Konfigurationsfehler, 3 = Lauf ok, aber einzelne Quelle ausgefallen.
@@ -24,9 +27,11 @@ import html
 import json
 import os
 import re
+import signal
 import smtplib
 import ssl
 import sys
+import threading
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -551,6 +556,15 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Auch mailen, wenn es nichts Neues gibt.")
     mail.add_argument("--dry-run", action="store_true",
                       help="Mail nur ausgeben statt verschicken (zum Testen).")
+
+    daemon = parser.add_argument_group(
+        "Dauerbetrieb", "Fuer Docker: im Vordergrund laufen und selbst planen."
+    )
+    daemon.add_argument("--schedule", metavar="HH:MM,HH:MM",
+                        help="Statt einmalig laufen: zu diesen Uhrzeiten (lokale Zeit, "
+                             "SECFEED_SCHEDULE). Beispiel: 07:00,18:00")
+    daemon.add_argument("--run-at-start", action="store_true",
+                        help="Mit --schedule zusaetzlich sofort beim Start einmal laufen.")
     return parser
 
 
@@ -560,32 +574,9 @@ def resolve_state_path(args: argparse.Namespace) -> str | None:
     return args.state or os.environ.get("SECFEED_STATE") or default_state_path()
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-
-    # Umlaute auch in einer cp1252-Konsole nicht crashen lassen.
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):
-            pass
-
-    if args.env_file:
-        try:
-            load_env_file(args.env_file)
-        except OSError as exc:
-            print(f"env-file nicht lesbar: {exc}", file=sys.stderr)
-            return 2
-
-    # Mailkonfiguration vor dem Netzwerkzugriff pruefen - lieber sofort scheitern
-    # als nach 20 Sekunden Feedabruf.
-    try:
-        mail_cfg = mail_config_from_env(args) if args.email else None
-    except ConfigError as exc:
-        print(exc, file=sys.stderr)
-        return 2
-
-    state_path = resolve_state_path(args)
+def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
+             state_path: str | None) -> int:
+    """Ein kompletter Durchlauf: abrufen, filtern, ausgeben bzw. mailen."""
     seen = [] if (state_path is None or args.reset_state) else load_seen(state_path)
 
     selected = [s for s in SOURCES if not args.source or s.key in args.source]
@@ -656,6 +647,124 @@ def main(argv: list[str] | None = None) -> int:
 
     # Teilausfall einzelner Quellen sichtbar machen, ohne den Lauf zu entwerten.
     return 3 if failures else 0
+
+
+# --------------------------------------------------------------------------
+# Dauerbetrieb: im Container laufen lassen und selbst zu festen Zeiten starten
+# --------------------------------------------------------------------------
+
+def parse_schedule(spec: str) -> list[tuple[int, int]]:
+    """'07:00,18:00' -> [(7, 0), (18, 0)]"""
+    times: list[tuple[int, int]] = []
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})", chunk)
+        if not match:
+            raise ConfigError(f"Ungueltige Uhrzeit '{chunk}' - erwartet HH:MM, z.B. 07:00,18:00")
+        hour, minute = int(match.group(1)), int(match.group(2))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ConfigError(f"Uhrzeit ausserhalb des gueltigen Bereichs: {chunk}")
+        times.append((hour, minute))
+    if not times:
+        raise ConfigError("--schedule braucht mindestens eine Uhrzeit, z.B. 07:00,18:00")
+    return sorted(set(times))
+
+
+def next_run_at(times: list[tuple[int, int]], now: datetime) -> datetime:
+    """Naechster Termin in lokaler Zeit. Alles heute schon vorbei -> morgen."""
+    candidates = []
+    for hour, minute in times:
+        today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        candidates.append(today if today > now else today + timedelta(days=1))
+    return min(candidates)
+
+
+def log(message: str) -> None:
+    """Zeitgestempelte Zeile auf stdout - landet so in `docker logs`."""
+    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"[{stamp}] {message}", flush=True)
+
+
+def run_scheduler(args: argparse.Namespace, mail_cfg: MailConfig | None,
+                  state_path: str | None, times: list[tuple[int, int]]) -> int:
+    stop = threading.Event()
+
+    def request_stop(signum, _frame):
+        log(f"Signal {signal.Signals(signum).name} empfangen - beende nach aktuellem Lauf.")
+        stop.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, request_stop)
+
+    pretty = ", ".join(f"{h:02d}:{m:02d}" for h, m in times)
+    log(f"SecurityFeed {__version__} im Dauerbetrieb. Zeiten: {pretty} "
+        f"(Zeitzone {datetime.now().astimezone().tzname()})")
+
+    def execute(reason: str) -> None:
+        log(f"Lauf gestartet ({reason}).")
+        try:
+            code = run_once(args, mail_cfg, state_path)
+        except Exception as exc:  # ein Fehlschlag darf den Dienst nicht beenden
+            log(f"Lauf abgebrochen: {type(exc).__name__}: {exc}")
+            return
+        log(f"Lauf beendet, Exit-Code {code}.")
+
+    if args.run_at_start:
+        execute("Start")
+
+    while not stop.is_set():
+        target = next_run_at(times, datetime.now().astimezone())
+        wait = (target - datetime.now().astimezone()).total_seconds()
+        log(f"Naechster Lauf {target.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"(in {int(wait // 3600)}h {int(wait % 3600 // 60)}min).")
+        # Warten in Haeppchen: so wird eine Zeitumstellung oder ein korrigierter
+        # Systemtakt spaetestens nach einer Minute neu bewertet.
+        while wait > 0 and not stop.is_set():
+            if stop.wait(min(wait, 60)):
+                break
+            wait = (target - datetime.now().astimezone()).total_seconds()
+        if stop.is_set():
+            break
+        execute("Zeitplan")
+
+    log("Beendet.")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    # Umlaute auch in einer cp1252-Konsole nicht crashen lassen.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+    if args.env_file:
+        try:
+            load_env_file(args.env_file)
+        except OSError as exc:
+            print(f"env-file nicht lesbar: {exc}", file=sys.stderr)
+            return 2
+
+    # Konfiguration vor dem Netzwerkzugriff pruefen - lieber sofort scheitern als
+    # nach 20 Sekunden Feedabruf, und im Dauerbetrieb gar nicht erst starten.
+    try:
+        mail_cfg = mail_config_from_env(args) if args.email else None
+        schedule_spec = args.schedule or os.environ.get("SECFEED_SCHEDULE")
+        times = parse_schedule(schedule_spec) if schedule_spec else None
+    except ConfigError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+
+    state_path = resolve_state_path(args)
+
+    if times:
+        return run_scheduler(args, mail_cfg, state_path, times)
+    return run_once(args, mail_cfg, state_path)
 
 
 if __name__ == "__main__":

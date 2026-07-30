@@ -1,0 +1,50 @@
+services:
+  securityfeed:
+    build: .
+    image: securityfeed:latest
+    container_name: securityfeed
+
+    # Nach Reboot des Pi automatisch wieder starten.
+    restart: unless-stopped
+
+    # SMTP-Zugangsdaten. Datei aus .env.example erzeugen - sie ist per
+    # .gitignore ausgeschlossen und darf nie ins Repo.
+    env_file:
+      - .env
+
+    environment:
+      # Zeitplan in lokaler Zeit. Mehrere Uhrzeiten per Komma.
+      SECFEED_SCHEDULE: "07:00,18:00"
+      # Muss zur gewuenschten Zeitzone passen, sonst laeuft der Plan in UTC.
+      TZ: Europe/Berlin
+
+    # Merkt sich ueber Neustarts hinweg, was schon gemeldet wurde.
+    volumes:
+      - securityfeed-state:/var/lib/securityfeed
+
+    # Ueberschreibt CMD aus dem Dockerfile. --schedule fehlt hier absichtlich,
+    # der Zeitplan kommt aus SECFEED_SCHEDULE oben.
+    command:
+      - --email
+      - --since
+      - "2"
+      - --details
+
+    # Haertung. Das Programm schreibt ausschliesslich in sein State-Volume.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # Ohne Begrenzung laufen die Logs auf dem Pi irgendwann die SD-Karte voll.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  securityfeed-state:
