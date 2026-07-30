@@ -20,11 +20,12 @@ den Token** ein — nicht dein Kontopasswort.
 Kontrollieren:
 
 ```bash
-cd ~/securityfeed && ls
+cd ~/securityfeed && ls -a
 ```
 
-Erwartung: `Dockerfile compose.yaml vulnfeed.py .env.example deploy docs tests`
-und weitere.
+Erwartung: unter anderem `Dockerfile`, `compose.yaml`, `vulnfeed.py`,
+`.env.example`, `deploy`, `docs`, `tests`. Das `-a` ist nötig, weil
+`.env.example` mit einem Punkt beginnt und ein blankes `ls` sie verschweigt.
 
 <details>
 <summary>Token dauerhaft hinterlegen, falls Git jedes Mal fragt</summary>
@@ -117,20 +118,25 @@ Erwartung: eine Versionsnummer und `Hello from Docker!`.
 
 ---
 
-## C — Zeitzone prüfen
+## C — Zeitzone
+
+Maßgeblich für den Zeitplan ist **`TZ` in der `.env`**, die du im nächsten Block
+anlegst — nicht die Zeitzone des Pi. Der Container bringt seine eigene mit.
+Steht dort `Europe/Berlin`, kommt die Morgenmail um 07:00 deutscher Zeit, auch
+wenn der Pi auf UTC läuft.
+
+Trotzdem sinnvoll, den Pi passend zu stellen, damit Zeitstempel auf dem Host und
+im Container übereinstimmen:
 
 ```bash
 timedatectl | grep "Time zone"
 ```
 
-Steht dort nicht `Europe/Berlin`, korrigieren:
+Steht dort nicht `Europe/Berlin`:
 
 ```bash
 sudo timedatectl set-timezone Europe/Berlin
 ```
-
-Der Zeitplan im Container gilt in dieser Zeitzone. Ohne diesen Schritt kommt die
-Morgenmail im Sommer zwei Stunden zu spät.
 
 ---
 
@@ -207,8 +213,13 @@ Kommt `Mailversand nicht konfiguriert`, fehlt ein Wert in Block D.
 Wenn das passt, ein **echter** Testversand:
 
 ```bash
-cd ~/securityfeed && docker compose run --rm securityfeed --email --since 2 --no-state
+cd ~/securityfeed && docker compose run --rm securityfeed --once --email --since 2 --no-state
 ```
+
+Das `--once` ist hier nötig: `docker compose run` erbt die Service-Umgebung und
+damit `SECFEED_SCHEDULE`. Ohne das Flag würde der Aufruf in den Dauerbetrieb
+gehen und warten, statt einmal zu laufen. Bei `--dry-run` oben ist es nicht
+nötig, das impliziert den Einzellauf.
 
 Erwartung: `Mail an ... verschickt (N Meldung(en)).` Schau in dein Postfach,
 auch in den Spam-Ordner. `--no-state` verhindert, dass dieser Test die Meldungen
@@ -237,7 +248,8 @@ securityfeed  | [2026-07-30 10:15:02 CEST] SecurityFeed 1.0.0 im Dauerbetrieb. Z
 securityfeed  | [2026-07-30 10:15:02 CEST] Naechster Lauf 2026-07-30 18:00:00 CEST (in 7h 44min).
 ```
 
-Steht dort `UTC` statt `CEST`, war Block C nicht erfolgreich.
+Steht dort `UTC` statt `CEST`, fehlt `TZ=Europe/Berlin` in der `.env` aus
+Block D — die Zeitzone des Pi spielt dafür keine Rolle.
 
 Fertig. Der Container startet nach einem Reboot des Pi automatisch wieder.
 
@@ -260,7 +272,7 @@ cd ~/securityfeed && docker compose ps
 Lauf sofort auslösen, ohne auf 07:00 zu warten:
 
 ```bash
-cd ~/securityfeed && docker compose run --rm securityfeed --email --since 2
+cd ~/securityfeed && docker compose run --rm securityfeed --once --email --since 2
 ```
 
 Zeiten ändern — `SECFEED_SCHEDULE` in der `.env`, danach übernehmen:
@@ -303,8 +315,9 @@ erhalten, es kommen keine Wiederholungen.
 | `authentication failed` | App-Passwort nötig, nicht das Anmeldepasswort. |
 | `STARTTLS extension not supported` | Relay will kein STARTTLS — auf `none` (25) oder `ssl` (465) wechseln. |
 | `relay access denied` | Das Relay akzeptiert deine `SECFEED_MAIL_FROM` nicht. |
-| Container startet immer neu | `SECFEED_SCHEDULE` fehlt in der `compose.yaml`. |
+| Container startet immer neu | `SECFEED_SCHEDULE` ist in der `.env` auf einen leeren Wert gesetzt. Zeile entweder korrekt füllen oder ganz löschen — dann greift der Standardwert `07:00,18:00` aus der `compose.yaml`. |
 | `no such file or directory: compose.yaml` | Du bist nicht in `~/securityfeed`. |
+| `compose run` läuft nicht durch, meldet „im Dauerbetrieb" | `--once` fehlt. `compose run` erbt `SECFEED_SCHEDULE` aus der Service-Umgebung. |
 | `Authentication failed` beim `git clone` | Als Passwort den Token eingeben, nicht das Kontopasswort. Token abgelaufen? Auf GitHub unter Settings → Developer settings prüfen. |
 | `git pull` meldet lokale Änderungen | Du hast eine getrackte Datei bearbeitet. Zeitplan und Zeitzone gehören in die `.env`, nicht in die `compose.yaml`. Mit `git stash` beiseitelegen, `git pull`, dann `git stash pop`. |
 

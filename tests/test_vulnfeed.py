@@ -527,6 +527,48 @@ class TestSchedulerLoop(unittest.TestCase):
                         "Scheduler haette sofort abbrechen muessen")
 
 
+class TestScheduleActivation(unittest.TestCase):
+    """SECFEED_SCHEDULE steckt im Container in der Service-Umgebung und wird an
+    'docker compose run' durchgereicht. Ein Einzelaufruf dort darf deshalb nicht
+    versehentlich den Scheduler starten und haengen bleiben."""
+
+    def setUp(self):
+        self.previous = os.environ.pop("SECFEED_SCHEDULE", None)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        os.environ.pop("SECFEED_SCHEDULE", None)
+        if self.previous is not None:
+            os.environ["SECFEED_SCHEDULE"] = self.previous
+
+    def _resolve(self, *argv) -> list[tuple[int, int]] | None:
+        """Bildet die Entscheidung aus main() nach: Dauerbetrieb oder Einzellauf?"""
+        args = vf.build_parser().parse_args(list(argv))
+        if args.once or args.dry_run:
+            spec = None
+        else:
+            spec = args.schedule or os.environ.get("SECFEED_SCHEDULE")
+        return vf.parse_schedule(spec) if spec else None
+
+    def test_environment_alone_activates_scheduler(self):
+        os.environ["SECFEED_SCHEDULE"] = "07:00,18:00"
+        self.assertEqual(self._resolve("--no-state"), [(7, 0), (18, 0)])
+
+    def test_once_forces_single_run_despite_environment(self):
+        os.environ["SECFEED_SCHEDULE"] = "07:00,18:00"
+        self.assertIsNone(self._resolve("--once", "--no-state"))
+
+    def test_dry_run_forces_single_run_despite_environment(self):
+        os.environ["SECFEED_SCHEDULE"] = "07:00,18:00"
+        self.assertIsNone(self._resolve("--email", "--dry-run"))
+
+    def test_once_beats_explicit_schedule_flag(self):
+        self.assertIsNone(self._resolve("--schedule", "07:00", "--once"))
+
+    def test_without_schedule_it_stays_a_single_run(self):
+        self.assertIsNone(self._resolve("--no-state"))
+
+
 class TestArgumentParsing(unittest.TestCase):
     def test_state_path_respects_no_state(self):
         args = vf.build_parser().parse_args(["--no-state"])

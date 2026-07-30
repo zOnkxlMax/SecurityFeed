@@ -73,6 +73,11 @@ py -3 vulnfeed.py --cve-only --since 3
 | ------------------- | --------------------- | ------------------------------------------ |
 | `--schedule`        | `SECFEED_SCHEDULE`    | `07:00,18:00` — läuft dann selbst zu diesen Zeiten |
 | `--run-at-start`    | —                     | Zusätzlich sofort beim Start einmal laufen  |
+| `--once`            | —                     | Einzellauf erzwingen, auch wenn `SECFEED_SCHEDULE` gesetzt ist |
+
+`--once` brauchst du bei `docker compose run`: der Aufruf erbt die
+Service-Umgebung und damit `SECFEED_SCHEDULE`, würde also sonst in den
+Dauerbetrieb gehen statt einmal zu laufen. `--dry-run` impliziert `--once`.
 
 Mit `--schedule` bleibt der Prozess im Vordergrund, schläft bis zur nächsten
 Uhrzeit und protokolliert jeden Lauf mit Zeitstempel nach stdout. Ein Fehlschlag

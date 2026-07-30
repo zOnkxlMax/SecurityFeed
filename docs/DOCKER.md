@@ -147,12 +147,17 @@ sehen. Kommt `Mailversand nicht konfiguriert`, fehlt ein Wert in der `.env`.
 Wenn das passt, ein **echter** Testversand:
 
 ```bash
-docker compose run --rm securityfeed --email --since 2 --no-state
+docker compose run --rm securityfeed --once --email --since 2 --no-state
 ```
 
 `--no-state` verhindert, dass dieser Test die Meldungen als „schon gemeldet"
 markiert. Schau in dein Postfach, auch im Spam-Ordner — die erste Mail einer
 neuen Absenderadresse landet gern dort.
+
+`--once` ist bei `docker compose run` wichtig: der Aufruf erbt die
+Service-Umgebung und damit `SECFEED_SCHEDULE`. Ohne das Flag ginge er in den
+Dauerbetrieb und würde warten, statt einmal zu laufen. `--dry-run` impliziert
+den Einzellauf und braucht es nicht.
 
 Erst weitermachen, wenn diese Mail angekommen ist.
 
@@ -266,7 +271,7 @@ docker compose config
 | Logs live mitlesen | `docker compose logs -f` |
 | Letzte 50 Zeilen | `docker compose logs --tail 50` |
 | Läuft der Container? | `docker compose ps` |
-| Lauf sofort auslösen | `docker compose run --rm securityfeed --email --since 2` |
+| Lauf sofort auslösen | `docker compose run --rm securityfeed --once --email --since 2` |
 | Neu starten | `docker compose restart` |
 | Stoppen | `docker compose down` |
 | Stoppen samt Zustand | `docker compose down -v` |

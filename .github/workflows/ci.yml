@@ -122,6 +122,15 @@ jobs:
           test "$code" -eq 0
           docker rm sf-sched
 
+      - name: compose run beendet sich trotz SECFEED_SCHEDULE
+        # Die Service-Umgebung reicht SECFEED_SCHEDULE an "compose run" durch.
+        # Ohne die --once/--dry-run-Ausnahme startet dort der Scheduler und der
+        # Aufruf haengt - genau der Schritt, den die Anleitung als Test vorgibt.
+        run: |
+          timeout 120 docker compose run --rm securityfeed \
+            --once --no-state --since 2 --limit 1 --format table
+          echo "compose run ist beendet, kein Dauerbetrieb"
+
       - name: Compose-Stack startet mit read-only Dateisystem
         run: |
           docker compose up -d

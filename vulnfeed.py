@@ -571,6 +571,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "SECFEED_SCHEDULE). Beispiel: 07:00,18:00")
     daemon.add_argument("--run-at-start", action="store_true",
                         help="Mit --schedule zusaetzlich sofort beim Start einmal laufen.")
+    daemon.add_argument("--once", action="store_true",
+                        help="Einen einzelnen Lauf erzwingen und danach beenden, auch wenn "
+                             "SECFEED_SCHEDULE gesetzt ist. Fuer 'docker compose run'.")
     return parser
 
 
@@ -760,7 +763,13 @@ def main(argv: list[str] | None = None) -> int:
     # nach 20 Sekunden Feedabruf, und im Dauerbetrieb gar nicht erst starten.
     try:
         mail_cfg = mail_config_from_env(args) if args.email else None
-        schedule_spec = args.schedule or os.environ.get("SECFEED_SCHEDULE")
+        # SECFEED_SCHEDULE steckt im Container in der Service-Umgebung und wird
+        # daher auch an "docker compose run" durchgereicht. Ohne diese Ausnahme
+        # wuerde ein dortiger Einzelaufruf den Scheduler starten und haengen.
+        if args.once or args.dry_run:
+            schedule_spec = None
+        else:
+            schedule_spec = args.schedule or os.environ.get("SECFEED_SCHEDULE")
         times = parse_schedule(schedule_spec) if schedule_spec else None
     except ConfigError as exc:
         print(exc, file=sys.stderr)
