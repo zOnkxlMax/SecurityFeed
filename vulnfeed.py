@@ -414,7 +414,13 @@ def load_env_file(path: str) -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, value = line.partition("=")
-            key, value = key.strip(), value.strip().strip("'\"")
+            key, value = key.strip(), value.strip()
+            # Nur ein umschliessendes Paar entfernen. Ein blindes strip("'\"")
+            # wuerde ein Passwort, das auf ein Anfuehrungszeichen endet, still
+            # beschneiden - der Fehler taucht spaeter nur als "authentication
+            # failed" auf.
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
             os.environ.setdefault(key, value)
 
 

@@ -125,6 +125,9 @@ Zwei Wege, je nachdem was auf deinem Pi läuft:
 Beide erledigen dasselbe. Nimm Docker, wenn auf dem Pi ohnehin Container laufen,
 sonst den systemd-Timer.
 
+**Nur die Befehle zum Einfügen in die SSH-Konsole des Pi:
+[docs/PI-SSH-QUICKSTART.md](docs/PI-SSH-QUICKSTART.md)**
+
 ### Docker Compose in drei Befehlen
 
 ```bash

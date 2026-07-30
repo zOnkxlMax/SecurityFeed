@@ -248,6 +248,32 @@ class TestEnvFile(unittest.TestCase):
         self.assertEqual(os.environ["SECFEED_TEST_B"], "zwei")
         self.assertEqual(os.environ["SECFEED_TEST_C"], "drei")
 
+    def test_only_matching_quote_pairs_are_stripped(self):
+        """Ein Passwort, das auf ein Anfuehrungszeichen endet, darf nicht
+        beschnitten werden - der Fehler zeigte sich sonst nur als
+        'authentication failed' beim Relay."""
+        path = os.path.join(self.tmp.name, "quotes.env")
+        Path(path).write_text(
+            "SECFEED_TEST_PAIR_S='umschlossen'\n"
+            'SECFEED_TEST_PAIR_D="umschlossen"\n'
+            "SECFEED_TEST_TRAIL_S=endetAuf'\n"
+            'SECFEED_TEST_TRAIL_D=endetAuf"\n'
+            "SECFEED_TEST_LEAD_S='nurVorne\n"
+            "SECFEED_TEST_SPECIAL=P@ss$w0rd!\n",
+            encoding="utf-8",
+        )
+        keys = ["SECFEED_TEST_PAIR_S", "SECFEED_TEST_PAIR_D", "SECFEED_TEST_TRAIL_S",
+                "SECFEED_TEST_TRAIL_D", "SECFEED_TEST_LEAD_S", "SECFEED_TEST_SPECIAL"]
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in keys])
+        vf.load_env_file(path)
+
+        self.assertEqual(os.environ["SECFEED_TEST_PAIR_S"], "umschlossen")
+        self.assertEqual(os.environ["SECFEED_TEST_PAIR_D"], "umschlossen")
+        self.assertEqual(os.environ["SECFEED_TEST_TRAIL_S"], "endetAuf'")
+        self.assertEqual(os.environ["SECFEED_TEST_TRAIL_D"], 'endetAuf"')
+        self.assertEqual(os.environ["SECFEED_TEST_LEAD_S"], "'nurVorne")
+        self.assertEqual(os.environ["SECFEED_TEST_SPECIAL"], "P@ss$w0rd!")
+
     def test_existing_environment_wins(self):
         os.environ["SECFEED_TEST_A"] = "vorher"
         self.addCleanup(lambda: os.environ.pop("SECFEED_TEST_A", None))
