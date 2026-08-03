@@ -64,7 +64,7 @@ py -3 vulnfeed.py --cve-only --since 3
 | `--mail-from`       | `SECFEED_MAIL_FROM`        | Absenderadresse                        |
 | `--mail-to`         | `SECFEED_MAIL_TO`          | Empfänger, mehrere per Komma           |
 | `--subject-prefix`  | `SECFEED_SUBJECT_PREFIX`   | Default `[SecurityFeed]`               |
-| `--send-empty`      | —                          | Auch mailen, wenn nichts Neues da ist  |
+| `--send-empty`      | `SECFEED_SEND_EMPTY`       | Auch mailen, wenn nichts Neues da ist — als Lebenszeichen |
 | `--dry-run`         | —                          | Mail ausgeben statt verschicken        |
 
 ### Dauerbetrieb

@@ -275,6 +275,18 @@ Lauf sofort auslösen, ohne auf 07:00 zu warten:
 cd ~/securityfeed && docker compose run --rm securityfeed --once --email --since 2
 ```
 
+Lebenszeichen einschalten — mailt auch dann, wenn es nichts Neues gibt, damit du
+merkst, falls der Dienst stillsteht:
+
+```bash
+cd ~/securityfeed && echo 'SECFEED_SEND_EMPTY=1' >> .env && docker compose up -d
+```
+
+Der Betreff lautet dann `[SecurityFeed] keine neuen Meldungen` und lässt sich
+leicht in einen Ordner filtern. War eine Quelle nicht erreichbar, hängt
+`(Warnung: N Quelle(n) nicht erreichbar)` dran und die Mail nennt welche — ein
+stiller Ausfall sieht also nicht mehr aus wie ein ruhiger Tag.
+
 Zeiten ändern — `SECFEED_SCHEDULE` in der `.env`, danach übernehmen:
 
 ```bash

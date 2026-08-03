@@ -123,6 +123,10 @@ jobs:
 
       - name: Scheduler startet und beendet sich auf SIGTERM
         run: |
+          # Auf einem self-hosted Runner ueberlebt ein Container aus einem
+          # abgebrochenen Lauf - ohne das hier scheitert der naechste am
+          # Namenskonflikt statt an der eigentlichen Sache.
+          docker rm -f sf-sched 2>/dev/null || true
           docker run -d --name sf-sched \
             -e SECFEED_SCHEDULE=03:00 -e TZ=Europe/Berlin \
             securityfeed:ci --no-state
@@ -168,9 +172,14 @@ jobs:
           docker compose logs 2>&1 | grep -qE "Zeitzone CES?T"
           docker compose ps
 
-      - name: Compose-Stack stoppen
+      - name: Aufräumen
+        # Muss auch nach einem Fehlschlag laufen, sonst sammeln sich auf einem
+        # self-hosted Runner Container, Volumes und Images an.
         if: always()
-        run: docker compose down -v
+        run: |
+          docker compose down -v --remove-orphans || true
+          docker rm -f sf-sched 2>/dev/null || true
+          rm -f .env
 
   build-arm64:
     name: Image für Raspberry Pi (arm64)

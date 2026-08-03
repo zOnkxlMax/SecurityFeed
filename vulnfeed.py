@@ -215,19 +215,20 @@ def load_source(source: Source, timeout: float) -> tuple[Source, list[Entry], st
     return source, entries, None
 
 
-def collect(selected: list[Source], timeout: float, quiet: bool) -> tuple[list[Entry], int]:
-    """Liefert (Eintraege, Anzahl fehlgeschlagener Quellen)."""
+def collect(selected: list[Source], timeout: float,
+            quiet: bool) -> tuple[list[Entry], list[str]]:
+    """Liefert (Eintraege, Beschreibung der fehlgeschlagenen Quellen)."""
     entries: list[Entry] = []
-    failures = 0
+    failed: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(selected)) as pool:
         for source, found, error in pool.map(lambda s: load_source(s, timeout), selected):
             if error:
-                failures += 1
+                failed.append(f"{source.label}: {error}")
                 if not quiet:
                     print(f"! {source.label}: {error}", file=sys.stderr)
                 continue
             entries.extend(found)
-    return entries, failures
+    return entries, failed
 
 
 def enrich_with_cves(entries: list[Entry], timeout: float, quiet: bool) -> None:
@@ -305,7 +306,8 @@ def render_markdown(entries: list[Entry]) -> str:
     return "\n".join(lines)
 
 
-def render_html(entries: list[Entry], subtitle: str) -> str:
+def render_html(entries: list[Entry], subtitle: str,
+                failed: list[str] | None = None) -> str:
     """Mail-taugliches HTML: Inline-Styles, keine externen Ressourcen."""
     esc = html.escape
     head = (
@@ -314,6 +316,15 @@ def render_html(entries: list[Entry], subtitle: str) -> str:
         '<h2 style="margin:0 0 4px">Aktuelle Schwachstellen-Meldungen</h2>'
         f'<p style="margin:0 0 20px;color:#666;font-size:13px">{esc(subtitle)}</p>'
     )
+    if failed:
+        items = "".join(f"<li>{esc(item)}</li>" for item in failed)
+        head += (
+            '<div style="background:#fff8e1;border-left:3px solid #f0ad4e;'
+            'padding:10px 14px;margin:0 0 20px;font-size:14px">'
+            '<strong>Warnung:</strong> Diese Quellen waren nicht erreichbar, die '
+            'Liste unten ist daher moeglicherweise unvollstaendig.'
+            f'<ul style="margin:6px 0 0;padding-left:20px">{items}</ul></div>'
+        )
     if not entries:
         return head + '<p>Keine neuen Meldungen.</p></div>'
 
@@ -415,6 +426,14 @@ class MailConfig:
     timeout: float = 30.0
 
 
+TRUTHY = frozenset({"1", "true", "yes", "y", "on", "ja"})
+
+
+def env_flag(name: str) -> bool:
+    """Schalter aus der Umgebung. Alles ausser den TRUTHY-Werten gilt als aus."""
+    return os.environ.get(name, "").strip().lower() in TRUTHY
+
+
 def load_env_file(path: str) -> None:
     """Simple KEY=VALUE-Datei ins Environment laden (fuer cron, das kein
     EnvironmentFile wie systemd kennt). Bereits gesetzte Variablen gewinnen."""
@@ -498,13 +517,25 @@ def mail_config_from_env(args: argparse.Namespace) -> MailConfig:
     )
 
 
-def build_message(cfg: MailConfig, entries: list[Entry], subtitle: str) -> EmailMessage:
+def build_message(cfg: MailConfig, entries: list[Entry], subtitle: str,
+                  failed: list[str] | None = None) -> EmailMessage:
+    failed = failed or []
     top = entries[0].title if entries else "keine neuen Meldungen"
     if len(top) > 70:
         top = top[:67] + "..."
     count = len(entries)
     subject = f"{cfg.subject_prefix} {count} neue Meldung(en): {top}" if count else \
               f"{cfg.subject_prefix} keine neuen Meldungen"
+    # Eine still ausgefallene Quelle sieht sonst aus wie ein ruhiger Tag.
+    if failed:
+        subject += f" (Warnung: {len(failed)} Quelle(n) nicht erreichbar)"
+
+    text = [subtitle, ""]
+    if failed:
+        text.append("WARNUNG - diese Quellen waren nicht erreichbar:")
+        text.extend(f"  - {item}" for item in failed)
+        text.append("")
+    text.append(render_table(entries))
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -512,8 +543,8 @@ def build_message(cfg: MailConfig, entries: list[Entry], subtitle: str) -> Email
     msg["To"] = ", ".join(cfg.recipients)
     msg["Date"] = format_datetime(datetime.now(timezone.utc))
     msg["Message-ID"] = make_msgid(domain=cfg.sender.split("@")[-1] or None)
-    msg.set_content(render_table(entries))
-    msg.add_alternative(render_html(entries, subtitle), subtype="html")
+    msg.set_content("\n".join(text))
+    msg.add_alternative(render_html(entries, subtitle, failed), subtype="html")
     return msg
 
 
@@ -627,7 +658,8 @@ def build_parser() -> argparse.ArgumentParser:
     mail.add_argument("--mail-to", help="Empfaenger, mehrere per Komma (SECFEED_MAIL_TO).")
     mail.add_argument("--subject-prefix", help="Betreff-Prefix. Default '[SecurityFeed]'.")
     mail.add_argument("--send-empty", action="store_true",
-                      help="Auch mailen, wenn es nichts Neues gibt.")
+                      help="Auch mailen, wenn es nichts Neues gibt - als Lebenszeichen "
+                           "(SECFEED_SEND_EMPTY=1).")
     mail.add_argument("--dry-run", action="store_true",
                       help="Mail nur ausgeben statt verschicken (zum Testen).")
 
@@ -657,10 +689,10 @@ def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
     seen = [] if (state_path is None or args.reset_state) else load_seen(state_path)
 
     selected = [s for s in SOURCES if not args.source or s.key in args.source]
-    entries, failures = collect(selected, args.timeout, args.quiet)
+    entries, failed = collect(selected, args.timeout, args.quiet)
     entries = dedupe(entries)
 
-    if failures == len(selected):
+    if len(failed) == len(selected):
         print("Keine einzige Quelle erreichbar - Abbruch.", file=sys.stderr)
         return 1
 
@@ -690,11 +722,12 @@ def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
             f"Lauf vom {datetime.now().astimezone().strftime('%d.%m.%Y %H:%M')} "
             f"- Quellen: {', '.join(s.label for s in selected)}"
         )
-        if not fresh and not args.send_empty:
+        send_empty = args.send_empty or env_flag("SECFEED_SEND_EMPTY")
+        if not fresh and not send_empty:
             if not args.quiet:
                 print("Nichts Neues - keine Mail verschickt.", file=sys.stderr)
         else:
-            msg = build_message(mail_cfg, fresh, subtitle)
+            msg = build_message(mail_cfg, fresh, subtitle, failed)
             if args.dry_run:
                 print(msg.as_string())
             else:
@@ -726,7 +759,7 @@ def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
             return 1
 
     # Teilausfall einzelner Quellen sichtbar machen, ohne den Lauf zu entwerten.
-    return 3 if failures else 0
+    return 3 if failed else 0
 
 
 # --------------------------------------------------------------------------

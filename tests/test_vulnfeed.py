@@ -525,6 +525,62 @@ class TestSendMail(unittest.TestCase):
             vf.send_mail(cfg, msg)
 
 
+class TestEnvFlag(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(lambda: os.environ.pop("SECFEED_TEST_FLAG", None))
+
+    def test_truthy_values(self):
+        for raw in ("1", "true", "TRUE", "Yes", "ja", "on", "  1  "):
+            os.environ["SECFEED_TEST_FLAG"] = raw
+            self.assertTrue(vf.env_flag("SECFEED_TEST_FLAG"), f"{raw!r} sollte wahr sein")
+
+    def test_falsy_values(self):
+        for raw in ("0", "false", "nein", "no", "off", ""):
+            os.environ["SECFEED_TEST_FLAG"] = raw
+            self.assertFalse(vf.env_flag("SECFEED_TEST_FLAG"), f"{raw!r} sollte falsch sein")
+
+    def test_unset_is_false(self):
+        os.environ.pop("SECFEED_TEST_FLAG", None)
+        self.assertFalse(vf.env_flag("SECFEED_TEST_FLAG"))
+
+
+class TestFailedSourceReporting(unittest.TestCase):
+    """Eine still ausgefallene Quelle sieht sonst aus wie ein ruhiger Tag -
+    gerade bei der Leermail als Lebenszeichen waere das irrefuehrend."""
+
+    def _cfg(self):
+        return vf.MailConfig(host="h", port=25, sender="a@test.invalid",
+                             recipients=["b@test.invalid"], security="none")
+
+    def test_subject_warns_about_failed_sources(self):
+        msg = vf.build_message(self._cfg(), [], "Untertitel",
+                               ["BleepingComputer: HTTP 403 Forbidden"])
+        self.assertIn("keine neuen Meldungen", msg["Subject"])
+        self.assertIn("1 Quelle(n) nicht erreichbar", msg["Subject"])
+
+    def test_plain_text_names_the_failed_source(self):
+        msg = vf.build_message(self._cfg(), [], "Untertitel",
+                               ["BleepingComputer: HTTP 403 Forbidden"])
+        body = msg.get_body(("plain",)).get_content()
+        self.assertIn("WARNUNG", body)
+        self.assertIn("HTTP 403 Forbidden", body)
+
+    def test_html_shows_a_warning_box(self):
+        out = vf.render_html([], "Untertitel", ["heise Security: Netzwerkfehler"])
+        self.assertIn("Warnung", out)
+        self.assertIn("Netzwerkfehler", out)
+
+    def test_clean_run_has_no_warning(self):
+        msg = vf.build_message(self._cfg(), [], "Untertitel", [])
+        self.assertNotIn("Warnung", msg["Subject"])
+        self.assertNotIn("WARNUNG", msg.get_body(("plain",)).get_content())
+
+    def test_plain_text_includes_the_subtitle_as_proof_of_life(self):
+        msg = vf.build_message(self._cfg(), [], "Lauf vom 30.07.2026 18:00")
+        self.assertIn("Lauf vom 30.07.2026 18:00",
+                      msg.get_body(("plain",)).get_content())
+
+
 class TestSmtpErrorHints(unittest.TestCase):
     def _cfg(self):
         return vf.MailConfig(host="relay.test", port=587, sender="a@test.invalid",
