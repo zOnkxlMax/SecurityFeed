@@ -149,6 +149,97 @@ class TestVulnHeuristic(unittest.TestCase):
                                summary="Sie kann jetzt Milchschaum.").is_vuln)
 
 
+class TestShortTermFalsePositives(unittest.TestCase):
+    """'rce' als blosser Teilstring steckt in 'enforced', 'resources' und
+    'e-commerce' - das hat harmlose Meldungen als Schwachstellen ausgewiesen."""
+
+    def test_words_merely_containing_rce_are_not_vulnerabilities(self):
+        for title in ("Microsoft enforces MFA for all Azure portal sign-ins",
+                      "My list of S-Tier HN resources",
+                      "E-commerce platform launches new checkout",
+                      "Oracle cut its Always Free ARM limits, enforced August 1",
+                      "Reinforced concrete and other materials"):
+            self.assertFalse(entry(title=title).is_vuln, f"{title!r} ist keine Luecke")
+
+    def test_rce_as_a_word_still_counts(self):
+        self.assertTrue(entry(title="Critical RCE in Apache Struts").is_vuln)
+        self.assertTrue(entry(title="Pre-auth rce discovered").is_vuln)
+
+    def test_dispatched_is_not_a_patch(self):
+        self.assertFalse(entry(title="Orders dispatched within 24 hours").is_vuln)
+
+    def test_patch_as_a_word_still_counts(self):
+        self.assertTrue(entry(title="Vendor ships patch for critical issue").is_vuln)
+
+
+class TestHackerNews(unittest.TestCase):
+    SOURCE = vf.Source("hackernews", "Hacker News",
+                       "https://hn.algolia.com/api/v1/search_by_date", "hn",
+                       always_vuln=True, queries=("vulnerability", "security"),
+                       min_points=50)
+
+    PAYLOAD = {
+        "hits": [
+            {"title": "Twenty One Zero-Days in FFmpeg CVE-2026-1234",
+             "url": "https://example.test/ffmpeg", "objectID": "123",
+             "created_at": "2026-07-28T12:15:00.000Z", "points": 289},
+            {"title": "Tell HN: my account was taken over", "url": None,
+             "objectID": "456", "created_at": "2026-07-27T08:00:00.000Z",
+             "points": 498, "story_text": "Ein <b>langer</b> Text."},
+            {"title": "Launch HN: Acme (YC S26) - deploy agents securely",
+             "url": "https://example.test/acme", "objectID": "789",
+             "created_at": "2026-07-26T08:00:00.000Z", "points": 80},
+            {"title": "", "url": "https://example.test/leer", "objectID": "999",
+             "created_at": "2026-07-25T08:00:00.000Z", "points": 60},
+        ]
+    }
+
+    def test_urls_cover_every_query_with_the_points_threshold(self):
+        urls = vf.hn_urls(self.SOURCE)
+        self.assertEqual(len(urls), 2)
+        for url, query in zip(urls, self.SOURCE.queries):
+            self.assertIn(f"query={query}", url)
+            self.assertIn("tags=story", url)
+            self.assertIn("points", url)
+            self.assertIn("50", url)
+
+    def test_story_with_url_links_to_the_article(self):
+        entries = vf.parse_hn(self.PAYLOAD, self.SOURCE)
+        first = entries[0]
+        self.assertEqual(first.link, "https://example.test/ffmpeg")
+        self.assertEqual(first.source, "Hacker News")
+        self.assertEqual(first.published,
+                         datetime(2026, 7, 28, 12, 15, tzinfo=timezone.utc))
+        self.assertIn("289 Punkte", first.summary)
+        self.assertIn("news.ycombinator.com/item?id=123", first.summary)
+
+    def test_cves_are_extracted_from_the_title(self):
+        self.assertEqual(vf.parse_hn(self.PAYLOAD, self.SOURCE)[0].cves,
+                         ["CVE-2026-1234"])
+
+    def test_story_without_url_links_to_the_discussion(self):
+        second = vf.parse_hn(self.PAYLOAD, self.SOURCE)[1]
+        self.assertEqual(second.link, "https://news.ycombinator.com/item?id=456")
+        self.assertIn("Ein langer Text.", second.summary)
+
+    def test_launch_hn_and_empty_titles_are_dropped(self):
+        titles = [e.title for e in vf.parse_hn(self.PAYLOAD, self.SOURCE)]
+        self.assertEqual(len(titles), 2)
+        self.assertFalse(any(t.lower().startswith("launch hn") for t in titles))
+        self.assertNotIn("", titles)
+
+    def test_missing_hits_key_yields_nothing(self):
+        self.assertEqual(vf.parse_hn({}, self.SOURCE), [])
+
+    def test_hackernews_is_a_registered_source(self):
+        keys = [s.key for s in vf.SOURCES]
+        self.assertIn("hackernews", keys)
+        source = next(s for s in vf.SOURCES if s.key == "hackernews")
+        self.assertEqual(source.kind, "hn")
+        self.assertTrue(source.always_vuln,
+                        "Suchbegriff und Punkteschwelle sind hier der Filter")
+
+
 class TestDedupe(unittest.TestCase):
     def test_same_link_appears_once(self):
         entries = [entry(link="https://a.test/x"), entry(link="https://a.test/x"),
@@ -694,7 +785,7 @@ class TestArgumentParsing(unittest.TestCase):
             vf.build_parser().parse_args(["--source", "gibtsnicht"])
 
     def test_all_documented_sources_are_accepted(self):
-        for source in ("bleeping", "heise-alerts", "heise-security"):
+        for source in ("bleeping", "heise-alerts", "heise-security", "hackernews"):
             args = vf.build_parser().parse_args(["--source", source])
             self.assertEqual(args.source, [source])
 

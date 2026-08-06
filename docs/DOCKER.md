@@ -247,6 +247,7 @@ gewünschten Argumente auf.
 | Wunsch | Argumente |
 | --- | --- |
 | Nur deutsche Advisories | `--source`, `heise-alerts` |
+| Hacker News weglassen | `--source` je einmal für `bleeping`, `heise-alerts`, `heise-security` |
 | Nur Meldungen mit CVE-Nummer | `--cve-only` statt `--details` |
 | Schneller, ohne CVE-Nummern | `--details` weglassen |
 | Höchstens 10 Meldungen pro Mail | `--limit`, `"10"` |

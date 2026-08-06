@@ -9,11 +9,27 @@ Reines Python 3.10+ aus der Standardbibliothek — keine Abhängigkeiten, kein
 
 ## Quellen
 
-| Key              | Feed                          | Inhalt                                   |
+| Key              | Quelle                        | Inhalt                                   |
 | ---------------- | ----------------------------- | ---------------------------------------- |
 | `bleeping`       | BleepingComputer (RSS 2.0)    | Security-News allgemein, wird gefiltert   |
 | `heise-alerts`   | heise Security Alerts (Atom)  | reine Schwachstellen-/Advisory-Meldungen  |
 | `heise-security` | heise Security (Atom)         | Security-News allgemein, wird gefiltert   |
+| `hackernews`     | Hacker News (Algolia-API)     | Diskutierte Security-Themen ab 50 Punkten |
+
+Hacker News läuft anders als die übrigen Quellen. Der Frontpage-Feed taugt
+dafür nicht — dort steht meist nichts Sicherheitsrelevantes. Stattdessen wird
+die [Algolia-Such-API](https://hn.algolia.com/api) nach `vulnerability` und
+`security` abgefragt, beschränkt auf Stories mit mindestens 50 Punkten.
+
+Diese beiden Kriterien **sind** hier der Filter, `VULN_TERMS` wird auf
+HN-Einträge nicht angewandt. Grund: die Stichwortliste ist auf heise- und
+BleepingComputer-Formulierungen getrimmt und ließe Überschriften wie „Bugtraq is
+back" oder „My security camera shipped a GitHub admin token in its login page"
+durchfallen. Der Preis dafür ist gelegentliches Rauschen — HN-Einträge sind
+Community-Diskussionen, keine Advisories.
+
+Einträge ohne eigene URL (Ask HN, Tell HN) verlinken auf ihre Diskussion, alle
+anderen auf den Artikel; die Diskussion steht dann in der Beschreibung.
 
 ## Nutzung
 
@@ -200,8 +216,9 @@ Feed zusätzlich eine eigene Mail.
 Die RSS/Atom-Feeds liefern nur Titel und Anrisstext. Ein Eintrag gilt als
 Schwachstellen-Meldung, wenn einer dieser Punkte zutrifft:
 
-1. Er stammt aus **heise Security Alerts** — dieser Feed enthält ausschließlich
-   Advisories.
+1. Er stammt aus **heise Security Alerts** oder **Hacker News** — dort filtert
+   bereits die Quelle selbst (reiner Advisory-Feed bzw. Suchbegriff plus
+   Punkteschwelle).
 2. Titel oder Beschreibung enthalten eine CVE-Nummer.
 3. Titel oder Beschreibung enthalten einen Begriff aus `VULN_TERMS`
    (`vulnerab`, `exploit`, `zero-day`, `Sicherheitslücke`, `Schwachstelle`, …).

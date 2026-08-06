@@ -34,6 +34,7 @@ import ssl
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -58,14 +59,21 @@ TAG_RE = re.compile(r"<[^>]+>")
 WS_RE = re.compile(r"\s+")
 
 # Treffer in Titel/Beschreibung -> Meldung gilt als Schwachstellen-Thema.
+# Teilstring-Treffer, damit Beugungen und Komposita mitgehen ("Schwachstellen",
+# "vulnerabilities"). Alles hier muss lang genug sein, um nicht zufaellig in
+# harmlosen Woertern zu stecken.
 VULN_TERMS = (
-    "cve-", "vulnerab", "zero-day", "zero day", "0-day", "exploit", "rce",
+    "cve-", "vulnerab", "zero-day", "zero day", "0-day", "exploit",
     "remote code execution", "privilege escalation", "security update",
-    "patch tuesday", "patches", "patched", "flaw", "backdoor",
+    "patch tuesday", "flaw", "backdoor",
     "sicherheitslueck", "sicherheitslück", "schwachstell", "luecke", "lücke",
     "angreifer", "attacke", "sicherheitspatch", "sicherheitsupdate",
-    "jetzt patchen", "verwundbar", "notfall-patch", "exploit-code",
+    "jetzt patchen", "verwundbar", "notfall-patch",
 )
+
+# Kurz und mehrdeutig - nur als ganzes Wort. "rce" steckt sonst in "enforced",
+# "resources" und "e-commerce", "patched" in "dispatched".
+VULN_WORDS_RE = re.compile(r"\b(?:rce|patch|patches|patched|poc)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -73,8 +81,11 @@ class Source:
     key: str
     label: str
     url: str
-    kind: str  # "rss" oder "atom"
+    kind: str  # "rss", "atom" oder "hn"
     always_vuln: bool = False  # Feed enthaelt ausschliesslich Luecken-Meldungen
+    # Nur fuer kind="hn": Suchbegriffe und Mindestpunktzahl.
+    queries: tuple[str, ...] = ()
+    min_points: int = 50
 
 
 SOURCES: tuple[Source, ...] = (
@@ -91,7 +102,24 @@ SOURCES: tuple[Source, ...] = (
         "heise-security", "heise Security",
         "https://www.heise.de/security/rss/news-atom.xml", "atom",
     ),
+    # Der Frontpage-Feed von HN taugt hierfuer nicht - dort steht meist nichts
+    # Sicherheitsrelevantes. Die Algolia-Suche liefert dagegen gezielt, und die
+    # Punkteschwelle sortiert unkommentierte Einzeleinreichungen aus.
+    #
+    # always_vuln, weil hier Suchbegriff und Punkteschwelle den Filter bilden.
+    # VULN_TERMS ist auf heise- und BleepingComputer-Formulierungen getrimmt und
+    # liesse HN-Ueberschriften wie "Bugtraq is back" oder "My security camera
+    # shipped a GitHub admin token" durchfallen.
+    Source(
+        "hackernews", "Hacker News",
+        "https://hn.algolia.com/api/v1/search_by_date", "hn",
+        always_vuln=True, queries=("vulnerability", "security"), min_points=50,
+    ),
 )
+
+# Strukturell keine Sicherheitsmeldungen, matchen aber regelmaessig auf die
+# HN-Suchbegriffe ("... deploy agents securely", "security deposit").
+HN_TITLE_NOISE = ("launch hn:", "ask hn: who is hiring", "ask hn: who wants to be hired")
 
 
 @dataclass
@@ -109,7 +137,9 @@ class Entry:
         if self.advisory or self.cves:
             return True
         haystack = f"{self.title} {self.summary}".lower()
-        return any(term in haystack for term in VULN_TERMS)
+        if any(term in haystack for term in VULN_TERMS):
+            return True
+        return VULN_WORDS_RE.search(haystack) is not None
 
     def as_dict(self) -> dict:
         return {
@@ -185,6 +215,47 @@ def parse_atom(root: ET.Element, source: str) -> list[Entry]:
     return entries
 
 
+def parse_hn(payload: dict, source: Source) -> list[Entry]:
+    """Algolia-Treffer in Entry-Objekte. Stories ohne eigene URL (Ask HN, Tell
+    HN) verweisen auf ihre Diskussion."""
+    entries = []
+    for hit in payload.get("hits", []):
+        title = clean(hit.get("title"))
+        if not title or title.lower().startswith(HN_TITLE_NOISE):
+            continue
+        discussion = f"https://news.ycombinator.com/item?id={hit.get('objectID')}"
+        points = hit.get("points") or 0
+        story_text = clean(hit.get("story_text"))
+        summary = f"{points} Punkte auf Hacker News."
+        if story_text:
+            summary += " " + (story_text[:300] + "..." if len(story_text) > 300 else story_text)
+        if hit.get("url"):
+            summary += f" Diskussion: {discussion}"
+        entries.append(Entry(
+            source=source.label,
+            title=title,
+            link=hit.get("url") or discussion,
+            published=parse_date(hit.get("created_at")),
+            summary=summary,
+            cves=find_cves(title, story_text),
+        ))
+    return entries
+
+
+def hn_urls(source: Source) -> list[str]:
+    """Je Suchbegriff eine Abfrage - Algolia kennt kein ODER ueber Begriffe."""
+    urls = []
+    for query in source.queries:
+        params = urllib.parse.urlencode({
+            "tags": "story",
+            "query": query,
+            "numericFilters": f"points>={source.min_points}",
+            "hitsPerPage": 50,
+        })
+        urls.append(f"{source.url}?{params}")
+    return urls
+
+
 def find_cves(*texts: str) -> list[str]:
     seen: dict[str, None] = {}
     for text in texts:
@@ -195,21 +266,30 @@ def find_cves(*texts: str) -> list[str]:
 
 def load_source(source: Source, timeout: float) -> tuple[Source, list[Entry], str | None]:
     """Liefert (Quelle, Eintraege, Fehlermeldung)."""
+    entries: list[Entry] = []
+    root = None
     try:
-        raw = fetch(source.url, timeout)
-        root = ET.fromstring(raw)
+        if source.kind == "hn":
+            for url in hn_urls(source):
+                entries.extend(parse_hn(json.loads(fetch(url, timeout)), source))
+        else:
+            root = ET.fromstring(fetch(source.url, timeout))
     except urllib.error.HTTPError as exc:
         return source, [], f"HTTP {exc.code} {exc.reason}"
     except (urllib.error.URLError, TimeoutError) as exc:
         return source, [], f"Netzwerkfehler: {exc.reason if hasattr(exc, 'reason') else exc}"
     except ET.ParseError as exc:
         return source, [], f"Feed nicht lesbar: {exc}"
+    except json.JSONDecodeError as exc:
+        return source, [], f"Antwort ist kein gueltiges JSON: {exc}"
 
-    parser = parse_atom if source.kind == "atom" else parse_rss
-    entries = parser(root, source.label)
+    if source.kind != "hn":
+        parser = parse_atom if source.kind == "atom" else parse_rss
+        entries = parser(root, source.label)
+
     if source.always_vuln:
-        # Feed besteht komplett aus Luecken-Meldungen; der Keyword-Filter waere
-        # hier nur eine Fehlerquelle.
+        # Quelle liefert bereits nur Relevantes - der Keyword-Filter waere hier
+        # nur eine Fehlerquelle. Gilt fuer alle Arten, auch fuer HN.
         for entry in entries:
             entry.advisory = True
     return source, entries, None
