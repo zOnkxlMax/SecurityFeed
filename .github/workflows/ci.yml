@@ -185,10 +185,12 @@ jobs:
           find /tmp/ci-container-lists
 
           # Der SecurityFeed-Container basiert auf bookworm, hat also dpkg.
-          name=$(docker compose ps --format '{{.Name}}' | head -1)
-          test -s "/tmp/ci-container-lists/$name/status"
-          grep -q "^Package: " "/tmp/ci-container-lists/$name/status"
-          grep -q "^ID=debian" "/tmp/ci-container-lists/$name/os-release"
+          # Der Name steht als container_name in der compose.yaml fest.
+          test -s /tmp/ci-container-lists/securityfeed/status
+          grep -q "^Package: " /tmp/ci-container-lists/securityfeed/status
+          # /etc/os-release ist unter Debian ein Symlink - "docker cp -L" muss
+          # ihm folgen, sonst steht hier nur ein toter Verweis.
+          grep -q "^ID=debian" /tmp/ci-container-lists/securityfeed/os-release
 
           # Alpine hat kein dpkg und muss als nicht pruefbar vermerkt sein,
           # statt stillschweigend zu fehlen.
