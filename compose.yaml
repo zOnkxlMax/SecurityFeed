@@ -27,6 +27,13 @@ services:
       SECFEED_LOCAL: ${SECFEED_LOCAL:-0}
       SECFEED_DPKG_STATUS: /host/dpkg-status
 
+      # Zusaetzlich die Pakete der anderen Container pruefen. Leer = aus.
+      # Zum Einschalten in der .env auf /host/containers setzen und das
+      # Verzeichnis per compose.override.yaml einhaengen - befuellt wird es auf
+      # dem Host von deploy/dump-container-packages.sh. SecurityFeed selbst
+      # bekommt bewusst keinen Docker-Socket, der waere faktisch root auf dem Pi.
+      SECFEED_CONTAINER_LISTS: ${SECFEED_CONTAINER_LISTS:-}
+
     # Merkt sich ueber Neustarts hinweg, was schon gemeldet wurde.
     volumes:
       - securityfeed-state:/var/lib/securityfeed

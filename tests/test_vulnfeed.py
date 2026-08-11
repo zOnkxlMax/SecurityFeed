@@ -936,30 +936,27 @@ class TestScanLocal(unittest.TestCase):
     genau die Luecken ohne Fix. Was nur die echte Abfrage meldet, schliesst ein
     Update tatsaechlich."""
 
-    SOURCE = vf.Source("local", "Lokales System", vf.OSV_BATCH_URL, "local",
-                       always_vuln=True, default_on=False)
-
     def _patch(self, name: str, value) -> None:
         original = getattr(vf, name)
         setattr(vf, name, value)
         self.addCleanup(setattr, vf, name, original)
 
-    def _scan(self, packages: list[vf.Package], vulns: dict, **options) -> list[vf.Entry]:
+    def _fake_batch(self, vulns: dict):
         """vulns: Paketname -> (IDs zur echten Version, IDs zum Sentinel)."""
-        self.queries: list[tuple[str, str]] = []
-        self.ecosystem = ""
-        self._patch("installed_packages", lambda opts, timeout: packages)
-
-        def fake_batch(queries, ecosystem, timeout):
-            self.queries, self.ecosystem = queries, ecosystem
+        def fake_batch(queries, timeout):
+            self.queries = queries
             answers = []
-            for name, version in queries:
+            for name, version, _ecosystem in queries:
                 real, sentinel = vulns.get(name, ([], []))
                 answers.append(sentinel if version == vf.OSV_SENTINEL_VERSION else real)
             return answers
+        return fake_batch
 
-        self._patch("osv_batch", fake_batch)
-        return vf.scan_local(self.SOURCE, vf.LocalOptions(release="12", **options), 20.0)
+    def _scan(self, packages: list[vf.Package], vulns: dict, **options) -> list[vf.Entry]:
+        self.queries: list[tuple[str, str, str]] = []
+        self._patch("installed_packages", lambda opts, timeout: packages)
+        self._patch("osv_batch", self._fake_batch(vulns))
+        return vf.scan_local(vf.LocalOptions(release="12", **options), 20.0)
 
     def test_only_the_fixable_difference_is_reported(self):
         entries = self._scan(
@@ -974,9 +971,10 @@ class TestScanLocal(unittest.TestCase):
 
     def test_each_package_is_asked_twice_with_the_sentinel(self):
         self._scan([vf.Package("openssl", "3.0.11-1")], {})
-        self.assertEqual(self.queries,
-                         [("openssl", "3.0.11-1"), ("openssl", vf.OSV_SENTINEL_VERSION)])
-        self.assertEqual(self.ecosystem, "Debian:12")
+        self.assertEqual(self.queries, [
+            ("openssl", "3.0.11-1", "Debian:12"),
+            ("openssl", vf.OSV_SENTINEL_VERSION, "Debian:12"),
+        ])
 
     def test_package_without_findings_yields_nothing(self):
         self.assertEqual(self._scan([vf.Package("bash", "5.2-1")], {}), [])
@@ -1057,21 +1055,262 @@ class TestOsvBatch(unittest.TestCase):
 
     def test_queries_are_split_into_chunks(self):
         sent = self._collect_requests(lambda n: [{} for _ in range(n)])
-        queries = [(f"paket{i}", "1.0") for i in range(vf.OSV_CHUNK + 5)]
-        results = vf.osv_batch(queries, "Debian:12", 30.0)
+        queries = [(f"paket{i}", "1.0", "Debian:12") for i in range(vf.OSV_CHUNK + 5)]
+        results = vf.osv_batch(queries, 30.0)
         self.assertEqual([len(chunk) for chunk in sent], [vf.OSV_CHUNK, 5])
         self.assertEqual(len(results), len(queries))
 
     def test_ids_are_extracted_in_order(self):
         self._collect_requests(lambda n: [{"vulns": [{"id": "DEBIAN-CVE-2024-1001"}]}, {}])
-        results = vf.osv_batch([("a", "1"), ("b", "2")], "Debian:12", 30.0)
+        results = vf.osv_batch([("a", "1", "Debian:12"), ("b", "2", "Debian:12")], 30.0)
         self.assertEqual(results, [["DEBIAN-CVE-2024-1001"], []])
+
+    def test_each_query_carries_its_own_ecosystem(self):
+        # Host und Container koennen verschiedene Debian-Versionen haben und
+        # muessen trotzdem in einen Request passen.
+        sent = self._collect_requests(lambda n: [{} for _ in range(n)])
+        vf.osv_batch([("a", "1", "Debian:12"), ("b", "2", "Debian:13")], 30.0)
+        self.assertEqual([q["package"]["ecosystem"] for q in sent[0]],
+                         ["Debian:12", "Debian:13"])
 
     def test_mismatched_answer_count_is_an_error(self):
         # Sonst verschiebt sich die Zuordnung Paket <-> Antwort still.
         self._collect_requests(lambda n: [{}])
         with self.assertRaises(vf.LocalScanError):
-            vf.osv_batch([("a", "1"), ("b", "2")], "Debian:12", 30.0)
+            vf.osv_batch([("a", "1", "Debian:12"), ("b", "2", "Debian:12")], 30.0)
+
+
+class TestContainerLists(unittest.TestCase):
+    """Die Paketlisten der Container legt ein Skript auf dem Host ab.
+    SecurityFeed selbst bekommt keinen Docker-Zugriff - der Socket waere
+    faktisch root auf dem Pi."""
+
+    STATUS = ("Package: openssl\n"
+              "Status: install ok installed\n"
+              "Version: 3.0.11-1~deb12u2\n")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+
+    def _container(self, name: str, status: str | None = None,
+                   os_release: str | None = "ID=debian\nVERSION_ID=\"12\"\n",
+                   unsupported: str | None = None) -> str:
+        base = os.path.join(self.dir, name)
+        os.makedirs(base, exist_ok=True)
+        for filename, text in ((vf.CONTAINER_STATUS_FILE, status),
+                               (vf.CONTAINER_OS_RELEASE_FILE, os_release),
+                               (vf.CONTAINER_UNSUPPORTED_FILE, unsupported)):
+            if text is not None:
+                with open(os.path.join(base, filename), "w", encoding="utf-8") as fh:
+                    fh.write(text)
+        return base
+
+    def test_complete_container_becomes_a_target(self):
+        self._container("web", status=self.STATUS)
+        targets, skipped = vf.container_targets(self.dir)
+        self.assertEqual(skipped, [])
+        self.assertEqual(targets[0].name, "web")
+        self.assertEqual(targets[0].release, "12")
+        self.assertEqual([p.name for p in targets[0].packages], ["openssl"])
+
+    def test_unsupported_marker_wins_and_carries_the_reason(self):
+        self._container("alpine", unsupported="keine dpkg-Paketliste im Container")
+        targets, skipped = vf.container_targets(self.dir)
+        self.assertEqual(targets, [])
+        self.assertEqual(skipped[0].name, "alpine")
+        self.assertIn("dpkg", skipped[0].reason)
+
+    def test_container_without_os_release_is_skipped_not_guessed(self):
+        # Ein bookworm-Host und ein trixie-Container haben verschiedene
+        # Fixversionen. Lieber nicht pruefen als gegen die falsche Suite.
+        self._container("fremd", status=self.STATUS, os_release=None)
+        targets, skipped = vf.container_targets(self.dir)
+        self.assertEqual(targets, [])
+        self.assertIn("Debian-Version", skipped[0].reason)
+
+    def test_non_debian_container_is_skipped(self):
+        self._container("alpine", status=self.STATUS,
+                        os_release='ID=alpine\nVERSION_ID="3.19.1"\n')
+        targets, skipped = vf.container_targets(self.dir)
+        self.assertEqual(targets, [])
+        self.assertEqual(skipped[0].name, "alpine")
+
+    def test_empty_status_file_is_skipped(self):
+        self._container("leer", status="")
+        _, skipped = vf.container_targets(self.dir)
+        self.assertIn("kein installiertes Paket", skipped[0].reason)
+
+    def test_missing_directory_is_reported_not_raised(self):
+        targets, skipped = vf.container_targets(os.path.join(self.dir, "weg"))
+        self.assertEqual(targets, [])
+        self.assertIn("nicht lesbar", skipped[0].reason)
+
+    def test_release_is_read_from_the_container_itself(self):
+        self.assertEqual(vf.container_release('ID=debian\nVERSION_ID="13"\n'), "13")
+        self.assertEqual(vf.container_release("VERSION_CODENAME=bookworm\n"), "12")
+        self.assertIsNone(vf.container_release('ID=alpine\nVERSION_ID="3.19"\n'))
+        self.assertIsNone(vf.container_release(""))
+
+    def test_age_of_the_stamp_file(self):
+        self.assertIsNone(vf.container_list_age(self.dir))
+        stamp = os.path.join(self.dir, vf.CONTAINER_STAMP_FILE)
+        with open(stamp, "w", encoding="utf-8") as fh:
+            fh.write("")
+        self.assertLess(vf.container_list_age(self.dir), timedelta(minutes=5))
+        old = datetime.now(timezone.utc) - timedelta(hours=100)
+        os.utime(stamp, (old.timestamp(), old.timestamp()))
+        self.assertGreater(vf.container_list_age(self.dir), vf.CONTAINER_STAMP_MAX_AGE)
+
+
+class TestScanAcrossTargets(unittest.TestCase):
+    """Host und Container in einem Lauf."""
+
+    STATUS = ("Package: openssl\n"
+              "Status: install ok installed\n"
+              "Version: 3.0.11-1~deb12u2\n")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.queries = []
+
+    def _patch(self, name: str, value) -> None:
+        original = getattr(vf, name)
+        setattr(vf, name, value)
+        self.addCleanup(setattr, vf, name, original)
+
+    def _container(self, name: str, **files) -> None:
+        base = os.path.join(self.tmp.name, name)
+        os.makedirs(base, exist_ok=True)
+        defaults = {vf.CONTAINER_STATUS_FILE: self.STATUS,
+                    vf.CONTAINER_OS_RELEASE_FILE: 'ID=debian\nVERSION_ID="13"\n'}
+        defaults.update(files)
+        for filename, text in defaults.items():
+            with open(os.path.join(base, filename), "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+    def _touch_stamp(self) -> None:
+        with open(os.path.join(self.tmp.name, vf.CONTAINER_STAMP_FILE),
+                  "w", encoding="utf-8") as fh:
+            fh.write("")
+
+    def _scan(self, vulns: dict, host_packages=(vf.Package("openssl", "3.0.11-1"),),
+              host_error: str | None = None, **options) -> list[vf.Entry]:
+        def packages(opts, timeout):
+            if host_error:
+                raise vf.LocalScanError(host_error)
+            return list(host_packages)
+
+        def fake_batch(queries, timeout):
+            self.queries = queries
+            answers = []
+            for name, version, _ecosystem in queries:
+                real, sentinel = vulns.get(name, ([], []))
+                answers.append(sentinel if version == vf.OSV_SENTINEL_VERSION else real)
+            return answers
+
+        self._patch("installed_packages", packages)
+        self._patch("osv_batch", fake_batch)
+        return vf.scan_local(
+            vf.LocalOptions(release="12", containers=self.tmp.name, **options), 20.0
+        )
+
+    def test_each_target_is_queried_with_its_own_release(self):
+        self._container("web")  # trixie, waehrend der Host bookworm ist
+        self._touch_stamp()
+        self._scan({})
+        self.assertEqual({q[2] for q in self.queries}, {"Debian:12", "Debian:13"})
+
+    def test_findings_name_the_container_they_came_from(self):
+        self._container("web")
+        self._touch_stamp()
+        entries = self._scan({"openssl": (["DEBIAN-CVE-2024-1001"], [])})
+        by_source = {e.source: e for e in entries}
+        self.assertEqual(set(by_source), {"Lokales System", "Container web"})
+        self.assertEqual(by_source["Container web"].affects_local, ["openssl (web)"])
+        self.assertEqual(by_source["Lokales System"].affects_local, ["openssl"])
+
+    def test_same_package_on_host_and_container_are_separate_entries(self):
+        # Gleicher Link, gleiche CVEs - ohne das Ziel im Schluessel wuerde der
+        # Zustand den zweiten Fund schlucken.
+        self._container("web")
+        self._touch_stamp()
+        entries = self._scan({"openssl": (["DEBIAN-CVE-2024-1001"], [])})
+        self.assertEqual(len({e.state_key for e in entries}), 2)
+        self.assertEqual(len(vf.dedupe(entries)), 2)
+
+    def test_container_finding_points_at_the_image_not_at_apt(self):
+        self._container("web")
+        self._touch_stamp()
+        entries = self._scan({"openssl": (["DEBIAN-CVE-2024-1001"], [])})
+        container = next(e for e in entries if e.source == "Container web")
+        self.assertNotIn("apt install", container.summary)
+        self.assertIn("Basisimage", container.summary)
+
+    def test_unscannable_container_is_reported_not_swallowed(self):
+        self._container("alpine", **{vf.CONTAINER_UNSUPPORTED_FILE: "kein dpkg im Image"})
+        self._touch_stamp()
+        entries = self._scan({})
+        note = next(e for e in entries if "nicht pruefbar" in e.title)
+        self.assertIn("alpine", note.title)
+        self.assertIn("kein dpkg im Image", note.summary)
+        self.assertTrue(note.is_vuln, "darf nicht am Themenfilter haengenbleiben")
+
+    def test_failed_host_scan_does_not_stop_the_containers(self):
+        self._container("web")
+        self._touch_stamp()
+        entries = self._scan({"openssl": (["DEBIAN-CVE-2024-1001"], [])},
+                             host_error="dpkg-query nicht gefunden")
+        self.assertTrue(any(e.source == "Container web" and e.cves for e in entries))
+        note = next(e for e in entries if "nicht pruefbar" in e.title)
+        self.assertIn("Lokales System", note.title)
+
+    def test_nothing_scannable_at_all_fails_the_source(self):
+        with self.assertRaises(vf.LocalScanError) as caught:
+            self._scan({}, host_error="dpkg-query nicht gefunden")
+        self.assertIn("dpkg-query nicht gefunden", str(caught.exception))
+
+    def test_stale_lists_are_flagged(self):
+        # Ein stehengebliebener Timer darf nicht als "alles ruhig" durchgehen.
+        self._container("web")
+        self._touch_stamp()
+        stamp = os.path.join(self.tmp.name, vf.CONTAINER_STAMP_FILE)
+        old = datetime.now(timezone.utc) - timedelta(hours=100)
+        os.utime(stamp, (old.timestamp(), old.timestamp()))
+        entries = self._scan({})
+        self.assertTrue(any("veraltet" in e.title for e in entries))
+
+    def test_missing_stamp_counts_as_stale(self):
+        self._container("web")
+        entries = self._scan({})
+        self.assertTrue(any("veraltet" in e.title for e in entries))
+
+    def test_fresh_lists_produce_no_warning(self):
+        self._container("web")
+        self._touch_stamp()
+        entries = self._scan({})
+        self.assertFalse(any("veraltet" in e.title for e in entries))
+
+    def test_operational_notes_do_not_count_as_findings(self):
+        # "nicht pruefbar" ist eine Betriebsmeldung, kein Befund - sie darf den
+        # Betreff nicht mit "betrifft dieses System" faerben.
+        self._container("alpine", **{vf.CONTAINER_UNSUPPORTED_FILE: "kein dpkg"})
+        self._touch_stamp()
+        entries = self._scan({})
+        cfg = vf.MailConfig(host="h", port=25, sender="a@b.de", recipients=["c@d.de"])
+        subject = vf.build_message(cfg, entries, "Test")["Subject"]
+        self.assertNotIn("betreffen dieses System", subject)
+
+    def test_entries_without_a_link_render_everywhere(self):
+        self._container("alpine", **{vf.CONTAINER_UNSUPPORTED_FILE: "kein dpkg"})
+        self._touch_stamp()
+        entries = self._scan({})
+        note = [e for e in entries if "nicht pruefbar" in e.title]
+        self.assertNotIn('href=""', vf.render_html(note, "Test"))
+        self.assertNotIn("]()", vf.render_markdown(note))
+        self.assertIn("nicht pruefbar", vf.render_table(note))
 
 
 class TestLocalCorrelation(unittest.TestCase):

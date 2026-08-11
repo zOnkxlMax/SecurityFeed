@@ -75,6 +75,7 @@ py -3 vulnfeed.py --cve-only --since 3
 | ------------------- | ------------------------ | -------------------------------------- |
 | `--local`           | `SECFEED_LOCAL`          | Scan zusätzlich zu den News laufen lassen |
 | `--dpkg-status`     | `SECFEED_DPKG_STATUS`    | Statusdatei lesen statt `dpkg-query` aufzurufen |
+| `--container-lists` | `SECFEED_CONTAINER_LISTS` | Auch die abgelegten Paketlisten der Container prüfen |
 | `--debian-release`  | `SECFEED_DEBIAN_RELEASE` | Debian-Hauptversion erzwingen, z. B. `12` |
 | `--local-unfixed`   | `SECFEED_LOCAL_UNFIXED`  | Auch Lücken ohne verfügbares Update melden |
 
@@ -213,6 +214,37 @@ darauf zeigen — Details in [docs/DOCKER.md](docs/DOCKER.md):
 ```bash
 docker compose run --rm -v /var/lib/dpkg/status:/host/dpkg-status:ro securityfeed --once -s local --dpkg-status /host/dpkg-status --since 0
 ```
+
+### Die anderen Container mitprüfen
+
+Naheliegend wäre, SecurityFeed den Docker-Socket zu geben. Genau das tut es
+**nicht** — wer `/var/run/docker.sock` hat, ist faktisch root auf dem Host, und
+das ausgerechnet bei dem Dienst, der die Sicherheit überwachen soll.
+
+Stattdessen legt [`deploy/dump-container-packages.sh`](deploy/dump-container-packages.sh)
+auf dem Host die Paketliste jedes laufenden Containers in einem Verzeichnis ab
+(per Timer, stündlich). SecurityFeed liest nur dieses Verzeichnis, nur lesend,
+und sieht ausschließlich Textdateien:
+
+```bash
+python3 vulnfeed.py --local --container-lists /var/lib/securityfeed/containers --since 2
+```
+
+Jeder Fund nennt dann seine Herkunft — „Lokales System" oder „Container
+nextcloud" — und die Debian-Version wird **je Container** aus dessen eigener
+`/etc/os-release` gelesen. Das ist kein Detail: dasselbe `openssl 3.0.11` ergibt
+gegen Debian 12 neununddreißig Treffer und gegen Debian 13 vierundfünfzig.
+
+Zwei Dinge, die bewusst laut sind statt still:
+
+- **Container ohne `dpkg`** (Alpine, distroless, scratch) erscheinen als
+  „nicht prüfbar" samt Imagename, statt einfach zu fehlen. Ein ungeprüfter
+  Container darf nicht aussehen wie ein unauffälliger.
+- **Veraltete Listen** melden sich selbst. Bleibt der Timer stehen, steht ab 48
+  Stunden ein Hinweis in der Mail — ein stehengebliebener Sammler, der „alles
+  ruhig" suggeriert, wäre die gefährlichste Art, falsch zu liegen.
+
+Einrichtung Schritt für Schritt in [docs/DOCKER.md](docs/DOCKER.md#auch-die-anderen-container-prüfen).
 
 ## Geplanter Betrieb
 

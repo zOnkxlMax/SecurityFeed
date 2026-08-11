@@ -1,0 +1,20 @@
+[Unit]
+Description=Paketlisten der Container regelmaessig auffrischen
+Documentation=https://github.com/zOnkxlMax/SecurityFeed
+
+[Timer]
+# Stuendlich reicht: Container wechseln ihre Pakete nur beim Neubau. Wichtig
+# ist vor allem, dass die Listen nicht veralten - SecurityFeed meldet das sonst
+# ausdruecklich, statt einen alten Stand als aktuell auszugeben.
+OnCalendar=hourly
+
+# Nach einem Neustart nicht warten, sonst sind die Listen bis zur naechsten
+# vollen Stunde vom Stand vor dem Reboot.
+Persistent=true
+OnBootSec=5min
+
+# Damit nicht alle Timer gleichzeitig losrennen.
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
