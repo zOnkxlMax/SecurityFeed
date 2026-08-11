@@ -1,0 +1,27 @@
+[Unit]
+Description=Paketlisten der laufenden Container fuer SecurityFeed ablegen
+Documentation=https://github.com/zOnkxlMax/SecurityFeed
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+
+# Braucht Docker-Zugriff und laeuft deshalb als root - bewusst hier und nicht
+# im SecurityFeed-Container, der ohne jede Docker-Berechtigung auskommt.
+ExecStart=/opt/securityfeed/dump-container-packages.sh /var/lib/securityfeed/containers
+
+TimeoutStartSec=300
+
+# Haertung, soweit es mit Docker-Zugriff geht.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
