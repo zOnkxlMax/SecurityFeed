@@ -326,6 +326,38 @@ Zwei Dinge, die du wissen solltest:
 sudo apt update && apt list --upgradable
 ```
 
+### Auch die Docker-Container prüfen
+
+Falls auf dem Pi zusätzlich Container laufen: ein Skript legt stündlich die
+Paketliste jedes laufenden Containers ab, SecurityFeed liest sie nur lesend.
+Bewusst getrennt — den Docker-Socket bekommt SecurityFeed nicht, wer ihn hat,
+ist faktisch root auf dem Pi.
+
+```bash
+sudo install -m 0755 deploy/dump-container-packages.sh /opt/securityfeed/
+sudo install -m 0644 deploy/securityfeed-containers.service deploy/securityfeed-containers.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now securityfeed-containers.timer
+```
+
+Einmal von Hand laufen lassen und ansehen, was er einsammelt:
+
+```bash
+sudo systemctl start securityfeed-containers.service && ls -R /var/lib/securityfeed/containers
+```
+
+Dann in der env-Datei ergänzen:
+
+```bash
+SECFEED_CONTAINER_LISTS=/var/lib/securityfeed/containers
+```
+
+Jeder Fund nennt danach seine Herkunft — „Lokales System" oder „Container
+nextcloud". Container ohne `dpkg` (Alpine, distroless) erscheinen ausdrücklich
+als „nicht prüfbar", und bleibt der Timer stehen, meldet SecurityFeed die
+veralteten Listen von sich aus. Behoben werden Container-Funde nicht per `apt`,
+sondern über ein neues Image.
+
 Ausführlich zur Funktionsweise und zu den Grenzen: Abschnitt „Paketscan" in der
 [README](../README.md#paketscan-was-steckt-hier-drin).
 

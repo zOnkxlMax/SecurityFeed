@@ -325,6 +325,74 @@ Wenn `SECFEED_LOCAL=1` gesetzt, der Mount aber vergessen wurde, steht in der
 Mail eine Warnung „Lokales System: dpkg-Statusdatei nicht lesbar
 (/host/dpkg-status)" — die übrigen Quellen laufen normal weiter.
 
+### Auch die anderen Container prüfen
+
+Naheliegend wäre, SecurityFeed den Docker-Socket zu geben. Genau das tut es
+**nicht**: wer `/var/run/docker.sock` hat, ist faktisch root auf dem Pi — bei
+dem Dienst, der die Sicherheit überwachen soll, ein schlechter Tausch, und er
+würde `read_only`, `cap_drop: ALL` und `no-new-privileges` aushebeln.
+
+Stattdessen holt ein kleines Skript auf dem Host die Paketlisten ab und legt
+sie in einem Verzeichnis ab. SecurityFeed liest nur dieses Verzeichnis, nur
+lesend, und sieht ausschließlich Textdateien.
+
+**1. Skript und Timer auf dem Host einrichten:**
+
+```bash
+sudo install -d -m 0755 /opt/securityfeed
+sudo install -m 0755 deploy/dump-container-packages.sh /opt/securityfeed/
+sudo install -m 0644 deploy/securityfeed-containers.service deploy/securityfeed-containers.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now securityfeed-containers.timer
+```
+
+Einmal von Hand laufen lassen und ansehen, was er findet:
+
+```bash
+sudo systemctl start securityfeed-containers.service && ls -R /var/lib/securityfeed/containers
+```
+
+**2. Verzeichnis einhängen** — in dieselbe `compose.override.yaml`:
+
+```yaml
+services:
+  securityfeed:
+    volumes:
+      - /var/lib/dpkg/status:/host/dpkg-status:ro
+      - /var/lib/securityfeed/containers:/host/containers:ro
+```
+
+**3. In der `.env` einschalten:**
+
+```bash
+SECFEED_CONTAINER_LISTS=/host/containers
+```
+
+Dann `docker compose up -d`. Ein Testlauf vorab:
+
+```bash
+docker compose run --rm securityfeed --once --no-state -s local --since 0
+```
+
+Jeder Fund nennt jetzt seine Herkunft — „Lokales System" oder
+„Container nextcloud". Und die Debian-Version wird **je Container** aus dessen
+eigener `/etc/os-release` gelesen, nicht vom Host übernommen: dasselbe
+`openssl 3.0.11` ergibt gegen Debian 12 neununddreißig Treffer und gegen
+Debian 13 vierundfünfzig. Mit der Version des Hosts wäre die Hälfte der
+Container falsch bewertet.
+
+Zwei Dinge, die das Verfahren bewusst anders macht als ein stiller Scanner:
+
+- **Container ohne `dpkg`** (Alpine, distroless, scratch) erscheinen als
+  „Container xy: nicht prüfbar" samt Imagename. Sie fehlen nicht einfach — sonst
+  sähe ein ungeprüfter Container aus wie ein unauffälliger.
+- **Veraltete Listen** melden sich selbst. Bleibt der Timer stehen, steht ab 48
+  Stunden „Container-Paketlisten veraltet" in der Mail, statt einen alten Stand
+  als aktuell auszugeben.
+
+Behoben werden Container-Funde nicht mit `apt` auf dem Pi, sondern über das
+Image — Basisimage aktualisieren und neu bauen. Der Eintrag sagt das auch so.
+
 ---
 
 ## Betrieb

@@ -106,6 +106,20 @@ OSV_CHUNK = 250
 DEBIAN_TRACKER_URL = "https://security-tracker.debian.org/tracker/source-package/"
 DPKG_STATUS_PATH = "/var/lib/dpkg/status"
 
+# Verzeichnis mit den abgelegten Paketlisten der Container, je Container ein
+# Unterverzeichnis. Befuellt wird es auf dem Host von
+# deploy/dump-container-packages.sh - SecurityFeed selbst bekommt bewusst
+# keinen Docker-Zugriff, der Socket waere faktisch Root auf dem Pi.
+CONTAINER_STATUS_FILE = "status"
+CONTAINER_OS_RELEASE_FILE = "os-release"
+CONTAINER_UNSUPPORTED_FILE = "unsupported"  # Grund, falls keine Liste lesbar
+CONTAINER_STAMP_FILE = "updated"            # mtime = letzter Lauf des Skripts
+
+# Aelter als das, und die Listen beschreiben womoeglich Container, die es so
+# nicht mehr gibt. Ein stehengebliebener Timer darf nicht als "alles ruhig"
+# durchgehen - das waere die gefaehrlichste Art, falsch zu liegen.
+CONTAINER_STAMP_MAX_AGE = timedelta(hours=48)
+
 # /etc/debian_version nennt nur den Codenamen, OSV will die Nummer.
 CODENAME_RELEASES = {
     "buster": "10", "bullseye": "11", "bookworm": "12", "trixie": "13", "forky": "14",
@@ -346,6 +360,7 @@ class LocalOptions:
     status_path: str | None = None  # dpkg-Statusdatei statt dpkg-query
     release: str | None = None      # Debian-Hauptversion, z.B. "12"
     unfixed: bool = False           # auch Luecken ohne verfuegbaren Fix melden
+    containers: str | None = None   # Verzeichnis mit Container-Paketlisten
 
 
 @dataclass(frozen=True)
@@ -355,6 +370,33 @@ class Package:
     name: str
     version: str
     binaries: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScanTarget:
+    """Ein zu pruefendes System: der Host oder einer der Container."""
+    name: str  # "" = Host, sonst der Containername
+    packages: tuple[Package, ...] = ()
+    release: str = ""
+
+    @property
+    def label(self) -> str:
+        """Was in der Mail als Quelle des Eintrags steht."""
+        return f"Container {self.name}" if self.name else "Lokales System"
+
+    def qualify(self, package: str) -> str:
+        """Paketname mit Herkunft - 'openssl' steckt auf dem Pi und in drei
+        Containern, und das ist nicht dasselbe Problem."""
+        return f"{package} ({self.name})" if self.name else package
+
+
+@dataclass(frozen=True)
+class SkippedTarget:
+    """Ein System, das sich nicht pruefen liess. Kommt ausdruecklich in die
+    Mail: stillschweigend uebergangene Container waeren die schlechtere
+    Variante von 'keine Befunde'."""
+    name: str
+    reason: str
 
 
 # ${source:Version} faellt automatisch auf die Binaerversion zurueck, wenn das
@@ -508,15 +550,97 @@ def installed_packages(opts: LocalOptions, timeout: float) -> list[Package]:
     return packages
 
 
-def osv_batch(queries: list[tuple[str, str]], ecosystem: str,
-              timeout: float) -> list[list[str]]:
-    """[(Paket, Version)] -> je Abfrage die OSV-IDs, in derselben Reihenfolge."""
+def container_release(os_release_text: str) -> str | None:
+    """Debian-Hauptversion eines Containers, oder None. Bewusst ohne Rueckfall
+    auf die Version des Hosts: ein bookworm-Host und ein trixie-Container haben
+    verschiedene Fixversionen, und ein Vergleich gegen die falsche Suite waere
+    schlimmer als gar keiner."""
+    fields = parse_os_release(os_release_text)
+    if fields.get("ID", "").lower() not in ("", "debian"):
+        return None
+    version_id = fields.get("VERSION_ID", "")
+    if version_id.isdigit():
+        return version_id
+    return CODENAME_RELEASES.get(fields.get("VERSION_CODENAME", "").lower())
+
+
+def host_target(opts: LocalOptions, timeout: float) -> ScanTarget:
+    packages = installed_packages(opts, timeout)
+    release = opts.release or os.environ.get("SECFEED_DEBIAN_RELEASE") or debian_release()
+    return ScanTarget(name="", packages=tuple(packages), release=release.strip())
+
+
+def read_container_list(directory: str, name: str) -> ScanTarget | SkippedTarget:
+    """Ein Unterverzeichnis aus dem Ablageordner lesen."""
+    base = os.path.join(directory, name)
+
+    # Das Dump-Skript legt diese Datei an, wenn es an einem Container gar nicht
+    # erst herankam - so faellt der Container auf, statt zu fehlen.
+    try:
+        with open(os.path.join(base, CONTAINER_UNSUPPORTED_FILE),
+                  "r", encoding="utf-8", errors="replace") as fh:
+            return SkippedTarget(name, fh.read().strip() or "keine Paketliste vorhanden")
+    except OSError:
+        pass
+
+    try:
+        with open(os.path.join(base, CONTAINER_STATUS_FILE),
+                  "r", encoding="utf-8", errors="replace") as fh:
+            packages = parse_dpkg_status(fh.read())
+    except OSError as exc:
+        return SkippedTarget(name, f"Paketliste nicht lesbar: {exc}")
+    if not packages:
+        return SkippedTarget(name, "Paketliste enthaelt kein installiertes Paket")
+
+    try:
+        with open(os.path.join(base, CONTAINER_OS_RELEASE_FILE),
+                  "r", encoding="utf-8", errors="replace") as fh:
+            release = container_release(fh.read())
+    except OSError:
+        release = None
+    if not release:
+        return SkippedTarget(
+            name, "Debian-Version nicht erkennbar - kein Debian-Container?"
+        )
+    return ScanTarget(name=name, packages=tuple(packages), release=release)
+
+
+def container_targets(directory: str) -> tuple[list[ScanTarget], list[SkippedTarget]]:
+    try:
+        names = sorted(
+            item for item in os.listdir(directory)
+            if os.path.isdir(os.path.join(directory, item))
+        )
+    except OSError as exc:
+        return [], [SkippedTarget("", f"Ablageordner nicht lesbar ({directory}): {exc}")]
+
+    targets: list[ScanTarget] = []
+    skipped: list[SkippedTarget] = []
+    for name in names:
+        result = read_container_list(directory, name)
+        (targets if isinstance(result, ScanTarget) else skipped).append(result)
+    return targets, skipped
+
+
+def container_list_age(directory: str) -> timedelta | None:
+    """Wie alt der letzte Lauf des Dump-Skripts ist. None = kein Zeitstempel."""
+    try:
+        stamp = os.path.getmtime(os.path.join(directory, CONTAINER_STAMP_FILE))
+    except OSError:
+        return None
+    return datetime.now(timezone.utc) - datetime.fromtimestamp(stamp, timezone.utc)
+
+
+def osv_batch(queries: list[tuple[str, str, str]], timeout: float) -> list[list[str]]:
+    """[(Paket, Version, Oekosystem)] -> je Abfrage die OSV-IDs, in derselben
+    Reihenfolge. Das Oekosystem haengt an der einzelnen Abfrage, damit Host und
+    Container mit verschiedenen Debian-Versionen in einen Request passen."""
     results: list[list[str]] = []
     for start in range(0, len(queries), OSV_CHUNK):
         chunk = queries[start:start + OSV_CHUNK]
         body = json.dumps({"queries": [
             {"package": {"name": name, "ecosystem": ecosystem}, "version": version}
-            for name, version in chunk
+            for name, version, ecosystem in chunk
         ]}).encode("utf-8")
         request = urllib.request.Request(
             OSV_BATCH_URL, data=body, method="POST",
@@ -554,7 +678,7 @@ def cve_id(osv_id: str) -> str:
     return stripped if CVE_RE.fullmatch(stripped) else osv_id
 
 
-def local_entry(source: Source, package: Package, cves: list[str], unfixed: int,
+def local_entry(target: ScanTarget, package: Package, cves: list[str], unfixed: int,
                 now: datetime, *, fixable: bool = True,
                 truncated: bool = False) -> Entry:
     binaries = list(package.binaries) or [package.name]
@@ -588,11 +712,16 @@ def local_entry(source: Source, package: Package, cves: list[str], unfixed: int,
 
     summary += f"Installiert als: {shown}."
     if fixable and not truncated:
-        summary += " Beheben mit: sudo apt update && sudo apt install --only-upgrade " \
-                   + " ".join(binaries[:6])
+        update = "sudo apt update && sudo apt install --only-upgrade " + " ".join(binaries[:6])
+        # Im Container hilft kein apt auf dem Host - dort ist das Image dran.
+        summary += (
+            f" Beheben ueber ein neues Image: das Basisimage von '{target.name}' "
+            "aktualisieren und neu bauen."
+            if target.name else f" Beheben mit: {update}"
+        )
 
     return Entry(
-        source=source.label,
+        source=target.label,
         title=title,
         link=DEBIAN_TRACKER_URL + urllib.parse.quote(package.name),
         published=now,
@@ -602,51 +731,128 @@ def local_entry(source: Source, package: Package, cves: list[str], unfixed: int,
         local=True,
         # Beim Scan-Eintrag ist das betroffene Paket er selbst. So kommt
         # mark_local_matches an den Namen, ohne ihn aus dem Titel zu klauben.
-        affects_local=[package.name],
+        affects_local=[target.qualify(package.name)],
         # Der Link zeigt fuer ein Paket immer auf dieselbe Tracker-Seite. Ohne
-        # Anzahl und juengste CVE im Schluessel bliebe jede spaeter dazu
-        # gekommene Luecke ungemeldet.
-        key=f"local:{package.name}:{len(cves)}:{max(cves) if cves else package.version}",
+        # Ziel, Anzahl und juengste CVE im Schluessel bliebe jede spaeter dazu
+        # gekommene Luecke ungemeldet - und dasselbe Paket auf Host und in
+        # einem Container waere derselbe Eintrag.
+        key=f"local:{target.name or 'host'}:{package.name}:{len(cves)}:"
+            f"{max(cves) if cves else package.version}",
     )
 
 
-def scan_local(source: Source, opts: LocalOptions, timeout: float) -> list[Entry]:
-    packages = installed_packages(opts, timeout)
-    release = opts.release or os.environ.get("SECFEED_DEBIAN_RELEASE") or debian_release()
-    ecosystem = f"Debian:{release.strip()}"
+def unscanned_entry(skipped: SkippedTarget, now: datetime) -> Entry:
+    """Ein Ziel, das sich nicht pruefen liess. Ohne diesen Eintrag saehe ein
+    unpruefbarer Container aus wie ein unauffaelliger."""
+    what = f"Container {skipped.name}" if skipped.name else "Lokales System"
+    return Entry(
+        source=what,
+        title=f"{what}: nicht pruefbar",
+        link="",
+        published=now,
+        summary=f"{skipped.reason}. Dieses System steckt in keiner der obigen "
+                "Bewertungen - es wurde nicht geprueft, nicht fuer unauffaellig "
+                "befunden.",
+        advisory=True,
+        local=True,
+        key=f"local:{skipped.name or 'host'}:ungeprueft:{skipped.reason}",
+    )
+
+
+def stale_lists_entry(age: timedelta | None, directory: str, now: datetime) -> Entry:
+    alter = "kein Zeitstempel vorhanden" if age is None else f"{int(age.total_seconds() // 3600)} Stunden alt"
+    return Entry(
+        source="Lokales System",
+        title=f"Container-Paketlisten veraltet ({alter})",
+        link="",
+        published=now,
+        summary=f"Die Listen unter {directory} werden nicht mehr aktualisiert - "
+                "laeuft der Timer fuer dump-container-packages.sh noch? Bis dahin "
+                "beschreiben die Container-Befunde einen alten Stand. "
+                "Pruefen mit: systemctl status securityfeed-containers.timer",
+        advisory=True,
+        local=True,
+        # Einmal je Tag melden: ein einmaliger Hinweis geht unter, einer je Lauf
+        # ist Laerm.
+        key=f"local:containers:veraltet:{now.date().isoformat()}",
+    )
+
+
+def gather_targets(opts: LocalOptions,
+                   timeout: float) -> tuple[list[ScanTarget], list[SkippedTarget]]:
+    """Host und - falls konfiguriert - die abgelegten Container-Paketlisten.
+
+    Ein gescheitertes Ziel nimmt die anderen nicht mit: laeuft der Host-Scan
+    nicht, sollen die Container trotzdem geprueft werden und umgekehrt."""
+    targets: list[ScanTarget] = []
+    skipped: list[SkippedTarget] = []
+    try:
+        targets.append(host_target(opts, timeout))
+    except LocalScanError as exc:
+        skipped.append(SkippedTarget("", str(exc)))
+
+    directory = opts.containers or os.environ.get("SECFEED_CONTAINER_LISTS")
+    if directory:
+        found, missed = container_targets(directory)
+        targets.extend(found)
+        skipped.extend(missed)
+    return targets, skipped
+
+
+def scan_local(opts: LocalOptions, timeout: float) -> list[Entry]:
+    targets, skipped = gather_targets(opts, timeout)
+    if not targets:
+        raise LocalScanError(
+            "Kein pruefbares System gefunden. "
+            + "; ".join(f"{s.name or 'Host'}: {s.reason}" for s in skipped)
+        )
 
     # Je Paket zwei Abfragen: die echte Version und der Sentinel. Was beide
     # melden, ist ungefixt; die Differenz ist das, was ein Update schliesst.
-    queries: list[tuple[str, str]] = []
-    for package in packages:
-        queries.append((package.name, package.version))
-        queries.append((package.name, OSV_SENTINEL_VERSION))
+    # Alle Ziele wandern in denselben Stapel - das Oekosystem haengt an der
+    # einzelnen Abfrage, ein Request bedient also Host und Container zugleich.
+    queries: list[tuple[str, str, str]] = []
+    for target in targets:
+        ecosystem = f"Debian:{target.release}"
+        for package in target.packages:
+            queries.append((package.name, package.version, ecosystem))
+            queries.append((package.name, OSV_SENTINEL_VERSION, ecosystem))
     # Ein Paket im Feed-Timeout abzufragen ist etwas anderes als 500 Pakete in
     # zwei Dutzend Abfragen - die Antwort braucht hier schlicht laenger.
-    answers = osv_batch(queries, ecosystem, max(timeout, 60.0))
+    answers = osv_batch(queries, max(timeout, 60.0))
 
     now = datetime.now(timezone.utc)
-    entries = []
-    for index, package in enumerate(packages):
-        current, sentinel = answers[2 * index], answers[2 * index + 1]
-        if not current:
-            continue
-        if len(current) >= OSV_RESULT_CAP or len(sentinel) >= OSV_RESULT_CAP:
-            entries.append(local_entry(
-                source, package, sorted({cve_id(i) for i in current}), 0, now,
-                truncated=True,
-            ))
-            continue
+    entries = [unscanned_entry(item, now) for item in skipped]
 
-        unfixed = set(sentinel)
-        fixable = sorted({cve_id(i) for i in current if i not in unfixed})
-        if fixable:
-            entries.append(local_entry(source, package, fixable, len(unfixed), now))
-        elif opts.unfixed:
-            entries.append(local_entry(
-                source, package, sorted({cve_id(i) for i in unfixed}), 0, now,
-                fixable=False,
-            ))
+    directory = opts.containers or os.environ.get("SECFEED_CONTAINER_LISTS")
+    if directory:
+        age = container_list_age(directory)
+        if age is None or age > CONTAINER_STAMP_MAX_AGE:
+            entries.append(stale_lists_entry(age, directory, now))
+
+    position = 0
+    for target in targets:
+        for package in target.packages:
+            current, sentinel = answers[position], answers[position + 1]
+            position += 2
+            if not current:
+                continue
+            if len(current) >= OSV_RESULT_CAP or len(sentinel) >= OSV_RESULT_CAP:
+                entries.append(local_entry(
+                    target, package, sorted({cve_id(i) for i in current}), 0, now,
+                    truncated=True,
+                ))
+                continue
+
+            unfixed = set(sentinel)
+            fixable = sorted({cve_id(i) for i in current if i not in unfixed})
+            if fixable:
+                entries.append(local_entry(target, package, fixable, len(unfixed), now))
+            elif opts.unfixed:
+                entries.append(local_entry(
+                    target, package, sorted({cve_id(i) for i in unfixed}), 0, now,
+                    fixable=False,
+                ))
     return entries
 
 
@@ -677,7 +883,9 @@ def load_source(source: Source, timeout: float,
     root = None
     try:
         if source.kind == "local":
-            return source, scan_local(source, local or LocalOptions(), timeout), None
+            # Die Quellenbezeichnung kommt hier aus dem Scan selbst: "Lokales
+            # System" fuer den Host, "Container <name>" fuer die uebrigen.
+            return source, scan_local(local or LocalOptions(), timeout), None
         if source.kind == "hn":
             for url in hn_urls(source):
                 entries.extend(parse_hn(json.loads(fetch(url, timeout)), source))
@@ -789,7 +997,10 @@ def render_table(entries: list[Entry]) -> str:
         if entry.summary:
             summary = entry.summary if len(entry.summary) <= 200 else entry.summary[:197] + "..."
             lines.append(f"  {summary}")
-        lines.append(f"  {entry.link}")
+        # Der Paketscan meldet auch Dinge ohne Zielseite, etwa ein System, das
+        # sich nicht pruefen liess.
+        if entry.link:
+            lines.append(f"  {entry.link}")
         lines.append("")
     lines.append(f"{len(entries)} Meldung(en).")
     return "\n".join(lines)
@@ -806,7 +1017,8 @@ def render_markdown(entries: list[Entry]) -> str:
         listed, rest = shown_cves(entry)
         extra = f" +{rest} weitere" if rest else ""
         cves = f" — `{'`, `'.join(listed)}`{extra}" if listed else ""
-        lines.append(f"## [{entry.title}]({entry.link})")
+        lines.append(f"## [{entry.title}]({entry.link})" if entry.link
+                     else f"## {entry.title}")
         lines.append("")
         lines.append(f"*{entry.source} · {stamp}*{cves}")
         if entry.affects_local and not entry.local:
@@ -870,12 +1082,16 @@ def render_html(entries: list[Entry], subtitle: str,
             if entry.summary else ""
         )
         border = "#c81e1e" if (entry.local or entry.affects_local) else "#d0d0d0"
+        headline = (
+            f'<a href="{esc(entry.link)}" style="font-size:16px;font-weight:600;'
+            f'color:#1a4fa0;text-decoration:none">{esc(entry.title)}</a>'
+            if entry.link else
+            f'<div style="font-size:16px;font-weight:600">{esc(entry.title)}</div>'
+        )
         blocks.append(
             f'<div style="border-left:3px solid {border};padding:0 0 0 14px;margin:0 0 24px">'
             f'<div style="color:#777;font-size:12px">{meta}</div>'
-            f'<a href="{esc(entry.link)}" style="font-size:16px;font-weight:600;'
-            f'color:#1a4fa0;text-decoration:none">{esc(entry.title)}</a>'
-            f'{affected}{cves}{summary}</div>'
+            f'{headline}{affected}{cves}{summary}</div>'
         )
     footer = (
         f'<p style="color:#888;font-size:12px;border-top:1px solid #e0e0e0;padding-top:10px">'
@@ -1047,8 +1263,10 @@ def build_message(cfg: MailConfig, entries: list[Entry], subtitle: str,
     failed = failed or []
     count = len(entries)
     # Was dieses System betrifft, gehoert in den Betreff - sonst geht es
-    # zwischen zwanzig allgemeinen Meldungen unter.
-    concerned = [e for e in entries if e.local or e.affects_local]
+    # zwischen zwanzig allgemeinen Meldungen unter. Hinweise des Scans ohne
+    # CVE - "nicht pruefbar", "Listen veraltet" - zaehlen hier nicht mit, sie
+    # sind Betriebsmeldungen und kein Befund.
+    concerned = [e for e in entries if (e.local and e.cves) or e.affects_local]
     headline = (concerned or entries)[0].title if entries else "keine neuen Meldungen"
     if len(headline) > 70:
         headline = headline[:67] + "..."
@@ -1179,6 +1397,11 @@ def build_parser() -> argparse.ArgumentParser:
                       help=f"Statusdatei lesen statt dpkg-query aufzurufen - fuer den "
                            f"Container, in den {DPKG_STATUS_PATH} des Hosts eingehaengt "
                            f"ist (SECFEED_DPKG_STATUS).")
+    scan.add_argument("--container-lists", metavar="VERZEICHNIS",
+                      help="Zusaetzlich die dort abgelegten Paketlisten der Container "
+                           "pruefen, je Container ein Unterverzeichnis. Befuellt wird "
+                           "das Verzeichnis auf dem Host von "
+                           "deploy/dump-container-packages.sh (SECFEED_CONTAINER_LISTS).")
     scan.add_argument("--debian-release", metavar="N",
                       help="Debian-Hauptversion erzwingen, z.B. 12, falls sie sich nicht "
                            "aus /etc/os-release ergibt (SECFEED_DEBIAN_RELEASE).")
@@ -1250,6 +1473,7 @@ def local_options(args: argparse.Namespace) -> LocalOptions:
         status_path=args.dpkg_status,
         release=args.debian_release,
         unfixed=args.local_unfixed or env_flag("SECFEED_LOCAL_UNFIXED"),
+        containers=args.container_lists,
     )
 
 
