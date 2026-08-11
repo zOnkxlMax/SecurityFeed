@@ -247,6 +247,7 @@ gewünschten Argumente auf.
 | Wunsch | Argumente |
 | --- | --- |
 | Nur deutsche Advisories | `--source`, `heise-alerts` |
+| Auch die Pakete des Pi prüfen | siehe [Paketscan](#paketscan-die-pakete-des-hosts-prüfen) |
 | Hacker News weglassen | `--source` je einmal für `bleeping`, `heise-alerts`, `heise-security` |
 | Nur Meldungen mit CVE-Nummer | `--cve-only` statt `--details` |
 | Schneller, ohne CVE-Nummern | `--details` weglassen |
@@ -262,6 +263,62 @@ Prüfen, was Compose aus beiden Dateien zusammensetzt:
 ```bash
 docker compose config
 ```
+
+---
+
+## Paketscan: die Pakete des Hosts prüfen
+
+Zusätzlich zu den Nachrichtenquellen kann das Tool die auf dem Pi installierten
+Pakete gegen die OSV-Datenbank halten und melden, was davon in einer
+verwundbaren Version vorliegt. Meldungen, die dieses System wirklich betreffen,
+sind in der Mail dann eigens markiert.
+
+Der Container sieht seine eigenen Pakete, nicht die des Pi. Er braucht deshalb
+die Paketliste des Hosts. Zwei Handgriffe:
+
+**1. In der `compose.yaml` den Mount entkommentieren:**
+
+```yaml
+      - /var/lib/dpkg/status:/host/dpkg-status:ro
+```
+
+**2. In der `.env` einschalten:**
+
+```bash
+SECFEED_LOCAL=1
+```
+
+Dann neu starten:
+
+```bash
+docker compose up -d
+```
+
+Die Datei wird **nur lesend** eingehängt, und es ist nur diese eine Datei. Sie
+enthält Name und Version jedes installierten Pakets — genau das, was der
+Abgleich braucht, und nichts weiter.
+
+Vorher ausprobieren, ohne den Dienst anzufassen:
+
+```bash
+docker compose run --rm -v /var/lib/dpkg/status:/host/dpkg-status:ro securityfeed --once --no-state -s local --since 0
+```
+
+Auf einem gepflegten Pi kommt hier wenig bis nichts zurück — das ist das
+erwartete Ergebnis, kein Fehler. Ausführlich zur Funktionsweise und zu den
+Grenzen: Abschnitt „Paketscan" in der [README](../README.md#paketscan-was-steckt-hier-drin).
+
+Zwei Dinge, die du wissen solltest:
+
+- Der Scan schickt die Liste der installierten Pakete samt Versionen an
+  `api.osv.dev`. Deshalb ist er standardmäßig aus.
+- Pakete aus dem Raspberry-Pi-Repo (`raspberrypi-kernel`, Firmware) stehen nicht
+  in der Debian-Datenbank und werden stillschweigend übergangen. Für den Kernel
+  bleibt `sudo apt list --upgradable`.
+
+Wenn `SECFEED_LOCAL=1` gesetzt, der Mount aber vergessen wurde, steht in der
+Mail eine Warnung „Lokales System: dpkg-Statusdatei nicht lesbar
+(/host/dpkg-status)" — die übrigen Quellen laufen normal weiter.
 
 ---
 

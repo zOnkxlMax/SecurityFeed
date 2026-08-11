@@ -785,9 +785,412 @@ class TestArgumentParsing(unittest.TestCase):
             vf.build_parser().parse_args(["--source", "gibtsnicht"])
 
     def test_all_documented_sources_are_accepted(self):
-        for source in ("bleeping", "heise-alerts", "heise-security", "hackernews"):
+        for source in ("bleeping", "heise-alerts", "heise-security", "hackernews", "local"):
             args = vf.build_parser().parse_args(["--source", source])
             self.assertEqual(args.source, [source])
+
+
+# --------------------------------------------------------------------------
+# Paketscan
+# --------------------------------------------------------------------------
+
+# Die Fortsetzungszeile unter Description sieht wie ein Feld aus und wuerde,
+# falsch gelesen, die Version ueberschreiben - genau dafuer steht sie hier.
+DPKG_STATUS_FIXTURE = """Package: libssl3
+Status: install ok installed
+Priority: optional
+Architecture: arm64
+Source: openssl
+Version: 3.0.11-1~deb12u2
+Description: Secure Sockets Layer toolkit
+ Version: 9.9-9 gehoert zur Beschreibung, nicht zum Paket.
+
+Package: openssl
+Status: install ok installed
+Architecture: arm64
+Version: 3.0.11-1~deb12u2
+
+Package: python3.11-minimal
+Status: install ok installed
+Source: python3.11 (3.11.2-6+deb12u3)
+Version: 3.11.2-6+deb12u3
+
+Package: altlast
+Status: deinstall ok config-files
+Version: 1.0-1
+
+Package: halbfertig
+Status: install ok half-configured
+Version: 2.0-1
+"""
+
+DPKG_QUERY_FIXTURE = (
+    "installed\topenssl\t3.0.11-1~deb12u2\tlibssl3\n"
+    "installed\topenssl\t3.0.11-1~deb12u2\topenssl\n"
+    "config-files\taltlast\t1.0-1\taltlast\n"
+    "installed\t\t\tohne-quellpaket\n"
+    "voellig unbrauchbare zeile\n"
+)
+
+
+class TestDpkgParsing(unittest.TestCase):
+    def setUp(self):
+        self.packages = {p.name: p for p in vf.parse_dpkg_status(DPKG_STATUS_FIXTURE)}
+
+    def test_binary_package_is_folded_onto_its_source(self):
+        # OSV kennt nur Quellpakete - eine Abfrage nach 'libssl3' liefert nichts.
+        self.assertIn("openssl", self.packages)
+        self.assertNotIn("libssl3", self.packages)
+        self.assertEqual(self.packages["openssl"].binaries, ("libssl3", "openssl"))
+
+    def test_source_version_in_parentheses_wins(self):
+        self.assertEqual(self.packages["python3.11"].version, "3.11.2-6+deb12u3")
+        self.assertEqual(self.packages["python3.11"].binaries, ("python3.11-minimal",))
+
+    def test_continuation_lines_are_not_mistaken_for_fields(self):
+        self.assertEqual(self.packages["openssl"].version, "3.0.11-1~deb12u2")
+
+    def test_only_fully_installed_packages_count(self):
+        # Konfigurationsreste und halb entpackte Pakete liegen nicht als
+        # angreifbarer Code auf der Platte.
+        self.assertEqual(set(self.packages), {"openssl", "python3.11"})
+
+    def test_query_output_groups_binaries_per_source(self):
+        packages = vf.parse_dpkg_query(DPKG_QUERY_FIXTURE)
+        self.assertEqual([p.name for p in packages], ["openssl"])
+        self.assertEqual(packages[0].binaries, ("libssl3", "openssl"))
+
+    def test_query_output_skips_unusable_lines(self):
+        packages = {p.name for p in vf.parse_dpkg_query(DPKG_QUERY_FIXTURE)}
+        self.assertNotIn("altlast", packages)
+        self.assertNotIn("", packages)
+
+
+class TestDebianRelease(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _write(self, name: str, text: str) -> str:
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def _release(self, os_release: str = "", debian_version: str = "") -> str:
+        missing = os.path.join(self.tmp.name, "gibtsnicht")
+        return vf.debian_release(os_release or missing, debian_version or missing)
+
+    def test_raspberry_pi_os_is_recognised_as_debian(self):
+        # Raspberry Pi OS meldet sich in /etc/os-release als Debian - haette es
+        # eine eigene ID, wuerde der Scan auf dem Zielgeraet verweigern.
+        path = self._write("os-release", 'PRETTY_NAME="Raspberry Pi OS"\n'
+                                         'NAME="Debian GNU/Linux"\n'
+                                         'VERSION_ID="12"\n'
+                                         'VERSION="12 (bookworm)"\n'
+                                         "VERSION_CODENAME=bookworm\n"
+                                         "ID=debian\n")
+        self.assertEqual(self._release(os_release=path), "12")
+
+    def test_codename_is_translated_when_version_id_is_missing(self):
+        path = self._write("os-release", "ID=debian\nVERSION_CODENAME=trixie\n")
+        self.assertEqual(self._release(os_release=path), "13")
+
+    def test_debian_version_file_is_the_fallback(self):
+        self.assertEqual(self._release(debian_version=self._write("dv", "12.5\n")), "12")
+        self.assertEqual(self._release(debian_version=self._write("dv2", "trixie/sid\n")), "13")
+
+    def test_foreign_distribution_is_refused_with_a_hint(self):
+        path = self._write("os-release", "ID=ubuntu\nVERSION_ID=\"24.04\"\n")
+        with self.assertRaises(vf.LocalScanError) as caught:
+            self._release(os_release=path)
+        self.assertIn("ubuntu", str(caught.exception))
+        self.assertIn("--debian-release", str(caught.exception))
+
+    def test_nothing_recognisable_raises(self):
+        with self.assertRaises(vf.LocalScanError):
+            self._release()
+
+    def test_os_release_quotes_are_stripped(self):
+        fields = vf.parse_os_release('ID=debian\nVERSION_ID="12"\n# Kommentar\n')
+        self.assertEqual(fields, {"ID": "debian", "VERSION_ID": "12"})
+
+
+class TestCveId(unittest.TestCase):
+    def test_debian_prefix_is_removed(self):
+        self.assertEqual(vf.cve_id("DEBIAN-CVE-2025-9230"), "CVE-2025-9230")
+
+    def test_other_identifiers_stay_untouched(self):
+        self.assertEqual(vf.cve_id("GHSA-abcd-1234"), "GHSA-abcd-1234")
+        self.assertEqual(vf.cve_id("DEBIAN-DSA-5678-1"), "DEBIAN-DSA-5678-1")
+
+    def test_prefix_is_only_dropped_for_a_real_cve(self):
+        # CVE_RE verlangt mindestens vier Ziffern im Zaehler. Wird der Rest
+        # danach zu keiner gueltigen Nummer, bleibt die OSV-ID unangetastet -
+        # sonst entstuende eine Nummer, die es nirgends gibt.
+        self.assertEqual(vf.cve_id("DEBIAN-CVE-2024-1"), "DEBIAN-CVE-2024-1")
+
+
+class TestScanLocal(unittest.TestCase):
+    """Der Sentinel-Trick: eine zweite Abfrage mit absurd hoher Version nennt
+    genau die Luecken ohne Fix. Was nur die echte Abfrage meldet, schliesst ein
+    Update tatsaechlich."""
+
+    SOURCE = vf.Source("local", "Lokales System", vf.OSV_BATCH_URL, "local",
+                       always_vuln=True, default_on=False)
+
+    def _patch(self, name: str, value) -> None:
+        original = getattr(vf, name)
+        setattr(vf, name, value)
+        self.addCleanup(setattr, vf, name, original)
+
+    def _scan(self, packages: list[vf.Package], vulns: dict, **options) -> list[vf.Entry]:
+        """vulns: Paketname -> (IDs zur echten Version, IDs zum Sentinel)."""
+        self.queries: list[tuple[str, str]] = []
+        self.ecosystem = ""
+        self._patch("installed_packages", lambda opts, timeout: packages)
+
+        def fake_batch(queries, ecosystem, timeout):
+            self.queries, self.ecosystem = queries, ecosystem
+            answers = []
+            for name, version in queries:
+                real, sentinel = vulns.get(name, ([], []))
+                answers.append(sentinel if version == vf.OSV_SENTINEL_VERSION else real)
+            return answers
+
+        self._patch("osv_batch", fake_batch)
+        return vf.scan_local(self.SOURCE, vf.LocalOptions(release="12", **options), 20.0)
+
+    def test_only_the_fixable_difference_is_reported(self):
+        entries = self._scan(
+            [vf.Package("openssl", "3.0.11-1", ("libssl3", "openssl"))],
+            {"openssl": (["DEBIAN-CVE-2024-1001", "DEBIAN-CVE-2024-1002", "DEBIAN-CVE-2024-1003"],
+                         ["DEBIAN-CVE-2024-1003"])},
+        )
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].cves, ["CVE-2024-1001", "CVE-2024-1002"])
+        self.assertIn("2 Luecke(n) mit verfuegbarem Fix", entries[0].title)
+        self.assertIn("1 weitere", entries[0].summary)
+
+    def test_each_package_is_asked_twice_with_the_sentinel(self):
+        self._scan([vf.Package("openssl", "3.0.11-1")], {})
+        self.assertEqual(self.queries,
+                         [("openssl", "3.0.11-1"), ("openssl", vf.OSV_SENTINEL_VERSION)])
+        self.assertEqual(self.ecosystem, "Debian:12")
+
+    def test_package_without_findings_yields_nothing(self):
+        self.assertEqual(self._scan([vf.Package("bash", "5.2-1")], {}), [])
+
+    def test_unfixable_findings_are_hidden_by_default(self):
+        vulns = {"openssl": (["DEBIAN-CVE-2024-1003"], ["DEBIAN-CVE-2024-1003"])}
+        self.assertEqual(self._scan([vf.Package("openssl", "3.0.11-1")], vulns), [])
+
+        entries = self._scan([vf.Package("openssl", "3.0.11-1")], vulns, unfixed=True)
+        self.assertIn("ohne Fix", entries[0].title)
+        self.assertNotIn("apt install", entries[0].summary)
+
+    def test_truncated_result_is_flagged_instead_of_miscounted(self):
+        # Bei erreichter Obergrenze ist die Liste abgeschnitten und die
+        # Differenz wertlos - dann lieber ehrlich nichts behaupten.
+        many = [f"DEBIAN-CVE-2024-{1000 + i}" for i in range(vf.OSV_RESULT_CAP)]
+        entries = self._scan([vf.Package("linux", "6.1-1")], {"linux": (many, many)})
+        self.assertIn("sehr viele bekannte Luecken", entries[0].title)
+        self.assertNotIn("apt install", entries[0].summary)
+
+    def test_entry_survives_the_topic_and_age_filter(self):
+        entries = self._scan([vf.Package("openssl", "3.0.11-1")],
+                             {"openssl": (["DEBIAN-CVE-2024-1001"], [])})
+        self.assertTrue(entries[0].is_vuln)
+        self.assertTrue(entries[0].local)
+        self.assertIsNotNone(entries[0].published)
+        age = datetime.now(timezone.utc) - entries[0].published
+        self.assertLess(age, timedelta(minutes=5), "Scan-Eintraege sind immer aktuell")
+
+    def test_entry_links_to_the_tracker_and_names_the_update_command(self):
+        entries = self._scan([vf.Package("openssl", "3.0.11-1", ("libssl3", "openssl"))],
+                             {"openssl": (["DEBIAN-CVE-2024-1001"], [])})
+        self.assertEqual(entries[0].link,
+                         "https://security-tracker.debian.org/tracker/source-package/openssl")
+        self.assertIn("apt install --only-upgrade libssl3 openssl", entries[0].summary)
+
+    def test_key_changes_when_a_new_vulnerability_appears(self):
+        package = [vf.Package("openssl", "3.0.11-1")]
+        first = self._scan(package, {"openssl": (["DEBIAN-CVE-2024-1001"], [])})
+        second = self._scan(package, {"openssl": (["DEBIAN-CVE-2024-1001",
+                                                   "DEBIAN-CVE-2025-1009"], [])})
+        # Gleicher Link, also muesste der Zustand den zweiten Lauf schlucken -
+        # der eigene Schluessel verhindert genau das.
+        self.assertEqual(first[0].link, second[0].link)
+        self.assertNotEqual(first[0].state_key, second[0].state_key)
+
+
+class TestOsvBatch(unittest.TestCase):
+    def _patch_urlopen(self, handler) -> None:
+        original = vf.urllib.request.urlopen
+        vf.urllib.request.urlopen = handler
+        self.addCleanup(setattr, vf.urllib.request, "urlopen", original)
+
+    def _collect_requests(self, results_per_call):
+        sent = []
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def read(self):
+                return json.dumps(self.payload).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def handler(request, timeout=None):
+            body = json.loads(request.data)
+            sent.append(body["queries"])
+            count = len(body["queries"])
+            return Response({"results": results_per_call(count)})
+
+        self._patch_urlopen(handler)
+        return sent
+
+    def test_queries_are_split_into_chunks(self):
+        sent = self._collect_requests(lambda n: [{} for _ in range(n)])
+        queries = [(f"paket{i}", "1.0") for i in range(vf.OSV_CHUNK + 5)]
+        results = vf.osv_batch(queries, "Debian:12", 30.0)
+        self.assertEqual([len(chunk) for chunk in sent], [vf.OSV_CHUNK, 5])
+        self.assertEqual(len(results), len(queries))
+
+    def test_ids_are_extracted_in_order(self):
+        self._collect_requests(lambda n: [{"vulns": [{"id": "DEBIAN-CVE-2024-1001"}]}, {}])
+        results = vf.osv_batch([("a", "1"), ("b", "2")], "Debian:12", 30.0)
+        self.assertEqual(results, [["DEBIAN-CVE-2024-1001"], []])
+
+    def test_mismatched_answer_count_is_an_error(self):
+        # Sonst verschiebt sich die Zuordnung Paket <-> Antwort still.
+        self._collect_requests(lambda n: [{}])
+        with self.assertRaises(vf.LocalScanError):
+            vf.osv_batch([("a", "1"), ("b", "2")], "Debian:12", 30.0)
+
+
+class TestLocalCorrelation(unittest.TestCase):
+    """Der eigentliche Zweck: nicht 'es gibt eine Luecke', sondern 'sie steckt
+    hier drin'."""
+
+    def _entries(self):
+        scan = entry(source="Lokales System", title="openssl 3.0.11-1: 1 Luecke(n)",
+                     link="https://security-tracker.debian.org/tracker/source-package/openssl",
+                     cves=["CVE-2024-2511"], local=True, affects_local=["openssl"])
+        hit = entry(title="Angreifer nutzen OpenSSL-Luecke", link="https://example.test/1",
+                    cves=["CVE-2024-2511", "CVE-2024-9999"])
+        miss = entry(title="Luecke in fremder Software", link="https://example.test/2",
+                     cves=["CVE-2030-1000"])
+        return scan, hit, miss
+
+    def test_matching_news_entry_names_the_installed_package(self):
+        scan, hit, miss = self._entries()
+        vf.mark_local_matches([scan, hit, miss])
+        self.assertEqual(hit.affects_local, ["openssl"])
+        self.assertEqual(miss.affects_local, [])
+
+    def test_without_a_scan_nothing_is_marked(self):
+        _, hit, miss = self._entries()
+        vf.mark_local_matches([hit, miss])
+        self.assertEqual(hit.affects_local, [])
+
+    def test_subject_puts_the_affected_system_first(self):
+        scan, hit, miss = self._entries()
+        vf.mark_local_matches([scan, hit, miss])
+        cfg = vf.MailConfig(host="h", port=25, sender="a@b.de", recipients=["c@d.de"])
+        subject = vf.build_message(cfg, [miss, scan, hit], "Test")["Subject"]
+        self.assertIn("2 von 3", subject)
+        self.assertIn("betreffen dieses System", subject)
+
+    def test_rendering_marks_the_hit_but_not_the_scan_entry(self):
+        scan, hit, miss = self._entries()
+        vf.mark_local_matches([scan, hit, miss])
+        for text in (vf.render_table([scan, hit]), vf.render_markdown([scan, hit]),
+                     vf.render_html([scan, hit], "Test")):
+            self.assertIn("Betrifft dieses System", text)
+            # Beim Scan-Eintrag waere der Hinweis eine Doppelung - der Titel
+            # nennt das Paket bereits.
+            self.assertEqual(text.count("Betrifft dieses System"), 1)
+
+
+class TestStateKey(unittest.TestCase):
+    def test_explicit_key_wins_over_link(self):
+        self.assertEqual(entry(key="local:openssl:1:CVE-2024-1").state_key,
+                         "local:openssl:1:CVE-2024-1")
+
+    def test_link_is_the_default(self):
+        self.assertEqual(entry(link="https://a.test/1").state_key, "https://a.test/1")
+
+    def test_title_is_the_last_resort(self):
+        self.assertEqual(entry(link="", title="Ohne Link").state_key, "Ohne Link")
+
+    def test_dedupe_keeps_entries_that_share_a_link_but_not_a_key(self):
+        first = entry(link="https://a.test/pkg", key="local:pkg:1:CVE-2024-1")
+        second = entry(link="https://a.test/pkg", key="local:pkg:2:CVE-2025-1")
+        self.assertEqual(len(vf.dedupe([first, second])), 2)
+
+
+class TestCveDisplayCap(unittest.TestCase):
+    def test_long_cve_lists_are_shortened(self):
+        cves = [f"CVE-2024-{1000 + i}" for i in range(vf.CVE_DISPLAY_CAP + 7)]
+        listed, rest = vf.shown_cves(entry(cves=cves))
+        self.assertEqual(len(listed), vf.CVE_DISPLAY_CAP)
+        self.assertEqual(rest, 7)
+        for text in (vf.render_table([entry(cves=cves)]),
+                     vf.render_markdown([entry(cves=cves)]),
+                     vf.render_html([entry(cves=cves)], "Test")):
+            self.assertIn("+7 weitere", text)
+            self.assertNotIn(cves[-1], text)
+
+    def test_short_lists_stay_complete(self):
+        listed, rest = vf.shown_cves(entry(cves=["CVE-2024-1"]))
+        self.assertEqual((listed, rest), (["CVE-2024-1"], 0))
+        self.assertNotIn("weitere", vf.render_table([entry(cves=["CVE-2024-1"])]))
+
+
+class TestSourceSelection(unittest.TestCase):
+    def setUp(self):
+        self.previous = os.environ.pop("SECFEED_LOCAL", None)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        os.environ.pop("SECFEED_LOCAL", None)
+        if self.previous is not None:
+            os.environ["SECFEED_LOCAL"] = self.previous
+
+    def _keys(self, *argv) -> list[str]:
+        return [s.key for s in vf.select_sources(vf.build_parser().parse_args(list(argv)))]
+
+    def test_scan_stays_out_of_the_default_run(self):
+        # Auf einem Nicht-Debian-System scheitert er zwangslaeufig und wuerde
+        # jede Mail mit einer Ausfallwarnung verzieren.
+        self.assertNotIn("local", self._keys())
+        self.assertIn("bleeping", self._keys())
+
+    def test_local_flag_adds_the_scan_to_the_news(self):
+        self.assertIn("local", self._keys("--local"))
+        self.assertIn("bleeping", self._keys("--local"))
+
+    def test_environment_switch_works_like_the_flag(self):
+        os.environ["SECFEED_LOCAL"] = "1"
+        self.assertIn("local", self._keys())
+
+    def test_explicit_source_runs_the_scan_alone(self):
+        self.assertEqual(self._keys("-s", "local"), ["local"])
+
+    def test_scan_options_reach_the_scanner(self):
+        args = vf.build_parser().parse_args(
+            ["--dpkg-status", "/host/status", "--debian-release", "11", "--local-unfixed"]
+        )
+        options = vf.local_options(args)
+        self.assertEqual(options.status_path, "/host/status")
+        self.assertEqual(options.release, "11")
+        self.assertTrue(options.unfixed)
 
 
 if __name__ == "__main__":

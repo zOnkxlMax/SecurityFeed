@@ -15,6 +15,7 @@ Reines Python 3.10+ aus der Standardbibliothek — keine Abhängigkeiten, kein
 | `heise-alerts`   | heise Security Alerts (Atom)  | reine Schwachstellen-/Advisory-Meldungen  |
 | `heise-security` | heise Security (Atom)         | Security-News allgemein, wird gefiltert   |
 | `hackernews`     | Hacker News (Algolia-API)     | Diskutierte Security-Themen ab 50 Punkten |
+| `local`          | OSV-Datenbank + `dpkg`        | Verwundbare Pakete **auf diesem System** — nur mit `--local` |
 
 Hacker News läuft anders als die übrigen Quellen. Der Frontpage-Feed taugt
 dafür nicht — dort steht meist nichts Sicherheitsrelevantes. Stattdessen wird
@@ -37,7 +38,9 @@ anderen auf den Artikel; die Diskussion steht dann in der Beschreibung.
 py -3 vulnfeed.py
 ```
 
-Standard: alle drei Quellen, letzte 7 Tage, nur Meldungen mit Schwachstellenbezug.
+Standard: alle vier Nachrichtenquellen, letzte 7 Tage, nur Meldungen mit
+Schwachstellenbezug. Der Paketscan bleibt außen vor, bis du ihn mit `--local`
+dazuschaltest.
 
 ```bash
 py -3 vulnfeed.py --since 2 --limit 20
@@ -55,7 +58,7 @@ py -3 vulnfeed.py --cve-only --since 3
 
 | Option              | Bedeutung                                                        |
 | ------------------- | ---------------------------------------------------------------- |
-| `-s, --source`      | Nur bestimmte Quelle(n), mehrfach angebbar (Default: alle)        |
+| `-s, --source`      | Nur bestimmte Quelle(n), mehrfach angebbar (Default: alle Nachrichtenquellen) |
 | `-d, --since N`     | Nur Meldungen der letzten N Tage (`0` = alle im Feed), Default 7  |
 | `-n, --limit N`     | Maximale Anzahl Meldungen (`0` = unbegrenzt)                      |
 | `-f, --format`      | `table` (Default), `json` oder `markdown`                         |
@@ -65,6 +68,17 @@ py -3 vulnfeed.py --cve-only --since 3
 | `--detail-limit N`  | Höchstens N Artikelseiten nachladen (Default 25)                  |
 | `--timeout N`       | HTTP-Timeout pro Feed in Sekunden (Default 20)                    |
 | `-q, --quiet`       | Warnungen zu fehlgeschlagenen Feeds unterdrücken                  |
+
+### Paketscan
+
+| Option              | Umgebungsvariable        | Bedeutung                              |
+| ------------------- | ------------------------ | -------------------------------------- |
+| `--local`           | `SECFEED_LOCAL`          | Scan zusätzlich zu den News laufen lassen |
+| `--dpkg-status`     | `SECFEED_DPKG_STATUS`    | Statusdatei lesen statt `dpkg-query` aufzurufen |
+| `--debian-release`  | `SECFEED_DEBIAN_RELEASE` | Debian-Hauptversion erzwingen, z. B. `12` |
+| `--local-unfixed`   | `SECFEED_LOCAL_UNFIXED`  | Auch Lücken ohne verfügbares Update melden |
+
+Siehe Abschnitt [Paketscan](#paketscan-was-steckt-hier-drin) weiter unten.
 
 ### Mailversand
 
@@ -130,6 +144,75 @@ werden die letzten 2000 Links.
 Gespeichert wird erst **nach** erfolgreichem Versand. Scheitert das Relay, bleibt
 der Zustand unverändert und der nächste Lauf holt die Meldungen nach. `--dry-run`
 schreibt den Zustand nie.
+
+## Paketscan: was steckt hier drin?
+
+Die vier Nachrichtenquellen sagen, *was* in der Welt kaputt ist. Der Paketscan
+beantwortet die Anschlussfrage: *betrifft mich das?* Er liest die installierten
+Pakete, hält sie gegen die [OSV-Datenbank](https://osv.dev) und meldet, was
+davon in einer verwundbaren Version vorliegt.
+
+```bash
+python3 vulnfeed.py --source local --since 0
+```
+
+Zusammen mit den News — so ist es im Dauerbetrieb gedacht:
+
+```bash
+python3 vulnfeed.py --local --since 2 --details
+```
+
+Meldungen, deren CVE hier tatsächlich installiert ist, tragen dann in Mail und
+Ausgabe den Hinweis **„Betrifft dieses System"**, und der Betreff nennt die Zahl
+vorweg. Das ist der eigentliche Zweck der Übung.
+
+### Wie die Bewertung zustande kommt
+
+Jedes Paket wird zweimal abgefragt: einmal mit der installierten Version, einmal
+mit einer absurd hohen. Die zweite Antwort sind genau die Lücken, gegen die es in
+dieser Debian-Version noch **keinen** Fix gibt — die treffen jede Version. Zieht
+man sie von der ersten ab, bleibt übrig, was ein `apt upgrade` tatsächlich
+schließt. Das entspricht `debsecan --only-fixed`, kostet aber keine zusätzliche
+Software auf dem Pi.
+
+Ein gepflegtes System meldet deshalb fast nichts. `openssl 3.0.11` liefert 41
+Treffer, davon 39 behebbar; die aktuelle Version liefert 2 — beide ohne Fix und
+damit stumm, solange du nicht `--local-unfixed` setzt.
+
+### Grenzen
+
+Drei Dinge, die der Scan **nicht** leistet:
+
+- **Raspberry-Pi-eigene Pakete kennt er nicht.** `raspberrypi-kernel`,
+  `raspberrypi-bootloader` und die Firmware-Pakete aus dem RPi-Repo stehen nicht
+  in der Debian-Datenbank und kommen als „unauffällig" zurück, obwohl sie nie
+  geprüft wurden. Für den Kernel bleibt `sudo apt list --upgradable`.
+- **Nur Debian.** Auf einem Abkömmling mit eigener `ID` in `/etc/os-release`
+  verweigert er den Dienst, statt gegen die falsche Datenbank zu prüfen. Mit
+  `--debian-release` lässt sich das überstimmen, wenn du weißt, was du tust.
+- **Nur Systempakete.** Was per `pip`, `npm` oder `docker` danebenliegt, taucht
+  in `dpkg` nicht auf. Dafür sind `pip-audit` bzw. `osv-scanner` zuständig.
+
+Und eine Eigenheit, die man kennen sollte: die Markierung **„Betrifft dieses
+System"** hinkt den Nachrichten hinterher. Meldet heise eine frische Lücke,
+steht deren CVE-Nummer oft erst Stunden bis Tage später in der Debian-Datenbank
+— bis dahin bleibt die Meldung unmarkiert, obwohl das Paket installiert ist.
+Umgekehrt gibt es keine Fehlalarme: markiert wird nur, was nachweislich in einer
+betroffenen Version hier liegt.
+
+Außerdem: der Scan schickt die Liste deiner installierten Pakete samt Versionen
+an `api.osv.dev`. Das ist für einen Abgleich unvermeidlich, aber es ist eine
+Aussage über dein System an einen Dritten — deshalb ist der Scan standardmäßig
+aus und muss mit `--local` bzw. `SECFEED_LOCAL=1` eingeschaltet werden.
+
+### Im Container
+
+Dort gibt es kein `dpkg` des Hosts. Die Statusdatei read-only einhängen und
+darauf zeigen — Details in [docs/DOCKER.md](docs/DOCKER.md):
+
+```bash
+docker compose run --rm -v /var/lib/dpkg/status:/host/dpkg-status:ro securityfeed --once -s local --dpkg-status /host/dpkg-status --since 0
+```
 
 ## Geplanter Betrieb
 

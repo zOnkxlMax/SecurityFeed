@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Holt die neuesten Schwachstellen-Meldungen von BleepingComputer und heise.de.
 
+Mit --local zusaetzlich: die installierten Debian-Pakete gegen die OSV-Datenbank
+halten und Meldungen markieren, die dieses System wirklich betreffen.
+
 Nur Standardbibliothek - keine Installation noetig.
 
 Beispiele:
@@ -8,6 +11,8 @@ Beispiele:
     python3 vulnfeed.py --since 2 --limit 20  # letzte 2 Tage, max. 20 Eintraege
     python3 vulnfeed.py --source heise-alerts --format markdown
     python3 vulnfeed.py --format json > vulns.json
+    python3 vulnfeed.py --local --since 2     # News plus Paketscan
+    python3 vulnfeed.py -s local --since 0    # nur der Paketscan
 
 Geplanter Lauf auf einem Raspberry Pi (siehe docs/RASPBERRY-PI.md):
     python3 vulnfeed.py --email --env-file /etc/securityfeed.env --since 1
@@ -31,6 +36,7 @@ import signal
 import smtplib
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import urllib.error
@@ -75,17 +81,55 @@ VULN_TERMS = (
 # "resources" und "e-commerce", "patched" in "dispatched".
 VULN_WORDS_RE = re.compile(r"\b(?:rce|patch|patches|patched|poc)\b", re.IGNORECASE)
 
+# --- Paketscan ------------------------------------------------------------
+# Batch-Endpunkt der OSV-Datenbank: eine Anfrage, viele Pakete, Antwort sind
+# nur die IDs. Das reicht - die CVE-Nummer steckt schon im OSV-Bezeichner
+# ("DEBIAN-CVE-2025-9230"), ein zweiter Request je Luecke waere verschwendet.
+OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
+
+# Hoeher als jede reale Debian-Version. Die Antwort auf diese Abfrage sind
+# genau die Luecken, gegen die es in der Suite (noch) keinen Fix gibt - sie
+# treffen jede Version. Von der echten Abfrage abgezogen bleibt uebrig, was
+# ein "apt upgrade" tatsaechlich schliesst. Das ist das Gegenstueck zu
+# "debsecan --only-fixed" und kostet nur eine zweite Abfrage je Paket.
+OSV_SENTINEL_VERSION = "999999:0-0"
+
+# Die API liefert je Einzelabfrage hoechstens so viele IDs. Wird die Grenze
+# erreicht, ist die Liste abgeschnitten und die Differenz oben nicht mehr
+# belastbar - solche Pakete werden gesondert gemeldet statt falsch gezaehlt.
+OSV_RESULT_CAP = 1000
+
+# Abfragen pro HTTP-Request. Je Paket sind es zwei (echt + Sentinel), ein Pi
+# mit ~600 Paketen kommt so mit rund fuenf Requests aus.
+OSV_CHUNK = 250
+
+DEBIAN_TRACKER_URL = "https://security-tracker.debian.org/tracker/source-package/"
+DPKG_STATUS_PATH = "/var/lib/dpkg/status"
+
+# /etc/debian_version nennt nur den Codenamen, OSV will die Nummer.
+CODENAME_RELEASES = {
+    "buster": "10", "bullseye": "11", "bookworm": "12", "trixie": "13", "forky": "14",
+}
+
+# So viele CVE-Nummern werden je Eintrag ausgegeben. Ein lange nicht gepflegtes
+# Paket bringt schnell 40 mit - die Liste ist dann keine Information mehr.
+CVE_DISPLAY_CAP = 8
+
 
 @dataclass(frozen=True)
 class Source:
     key: str
     label: str
     url: str
-    kind: str  # "rss", "atom" oder "hn"
+    kind: str  # "rss", "atom", "hn" oder "local"
     always_vuln: bool = False  # Feed enthaelt ausschliesslich Luecken-Meldungen
     # Nur fuer kind="hn": Suchbegriffe und Mindestpunktzahl.
     queries: tuple[str, ...] = ()
     min_points: int = 50
+    # Ohne --source laufen nur die Quellen mit default_on. Der Paketscan bleibt
+    # aussen vor: auf einem Nicht-Debian-System scheitert er zwangslaeufig und
+    # wuerde jede Mail mit einer Ausfallwarnung verzieren.
+    default_on: bool = True
 
 
 SOURCES: tuple[Source, ...] = (
@@ -115,6 +159,12 @@ SOURCES: tuple[Source, ...] = (
         "https://hn.algolia.com/api/v1/search_by_date", "hn",
         always_vuln=True, queries=("vulnerability", "security"), min_points=50,
     ),
+    # Keine Nachrichtenquelle, sondern der Abgleich der installierten Pakete
+    # gegen die OSV-Datenbank. Siehe Abschnitt "Paketscan" weiter unten.
+    Source(
+        "local", "Lokales System", OSV_BATCH_URL, "local",
+        always_vuln=True, default_on=False,
+    ),
 )
 
 # Strukturell keine Sicherheitsmeldungen, matchen aber regelmaessig auf die
@@ -131,6 +181,18 @@ class Entry:
     summary: str
     cves: list[str] = field(default_factory=list)
     advisory: bool = False  # stammt aus einem reinen Advisory-Feed
+    local: bool = False  # aus dem Paketscan, nicht aus einem Feed
+    # Quellpakete, die auf diesem System in einer betroffenen Version stecken.
+    affects_local: list[str] = field(default_factory=list)
+    # Ueberschreibt den Link als Zustandsschluessel. Der Paketscan verlinkt
+    # immer auf dieselbe Tracker-Seite je Paket - ohne eigenen Schluessel
+    # bliebe eine neu hinzugekommene Luecke fuer immer ungemeldet.
+    key: str | None = None
+
+    @property
+    def state_key(self) -> str:
+        """Was den Eintrag identifiziert - fuer dedupe() und den Zustand."""
+        return self.key or self.link or self.title
 
     @property
     def is_vuln(self) -> bool:
@@ -149,6 +211,8 @@ class Entry:
             "published": self.published.isoformat() if self.published else None,
             "cves": self.cves,
             "advisory": self.advisory,
+            "local": self.local,
+            "affects_local": self.affects_local,
             "summary": self.summary,
         }
 
@@ -264,16 +328,363 @@ def find_cves(*texts: str) -> list[str]:
     return list(seen)
 
 
-def load_source(source: Source, timeout: float) -> tuple[Source, list[Entry], str | None]:
+# --------------------------------------------------------------------------
+# Paketscan: was liegt hier installiert, und ist davon etwas verwundbar?
+#
+# Ablauf: dpkg nach den installierten Quellpaketen fragen, die Liste gegen die
+# OSV-Datenbank halten, und je betroffenem Paket einen Eintrag bauen. OSV
+# vergleicht dabei selbst die Debian-Versionen - ein gepflegtes System liefert
+# darum fast nichts zurueck.
+# --------------------------------------------------------------------------
+
+class LocalScanError(Exception):
+    """Der Scan ist hier nicht durchfuehrbar -> Quelle gilt als ausgefallen."""
+
+
+@dataclass(frozen=True)
+class LocalOptions:
+    status_path: str | None = None  # dpkg-Statusdatei statt dpkg-query
+    release: str | None = None      # Debian-Hauptversion, z.B. "12"
+    unfixed: bool = False           # auch Luecken ohne verfuegbaren Fix melden
+
+
+@dataclass(frozen=True)
+class Package:
+    """Ein Quellpaket. OSV kennt nur diese - eine Abfrage nach dem
+    Binaerpaket 'libssl3' liefert nichts, die nach 'openssl' alles."""
+    name: str
+    version: str
+    binaries: tuple[str, ...] = ()
+
+
+# ${source:Version} faellt automatisch auf die Binaerversion zurueck, wenn das
+# Quellpaket keine eigene hat - genau das Verhalten, das OSV erwartet.
+DPKG_QUERY_FORMAT = (
+    "${db:Status-Status}\t${source:Package}\t${source:Version}\t${binary:Package}\n"
+)
+
+
+def collect_packages(found: dict[tuple[str, str], list[str]]) -> list[Package]:
+    return [
+        Package(name=name, version=version, binaries=tuple(sorted(set(binaries))))
+        for (name, version), binaries in sorted(found.items())
+    ]
+
+
+def parse_dpkg_query(text: str) -> list[Package]:
+    found: dict[tuple[str, str], list[str]] = {}
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        status, name, version, binary = (part.strip() for part in parts)
+        if status != "installed" or not name or not version:
+            continue
+        found.setdefault((name, version), []).append(binary or name)
+    return collect_packages(found)
+
+
+def parse_dpkg_status(text: str) -> list[Package]:
+    """Die Statusdatei /var/lib/dpkg/status selbst lesen - noetig, wenn dpkg
+    nicht zur Hand ist, etwa im Container mit eingehaengter Hostdatei."""
+    found: dict[tuple[str, str], list[str]] = {}
+    for block in text.split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            if not line or line[0] in " \t":  # Fortsetzungszeile, hier egal
+                continue
+            key, sep, value = line.partition(":")
+            if sep:
+                fields[key.strip().lower()] = value.strip()
+
+        name, version = fields.get("package"), fields.get("version")
+        # Nur "install ok installed". Alles andere - deinstalliert, halb
+        # entpackt, nur noch Konfigurationsreste - liegt nicht als
+        # angreifbarer Code auf der Platte.
+        if not name or not version or fields.get("status", "").split()[-1:] != ["installed"]:
+            continue
+
+        source, source_version = name, version
+        # "Source: openssl" oder "Source: openssl (3.0.11-1~deb12u2)"; das Feld
+        # fehlt ganz, wenn Quell- und Binaerpaket gleich heissen.
+        match = re.fullmatch(r"(\S+)(?:\s+\(([^)]+)\))?", fields.get("source", ""))
+        if match:
+            source = match.group(1)
+            source_version = match.group(2) or version
+        found.setdefault((source, source_version), []).append(name)
+    return collect_packages(found)
+
+
+def run_dpkg_query(timeout: float) -> str:
+    try:
+        proc = subprocess.run(
+            ["dpkg-query", "-W", "-f", DPKG_QUERY_FORMAT],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except FileNotFoundError:
+        raise LocalScanError(
+            "dpkg-query nicht gefunden - hier laeuft kein Debian. Im Container "
+            "stattdessen die Statusdatei des Hosts einhaengen und mit "
+            "--dpkg-status /host/var/lib/dpkg/status darauf zeigen."
+        ) from None
+    except subprocess.TimeoutExpired:
+        raise LocalScanError(f"dpkg-query antwortet nicht (Timeout {timeout:.0f}s).") from None
+    if proc.returncode != 0:
+        raise LocalScanError(
+            f"dpkg-query endete mit Code {proc.returncode}: {proc.stderr.strip()[:200]}"
+        )
+    return proc.stdout
+
+
+def parse_os_release(text: str) -> dict[str, str]:
+    fields = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        fields[key.strip()] = value.strip().strip("\"'")
+    return fields
+
+
+def debian_release(os_release_path: str = "/etc/os-release",
+                   debian_version_path: str = "/etc/debian_version") -> str:
+    """Debian-Hauptversion als Zahl, z.B. '12'. Raspberry Pi OS meldet sich
+    hier als Debian, das passt also auch auf dem Pi."""
+    try:
+        with open(os_release_path, "r", encoding="utf-8", errors="replace") as fh:
+            fields = parse_os_release(fh.read())
+    except OSError:
+        fields = {}
+
+    ident = fields.get("ID", "").lower()
+    if ident and ident != "debian":
+        raise LocalScanError(
+            f"Das System meldet sich als '{ident}', der Scan kennt aber nur die "
+            "Debian-Paketdatenbank. Bei einem Debian-Abkoemmling die passende "
+            "Version mit --debian-release erzwingen."
+        )
+    version_id = fields.get("VERSION_ID", "")
+    if version_id.isdigit():
+        return version_id
+    codename = fields.get("VERSION_CODENAME", "").lower()
+    if codename in CODENAME_RELEASES:
+        return CODENAME_RELEASES[codename]
+
+    try:
+        with open(debian_version_path, "r", encoding="utf-8", errors="replace") as fh:
+            raw = fh.read().strip()
+    except OSError:
+        raw = ""
+    if raw.split(".")[0].isdigit():  # "12.5"
+        return raw.split(".")[0]
+    if raw.split("/")[0].lower() in CODENAME_RELEASES:  # "trixie/sid"
+        return CODENAME_RELEASES[raw.split("/")[0].lower()]
+
+    raise LocalScanError(
+        "Debian-Version nicht erkennbar. Mit --debian-release 12 nachhelfen "
+        "(SECFEED_DEBIAN_RELEASE)."
+    )
+
+
+def installed_packages(opts: LocalOptions, timeout: float) -> list[Package]:
+    path = opts.status_path or os.environ.get("SECFEED_DPKG_STATUS")
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                packages = parse_dpkg_status(fh.read())
+        except OSError as exc:
+            raise LocalScanError(f"dpkg-Statusdatei nicht lesbar ({path}): {exc}") from None
+        if not packages:
+            raise LocalScanError(
+                f"In {path} steht kein installiertes Paket - ist das wirklich eine "
+                "dpkg-Statusdatei?"
+            )
+        return packages
+
+    packages = parse_dpkg_query(run_dpkg_query(timeout))
+    if not packages:
+        raise LocalScanError("dpkg-query meldet kein installiertes Paket.")
+    return packages
+
+
+def osv_batch(queries: list[tuple[str, str]], ecosystem: str,
+              timeout: float) -> list[list[str]]:
+    """[(Paket, Version)] -> je Abfrage die OSV-IDs, in derselben Reihenfolge."""
+    results: list[list[str]] = []
+    for start in range(0, len(queries), OSV_CHUNK):
+        chunk = queries[start:start + OSV_CHUNK]
+        body = json.dumps({"queries": [
+            {"package": {"name": name, "ecosystem": ecosystem}, "version": version}
+            for name, version in chunk
+        ]}).encode("utf-8")
+        request = urllib.request.Request(
+            OSV_BATCH_URL, data=body, method="POST",
+            headers={
+                "User-Agent": HEADERS["User-Agent"],
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            raise LocalScanError(f"OSV antwortet mit HTTP {exc.code} {exc.reason}") from None
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise LocalScanError(f"OSV nicht erreichbar: {exc}") from None
+        except json.JSONDecodeError as exc:
+            raise LocalScanError(f"OSV-Antwort ist kein gueltiges JSON: {exc}") from None
+
+        answers = payload.get("results")
+        if not isinstance(answers, list) or len(answers) != len(chunk):
+            raise LocalScanError(
+                f"OSV liefert {len(answers or [])} Ergebnisse auf {len(chunk)} Abfragen."
+            )
+        results.extend(
+            [vuln.get("id", "") for vuln in (answer or {}).get("vulns") or []]
+            for answer in answers
+        )
+    return results
+
+
+def cve_id(osv_id: str) -> str:
+    """'DEBIAN-CVE-2025-9230' -> 'CVE-2025-9230'. Alles andere bleibt stehen."""
+    stripped = osv_id[7:] if osv_id.startswith("DEBIAN-") else osv_id
+    return stripped if CVE_RE.fullmatch(stripped) else osv_id
+
+
+def local_entry(source: Source, package: Package, cves: list[str], unfixed: int,
+                now: datetime, *, fixable: bool = True,
+                truncated: bool = False) -> Entry:
+    binaries = list(package.binaries) or [package.name]
+    shown = ", ".join(binaries[:6]) + (" ..." if len(binaries) > 6 else "")
+
+    if truncated:
+        title = f"{package.name} {package.version}: sehr viele bekannte Luecken"
+        summary = (
+            f"OSV schneidet die Trefferliste bei {OSV_RESULT_CAP} Eintraegen ab, "
+            "deshalb laesst sich hier nicht auseinanderhalten, was davon ein "
+            "Update tatsaechlich schliesst. Bitte auf der verlinkten Seite nachsehen. "
+        )
+    elif fixable:
+        title = f"{package.name} {package.version}: {len(cves)} Luecke(n) mit verfuegbarem Fix"
+        summary = (
+            f"{len(cves)} bekannte Schwachstelle(n) sind in einer neueren Version "
+            "dieses Pakets behoben, die installierte ist aelter. "
+        )
+        if unfixed:
+            summary += (
+                f"{unfixed} weitere sind bekannt, aber in dieser Debian-Version "
+                "noch nicht behoben. "
+            )
+    else:
+        title = f"{package.name} {package.version}: {len(cves)} Luecke(n) ohne Fix"
+        summary = (
+            "Fuer diese Schwachstellen gibt es in dieser Debian-Version noch kein "
+            "Update. Debian stuft solche Faelle meist als geringfuegig ein und "
+            "behebt sie erst mit dem naechsten Release. "
+        )
+
+    summary += f"Installiert als: {shown}."
+    if fixable and not truncated:
+        summary += " Beheben mit: sudo apt update && sudo apt install --only-upgrade " \
+                   + " ".join(binaries[:6])
+
+    return Entry(
+        source=source.label,
+        title=title,
+        link=DEBIAN_TRACKER_URL + urllib.parse.quote(package.name),
+        published=now,
+        summary=summary,
+        cves=cves,
+        advisory=True,
+        local=True,
+        # Beim Scan-Eintrag ist das betroffene Paket er selbst. So kommt
+        # mark_local_matches an den Namen, ohne ihn aus dem Titel zu klauben.
+        affects_local=[package.name],
+        # Der Link zeigt fuer ein Paket immer auf dieselbe Tracker-Seite. Ohne
+        # Anzahl und juengste CVE im Schluessel bliebe jede spaeter dazu
+        # gekommene Luecke ungemeldet.
+        key=f"local:{package.name}:{len(cves)}:{max(cves) if cves else package.version}",
+    )
+
+
+def scan_local(source: Source, opts: LocalOptions, timeout: float) -> list[Entry]:
+    packages = installed_packages(opts, timeout)
+    release = opts.release or os.environ.get("SECFEED_DEBIAN_RELEASE") or debian_release()
+    ecosystem = f"Debian:{release.strip()}"
+
+    # Je Paket zwei Abfragen: die echte Version und der Sentinel. Was beide
+    # melden, ist ungefixt; die Differenz ist das, was ein Update schliesst.
+    queries: list[tuple[str, str]] = []
+    for package in packages:
+        queries.append((package.name, package.version))
+        queries.append((package.name, OSV_SENTINEL_VERSION))
+    # Ein Paket im Feed-Timeout abzufragen ist etwas anderes als 500 Pakete in
+    # zwei Dutzend Abfragen - die Antwort braucht hier schlicht laenger.
+    answers = osv_batch(queries, ecosystem, max(timeout, 60.0))
+
+    now = datetime.now(timezone.utc)
+    entries = []
+    for index, package in enumerate(packages):
+        current, sentinel = answers[2 * index], answers[2 * index + 1]
+        if not current:
+            continue
+        if len(current) >= OSV_RESULT_CAP or len(sentinel) >= OSV_RESULT_CAP:
+            entries.append(local_entry(
+                source, package, sorted({cve_id(i) for i in current}), 0, now,
+                truncated=True,
+            ))
+            continue
+
+        unfixed = set(sentinel)
+        fixable = sorted({cve_id(i) for i in current if i not in unfixed})
+        if fixable:
+            entries.append(local_entry(source, package, fixable, len(unfixed), now))
+        elif opts.unfixed:
+            entries.append(local_entry(
+                source, package, sorted({cve_id(i) for i in unfixed}), 0, now,
+                fixable=False,
+            ))
+    return entries
+
+
+def mark_local_matches(entries: list[Entry]) -> None:
+    """Meldungen markieren, deren CVE hier tatsaechlich installiert ist.
+
+    Erst nach dem Nachladen der Artikelseiten aufrufen - vorher kennen die
+    Feed-Eintraege ihre CVE-Nummern noch gar nicht."""
+    affected: dict[str, set[str]] = {}
+    for entry in entries:
+        if not entry.local:
+            continue
+        for cve in entry.cves:
+            affected.setdefault(cve, set()).update(entry.affects_local)
+    if not affected:
+        return
+    for entry in entries:
+        if entry.local:
+            continue
+        hits = {pkg for cve in entry.cves for pkg in affected.get(cve, ())}
+        entry.affects_local = sorted(hits)
+
+
+def load_source(source: Source, timeout: float,
+                local: LocalOptions | None = None) -> tuple[Source, list[Entry], str | None]:
     """Liefert (Quelle, Eintraege, Fehlermeldung)."""
     entries: list[Entry] = []
     root = None
     try:
+        if source.kind == "local":
+            return source, scan_local(source, local or LocalOptions(), timeout), None
         if source.kind == "hn":
             for url in hn_urls(source):
                 entries.extend(parse_hn(json.loads(fetch(url, timeout)), source))
         else:
             root = ET.fromstring(fetch(source.url, timeout))
+    except LocalScanError as exc:
+        return source, [], str(exc)
     except urllib.error.HTTPError as exc:
         return source, [], f"HTTP {exc.code} {exc.reason}"
     except (urllib.error.URLError, TimeoutError) as exc:
@@ -295,13 +706,15 @@ def load_source(source: Source, timeout: float) -> tuple[Source, list[Entry], st
     return source, entries, None
 
 
-def collect(selected: list[Source], timeout: float,
-            quiet: bool) -> tuple[list[Entry], list[str]]:
+def collect(selected: list[Source], timeout: float, quiet: bool,
+            local: LocalOptions | None = None) -> tuple[list[Entry], list[str]]:
     """Liefert (Eintraege, Beschreibung der fehlgeschlagenen Quellen)."""
     entries: list[Entry] = []
     failed: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(selected)) as pool:
-        for source, found, error in pool.map(lambda s: load_source(s, timeout), selected):
+        for source, found, error in pool.map(
+            lambda s: load_source(s, timeout, local), selected
+        ):
             if error:
                 failed.append(f"{source.label}: {error}")
                 if not quiet:
@@ -318,7 +731,9 @@ def enrich_with_cves(entries: list[Entry], timeout: float, quiet: bool) -> None:
     Artikel. Bewusst wenige parallele Requests, um die Seiten nicht zu belasten.
     """
     def load(entry: Entry) -> None:
-        if not entry.link:
+        # Eintraege des Paketscans nie nachladen: ihre CVEs stehen schon fest,
+        # und die Tracker-Seite eines Pakets nennt Hunderte weitere.
+        if not entry.link or entry.local:
             return
         try:
             body = fetch(entry.link, timeout).decode("utf-8", errors="replace")
@@ -341,12 +756,19 @@ def dedupe(entries: list[Entry]) -> list[Entry]:
     seen: set[str] = set()
     unique = []
     for entry in entries:
-        key = entry.link or entry.title
+        key = entry.state_key
         if key in seen:
             continue
         seen.add(key)
         unique.append(entry)
     return unique
+
+
+def shown_cves(entry: Entry) -> tuple[list[str], int]:
+    """Anzuzeigende CVEs und die Zahl der unterschlagenen. Ein lange nicht
+    gepflegtes Paket bringt vierzig mit - das liest dann niemand mehr."""
+    shown = entry.cves[:CVE_DISPLAY_CAP]
+    return shown, len(entry.cves) - len(shown)
 
 
 def render_table(entries: list[Entry]) -> str:
@@ -355,9 +777,15 @@ def render_table(entries: list[Entry]) -> str:
     lines = []
     for entry in entries:
         stamp = entry.published.astimezone().strftime("%Y-%m-%d %H:%M") if entry.published else "?"
-        cves = f"  [{', '.join(entry.cves)}]" if entry.cves else ""
+        listed, rest = shown_cves(entry)
+        extra = f" +{rest} weitere" if rest else ""
+        cves = f"  [{', '.join(listed)}{extra}]" if listed else ""
         lines.append(f"{stamp}  {entry.source}{cves}")
         lines.append(f"  {entry.title}")
+        # Beim Scan-Eintrag selbst waere der Hinweis eine Doppelung - da steht
+        # das Paket schon im Titel.
+        if entry.affects_local and not entry.local:
+            lines.append(f"  >> Betrifft dieses System: {', '.join(entry.affects_local)}")
         if entry.summary:
             summary = entry.summary if len(entry.summary) <= 200 else entry.summary[:197] + "..."
             lines.append(f"  {summary}")
@@ -375,10 +803,15 @@ def render_markdown(entries: list[Entry]) -> str:
         return "\n".join(lines)
     for entry in entries:
         stamp = entry.published.astimezone().strftime("%Y-%m-%d %H:%M") if entry.published else "?"
-        cves = f" — `{'`, `'.join(entry.cves)}`" if entry.cves else ""
+        listed, rest = shown_cves(entry)
+        extra = f" +{rest} weitere" if rest else ""
+        cves = f" — `{'`, `'.join(listed)}`{extra}" if listed else ""
         lines.append(f"## [{entry.title}]({entry.link})")
         lines.append("")
         lines.append(f"*{entry.source} · {stamp}*{cves}")
+        if entry.affects_local and not entry.local:
+            lines.append("")
+            lines.append(f"**Betrifft dieses System:** {', '.join(entry.affects_local)}")
         if entry.summary:
             lines.append("")
             lines.append(entry.summary)
@@ -412,25 +845,37 @@ def render_html(entries: list[Entry], subtitle: str,
     for entry in entries:
         stamp = entry.published.astimezone().strftime("%d.%m.%Y %H:%M") if entry.published else "?"
         meta = f"{esc(entry.source)} &middot; {stamp}"
+        listed, rest = shown_cves(entry)
         cves = ""
-        if entry.cves:
+        if listed:
             tags = "".join(
                 '<span style="display:inline-block;background:#fde8e8;color:#9b1c1c;'
                 'border-radius:3px;padding:1px 6px;margin:0 4px 4px 0;font-size:12px;'
                 f'font-family:monospace">{esc(c)}</span>'
-                for c in entry.cves
+                for c in listed
             )
+            if rest:
+                tags += (f'<span style="color:#777;font-size:12px">+{rest} weitere</span>')
             cves = f'<div style="margin:6px 0 0">{tags}</div>'
+        # Der eigentliche Punkt der Uebung: nicht "es gibt eine Luecke",
+        # sondern "sie steckt hier drin".
+        affected = (
+            '<div style="margin:6px 0 0;background:#fde8e8;color:#9b1c1c;'
+            'border-radius:3px;padding:4px 8px;font-size:13px;font-weight:600">'
+            f'Betrifft dieses System: {esc(", ".join(entry.affects_local))}</div>'
+            if entry.affects_local and not entry.local else ""
+        )
         summary = (
             f'<p style="margin:8px 0 0;font-size:14px;line-height:1.5">{esc(entry.summary)}</p>'
             if entry.summary else ""
         )
+        border = "#c81e1e" if (entry.local or entry.affects_local) else "#d0d0d0"
         blocks.append(
-            '<div style="border-left:3px solid #d0d0d0;padding:0 0 0 14px;margin:0 0 24px">'
+            f'<div style="border-left:3px solid {border};padding:0 0 0 14px;margin:0 0 24px">'
             f'<div style="color:#777;font-size:12px">{meta}</div>'
             f'<a href="{esc(entry.link)}" style="font-size:16px;font-weight:600;'
             f'color:#1a4fa0;text-decoration:none">{esc(entry.title)}</a>'
-            f'{cves}{summary}</div>'
+            f'{affected}{cves}{summary}</div>'
         )
     footer = (
         f'<p style="color:#888;font-size:12px;border-top:1px solid #e0e0e0;padding-top:10px">'
@@ -600,12 +1045,21 @@ def mail_config_from_env(args: argparse.Namespace) -> MailConfig:
 def build_message(cfg: MailConfig, entries: list[Entry], subtitle: str,
                   failed: list[str] | None = None) -> EmailMessage:
     failed = failed or []
-    top = entries[0].title if entries else "keine neuen Meldungen"
-    if len(top) > 70:
-        top = top[:67] + "..."
     count = len(entries)
-    subject = f"{cfg.subject_prefix} {count} neue Meldung(en): {top}" if count else \
-              f"{cfg.subject_prefix} keine neuen Meldungen"
+    # Was dieses System betrifft, gehoert in den Betreff - sonst geht es
+    # zwischen zwanzig allgemeinen Meldungen unter.
+    concerned = [e for e in entries if e.local or e.affects_local]
+    headline = (concerned or entries)[0].title if entries else "keine neuen Meldungen"
+    if len(headline) > 70:
+        headline = headline[:67] + "..."
+
+    if concerned:
+        subject = (f"{cfg.subject_prefix} {len(concerned)} von {count} Meldung(en) "
+                   f"betreffen dieses System: {headline}")
+    elif count:
+        subject = f"{cfg.subject_prefix} {count} neue Meldung(en): {headline}"
+    else:
+        subject = f"{cfg.subject_prefix} keine neuen Meldungen"
     # Eine still ausgefallene Quelle sieht sonst aus wie ein ruhiger Tag.
     if failed:
         subject += f" (Warnung: {len(failed)} Quelle(n) nicht erreichbar)"
@@ -687,12 +1141,14 @@ def send_mail(cfg: MailConfig, msg: EmailMessage) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Neueste Schwachstellen-Meldungen von BleepingComputer und heise.de.",
+        description="Neueste Schwachstellen-Meldungen von BleepingComputer und heise.de, "
+                    "auf Wunsch samt Abgleich mit den hier installierten Paketen.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--source", "-s", action="append", choices=[s.key for s in SOURCES],
-        help="Nur diese Quelle(n) abfragen (mehrfach angebbar). Default: alle.",
+        help="Nur diese Quelle(n) abfragen (mehrfach angebbar). Default: alle "
+             "Nachrichtenquellen, ohne den Paketscan 'local'.",
     )
     parser.add_argument("--since", "-d", type=float, default=7,
                         help="Nur Meldungen der letzten N Tage (0 = alle).")
@@ -712,6 +1168,23 @@ def build_parser() -> argparse.ArgumentParser:
                         help="HTTP-Timeout in Sekunden pro Feed.")
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Warnungen zu fehlgeschlagenen Feeds unterdruecken.")
+
+    scan = parser.add_argument_group(
+        "Paketscan", "Installierte Debian-Pakete gegen die OSV-Datenbank halten."
+    )
+    scan.add_argument("--local", action="store_true",
+                      help="Paketscan zusaetzlich zu den Nachrichtenquellen laufen lassen "
+                           "(SECFEED_LOCAL=1). '-s local' laesst dagegen nur ihn laufen.")
+    scan.add_argument("--dpkg-status", metavar="DATEI",
+                      help=f"Statusdatei lesen statt dpkg-query aufzurufen - fuer den "
+                           f"Container, in den {DPKG_STATUS_PATH} des Hosts eingehaengt "
+                           f"ist (SECFEED_DPKG_STATUS).")
+    scan.add_argument("--debian-release", metavar="N",
+                      help="Debian-Hauptversion erzwingen, z.B. 12, falls sie sich nicht "
+                           "aus /etc/os-release ergibt (SECFEED_DEBIAN_RELEASE).")
+    scan.add_argument("--local-unfixed", action="store_true",
+                      help="Auch Luecken melden, gegen die es noch kein Update gibt "
+                           "(SECFEED_LOCAL_UNFIXED=1). Deutlich mehr Rauschen.")
 
     state = parser.add_argument_group(
         "Zustand", "Fuer geplante Laeufe: bereits gemeldete Eintraege ueberspringen."
@@ -763,13 +1236,30 @@ def resolve_state_path(args: argparse.Namespace) -> str | None:
     return args.state or os.environ.get("SECFEED_STATE") or default_state_path()
 
 
+def select_sources(args: argparse.Namespace) -> list[Source]:
+    """Ohne --source laufen die Standardquellen; der Paketscan kommt nur auf
+    ausdrueckliche Ansage dazu."""
+    keys = set(args.source) if args.source else {s.key for s in SOURCES if s.default_on}
+    if args.local or env_flag("SECFEED_LOCAL"):
+        keys.add("local")
+    return [s for s in SOURCES if s.key in keys]
+
+
+def local_options(args: argparse.Namespace) -> LocalOptions:
+    return LocalOptions(
+        status_path=args.dpkg_status,
+        release=args.debian_release,
+        unfixed=args.local_unfixed or env_flag("SECFEED_LOCAL_UNFIXED"),
+    )
+
+
 def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
              state_path: str | None) -> int:
     """Ein kompletter Durchlauf: abrufen, filtern, ausgeben bzw. mailen."""
     seen = [] if (state_path is None or args.reset_state) else load_seen(state_path)
 
-    selected = [s for s in SOURCES if not args.source or s.key in args.source]
-    entries, failed = collect(selected, args.timeout, args.quiet)
+    selected = select_sources(args)
+    entries, failed = collect(selected, args.timeout, args.quiet, local_options(args))
     entries = dedupe(entries)
 
     if len(failed) == len(selected):
@@ -787,10 +1277,14 @@ def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
 
     # Schon gemeldete Eintraege raus, bevor Artikelseiten geladen werden.
     known = set(seen)
-    fresh = [e for e in entries if (e.link or e.title) not in known]
+    fresh = [e for e in entries if e.state_key not in known]
 
     if args.details or args.cve_only:
-        enrich_with_cves(fresh[: max(args.detail_limit, 0)], args.timeout, args.quiet)
+        news = [e for e in fresh if not e.local]
+        enrich_with_cves(news[: max(args.detail_limit, 0)], args.timeout, args.quiet)
+    # Erst jetzt kennen die Meldungen ihre CVE-Nummern - und erst jetzt laesst
+    # sich sagen, welche davon dieses System wirklich treffen.
+    mark_local_matches(fresh)
     if args.cve_only:
         fresh = [e for e in fresh if e.cves]
 
@@ -833,7 +1327,7 @@ def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
     # SMTP-Fehler verloren.
     if state_path and not args.dry_run:
         try:
-            save_seen(state_path, [e.link or e.title for e in fresh] + seen)
+            save_seen(state_path, [e.state_key for e in fresh] + seen)
         except OSError as exc:
             print(f"Zustand nicht speicherbar ({state_path}): {exc}", file=sys.stderr)
             return 1
