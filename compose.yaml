@@ -21,19 +21,15 @@ services:
       TZ: ${TZ:-Europe/Berlin}
 
       # Paketscan des Hosts. Zum Einschalten SECFEED_LOCAL=1 in die .env
-      # schreiben UND unten den Mount der dpkg-Statusdatei entkommentieren -
-      # ohne ihn sieht der Container nur seine eigenen Pakete. Siehe
-      # docs/DOCKER.md, Abschnitt "Paketscan".
+      # schreiben und die Paketliste des Hosts per compose.override.yaml
+      # einhaengen - ohne sie sieht der Container nur seine eigenen Pakete.
+      # Rezept in docs/DOCKER.md, Abschnitt "Paketscan".
       SECFEED_LOCAL: ${SECFEED_LOCAL:-0}
       SECFEED_DPKG_STATUS: /host/dpkg-status
 
+    # Merkt sich ueber Neustarts hinweg, was schon gemeldet wurde.
     volumes:
-      # Merkt sich ueber Neustarts hinweg, was schon gemeldet wurde.
       - securityfeed-state:/var/lib/securityfeed
-
-      # Nur lesend, und nur diese eine Datei - sie listet Name und Version
-      # jedes installierten Pakets, mehr braucht der Scan nicht.
-      #- /var/lib/dpkg/status:/host/dpkg-status:ro
 
     # Ueberschreibt CMD aus dem Dockerfile. --schedule fehlt hier absichtlich,
     # der Zeitplan kommt aus SECFEED_SCHEDULE oben.

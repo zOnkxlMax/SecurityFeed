@@ -276,9 +276,14 @@ sind in der Mail dann eigens markiert.
 Der Container sieht seine eigenen Pakete, nicht die des Pi. Er braucht deshalb
 die Paketliste des Hosts. Zwei Handgriffe:
 
-**1. In der `compose.yaml` den Mount entkommentieren:**
+**1. Paketliste einhängen** — über eine `compose.override.yaml`, damit die
+`compose.yaml` unverändert bleibt und `git pull` konfliktfrei durchläuft.
+Anders als `command` werden Volumes dabei ergänzt, nicht ersetzt:
 
 ```yaml
+services:
+  securityfeed:
+    volumes:
       - /var/lib/dpkg/status:/host/dpkg-status:ro
 ```
 
