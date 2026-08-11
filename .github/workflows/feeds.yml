@@ -46,3 +46,34 @@ jobs:
       - name: CVE-Extraktion aus Artikelseiten
         run: |
           python vulnfeed.py --cve-only --no-state --since 14 --limit 5 --detail-limit 10
+
+      - name: Paketscan gegen die echte OSV-API
+        # Feste Paketliste statt der des Runners: der laeuft unter Ubuntu, und
+        # nur mit bekannten Versionen laesst sich das Ergebnis pruefen. Faellt
+        # dieser Schritt aus, hat OSV Format oder Endpunkt geaendert.
+        run: |
+          cat > /tmp/dpkg-status <<'ENDE'
+          Package: libssl3
+          Status: install ok installed
+          Source: openssl
+          Version: 3.0.11-1~deb12u2
+
+          Package: bash
+          Status: install ok installed
+          Version: 5.2.15-2+b7
+          ENDE
+
+          python vulnfeed.py --source local --no-state --since 0 \
+            --dpkg-status /tmp/dpkg-status --debian-release 12 | tee /tmp/scan.txt
+
+          # openssl 3.0.11 ist nachweislich veraltet - kommt hier nichts zurueck,
+          # greift der Versionsvergleich nicht mehr.
+          grep -q "openssl 3.0.11-1~deb12u2" /tmp/scan.txt
+          grep -q "mit verfuegbarem Fix" /tmp/scan.txt
+
+          # Die Abfrage laeuft ueber das Quellpaket. Taucht das Binaerpaket auf,
+          # ist die Aufloesung kaputt.
+          if grep -q "^  libssl3 " /tmp/scan.txt; then
+            echo "::error::Binaerpaket statt Quellpaket abgefragt"
+            exit 1
+          fi

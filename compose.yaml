@@ -20,6 +20,13 @@ services:
       # Muss zur gewuenschten Zeitzone passen, sonst laeuft der Plan in UTC.
       TZ: ${TZ:-Europe/Berlin}
 
+      # Paketscan des Hosts. Zum Einschalten SECFEED_LOCAL=1 in die .env
+      # schreiben und die Paketliste des Hosts per compose.override.yaml
+      # einhaengen - ohne sie sieht der Container nur seine eigenen Pakete.
+      # Rezept in docs/DOCKER.md, Abschnitt "Paketscan".
+      SECFEED_LOCAL: ${SECFEED_LOCAL:-0}
+      SECFEED_DPKG_STATUS: /host/dpkg-status
+
     # Merkt sich ueber Neustarts hinweg, was schon gemeldet wurde.
     volumes:
       - securityfeed-state:/var/lib/securityfeed

@@ -274,12 +274,60 @@ sudo systemctl edit --full securityfeed.service
 | Größeres Zeitfenster | `--since 2` auf `--since 7` |
 | Höchstens 10 Meldungen pro Mail | `--limit 10` ergänzen |
 | Auch Nicht-Schwachstellen-News | `--all` ergänzen |
+| Auch die Pakete des Pi prüfen | siehe nächster Abschnitt — ohne Unit-Änderung |
 
 Nach jeder Änderung:
 
 ```bash
 sudo systemctl daemon-reload
 ```
+
+---
+
+## Paketscan: die eigenen Pakete prüfen
+
+Zusätzlich zu den Nachrichtenquellen kann das Tool die installierten Pakete
+gegen die OSV-Datenbank halten und melden, was davon in einer verwundbaren
+Version vorliegt. Meldungen, die diesen Pi wirklich betreffen, sind in der Mail
+dann eigens markiert.
+
+Erst ansehen, was dabei herauskommt:
+
+```bash
+sudo -u securityfeed python3 /opt/securityfeed/vulnfeed.py --source local --since 0 --no-state
+```
+
+Auf einem gepflegten Pi kommt hier wenig bis nichts zurück — das ist das
+erwartete Ergebnis, kein Fehler. Wenn du damit zufrieden bist, dauerhaft
+einschalten. Die Unit-Datei bleibt dabei unverändert, es reicht eine Zeile in
+der env-Datei:
+
+```bash
+sudo nano /etc/securityfeed/securityfeed.env
+```
+
+```bash
+SECFEED_LOCAL=1
+```
+
+Fertig — beim nächsten Timer-Lauf ist der Scan dabei. `dpkg-query` ist auf dem
+Pi ohnehin installiert, und die Härtung der Unit steht dem nicht im Weg: sie
+macht das Dateisystem nur schreibgeschützt, lesen darf der Dienst.
+
+Zwei Dinge, die du wissen solltest:
+
+- Der Scan schickt die Liste deiner installierten Pakete samt Versionen an
+  `api.osv.dev`. Deshalb ist er standardmäßig aus.
+- Pakete aus dem Raspberry-Pi-Repo (`raspberrypi-kernel`, `raspberrypi-bootloader`,
+  Firmware) stehen nicht in der Debian-Datenbank und werden stillschweigend
+  übergangen. Für den Kernel bleibt:
+
+```bash
+sudo apt update && apt list --upgradable
+```
+
+Ausführlich zur Funktionsweise und zu den Grenzen: Abschnitt „Paketscan" in der
+[README](../README.md#paketscan-was-steckt-hier-drin).
 
 ---
 
