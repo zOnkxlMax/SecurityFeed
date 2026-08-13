@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Holt die neuesten Schwachstellen-Meldungen von BleepingComputer und heise.de.
 
-Mit --local zusaetzlich: die installierten Debian-Pakete gegen die OSV-Datenbank
+Mit --local zusaetzlich: die installierten Pakete (Debian und Alpine) gegen die
 halten und Meldungen markieren, die dieses System wirklich betreffen.
 
 Nur Standardbibliothek - keine Installation noetig.
@@ -87,12 +87,22 @@ VULN_WORDS_RE = re.compile(r"\b(?:rce|patch|patches|patched|poc)\b", re.IGNORECA
 # ("DEBIAN-CVE-2025-9230"), ein zweiter Request je Luecke waere verschwendet.
 OSV_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 
-# Hoeher als jede reale Debian-Version. Die Antwort auf diese Abfrage sind
-# genau die Luecken, gegen die es in der Suite (noch) keinen Fix gibt - sie
-# treffen jede Version. Von der echten Abfrage abgezogen bleibt uebrig, was
-# ein "apt upgrade" tatsaechlich schliesst. Das ist das Gegenstueck zu
-# "debsecan --only-fixed" und kostet nur eine zweite Abfrage je Paket.
-OSV_SENTINEL_VERSION = "999999:0-0"
+# Hoeher als jede reale Version. Die Antwort auf diese Abfrage sind genau die
+# Luecken, gegen die es in der Suite (noch) keinen Fix gibt - sie treffen jede
+# Version. Von der echten Abfrage abgezogen bleibt uebrig, was ein Update
+# tatsaechlich schliesst. Das ist das Gegenstueck zu "debsecan --only-fixed"
+# und kostet nur eine zweite Abfrage je Paket.
+#
+# Die Schreibweise muss zum Oekosystem passen. Ein Debian-Sentinel liefert bei
+# Alpine heute zwar auch nichts - aber nur, weil OSV eine unparsbare Version
+# als "kein Treffer" behandelt. Aenderte sich das je zu "trifft alles", wuerde
+# die Differenz saemtliche Alpine-Funde stillschweigend ausloeschen.
+OSV_SENTINEL_VERSION = "999999:0-0"  # Debian, Ubuntu: Epoche:Version-Revision
+OSV_SENTINEL_BY_ECOSYSTEM = {"Alpine": "999999.0-r0"}
+
+
+def sentinel_version(ecosystem: str) -> str:
+    return OSV_SENTINEL_BY_ECOSYSTEM.get(ecosystem.split(":")[0], OSV_SENTINEL_VERSION)
 
 # Die API liefert je Einzelabfrage hoechstens so viele IDs. Wird die Grenze
 # erreicht, ist die Liste abgeschnitten und die Differenz oben nicht mehr
@@ -104,13 +114,15 @@ OSV_RESULT_CAP = 1000
 OSV_CHUNK = 250
 
 DEBIAN_TRACKER_URL = "https://security-tracker.debian.org/tracker/source-package/"
+OSV_LIST_URL = "https://osv.dev/list?"
 DPKG_STATUS_PATH = "/var/lib/dpkg/status"
 
 # Verzeichnis mit den abgelegten Paketlisten der Container, je Container ein
 # Unterverzeichnis. Befuellt wird es auf dem Host von
 # deploy/dump-container-packages.sh - SecurityFeed selbst bekommt bewusst
 # keinen Docker-Zugriff, der Socket waere faktisch Root auf dem Pi.
-CONTAINER_STATUS_FILE = "status"
+CONTAINER_STATUS_FILE = "status"          # dpkg, also Debian und Verwandte
+CONTAINER_APK_FILE = "apk-installed"      # apk, also Alpine
 CONTAINER_OS_RELEASE_FILE = "os-release"
 CONTAINER_UNSUPPORTED_FILE = "unsupported"  # Grund, falls keine Liste lesbar
 CONTAINER_STAMP_FILE = "updated"            # mtime = letzter Lauf des Skripts
@@ -124,6 +136,15 @@ CONTAINER_STAMP_MAX_AGE = timedelta(hours=48)
 CODENAME_RELEASES = {
     "buster": "10", "bullseye": "11", "bookworm": "12", "trixie": "13", "forky": "14",
 }
+
+# Nach so vielen Tagen wird ein unveraenderter Fund erneut gemeldet.
+#
+# Eine Nachricht ist ein Ereignis - einmal melden, fertig. Ein verwundbares
+# Paket ist ein Zustand, der bleibt, bis jemand patcht. Ohne Wiedervorlage
+# verschwaende der Fund nach der ersten Mail und das System saehe fuer immer
+# sauber aus. Woechentlich ist der Kompromiss: haeufig genug, um nicht in
+# Vergessenheit zu geraten, selten genug, um nicht weggefiltert zu werden.
+LOCAL_REMIND_DAYS = 7.0
 
 # So viele CVE-Nummern werden je Eintrag ausgegeben. Ein lange nicht gepflegtes
 # Paket bringt schnell 40 mit - die Liste ist dann keine Information mehr.
@@ -361,6 +382,7 @@ class LocalOptions:
     release: str | None = None      # Debian-Hauptversion, z.B. "12"
     unfixed: bool = False           # auch Luecken ohne verfuegbaren Fix melden
     containers: str | None = None   # Verzeichnis mit Container-Paketlisten
+    remind_days: float = 7.0        # unveraenderte Funde nach so vielen Tagen erneut
 
 
 @dataclass(frozen=True)
@@ -377,7 +399,7 @@ class ScanTarget:
     """Ein zu pruefendes System: der Host oder einer der Container."""
     name: str  # "" = Host, sonst der Containername
     packages: tuple[Package, ...] = ()
-    release: str = ""
+    ecosystem: str = ""  # OSV-Oekosystem, z.B. "Debian:12" oder "Alpine:v3.21"
 
     @property
     def label(self) -> str:
@@ -455,6 +477,42 @@ def parse_dpkg_status(text: str) -> list[Package]:
             source_version = match.group(2) or version
         found.setdefault((source, source_version), []).append(name)
     return collect_packages(found)
+
+
+def parse_apk_installed(text: str) -> list[Package]:
+    """Alpines Paketdatenbank /lib/apk/db/installed.
+
+    Ein Block je Paket, einbuchstabige Feldnamen: P: Name, V: Version,
+    o: Ursprungspaket. Wie bei Debian zaehlt fuer OSV das Ursprungspaket -
+    eine Abfrage nach 'libssl3' liefert nichts, die nach 'openssl' alles."""
+    found: dict[tuple[str, str], list[str]] = {}
+    for block in text.split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            key, sep, value = line.partition(":")
+            # Genau ein Buchstabe vor dem Doppelpunkt, sonst ist es keine
+            # Feldzeile - Pruefsummen und Dateilisten sehen aehnlich aus.
+            if sep and len(key) == 1:
+                fields[key] = value.strip()
+
+        name, version = fields.get("P"), fields.get("V")
+        if not name or not version:
+            continue
+        # Anders als dpkg fuehrt apk nur, was auch installiert ist - es gibt
+        # kein Gegenstueck zu "deinstall ok config-files".
+        source = fields.get("o") or name
+        found.setdefault((source, version), []).append(name)
+    return collect_packages(found)
+
+
+def alpine_ecosystem(version_id: str) -> str | None:
+    """'3.21.2' -> 'Alpine:v3.21'. OSV will genau diese Schreibweise: mit
+    fuehrendem v und ohne Patchstand. 'edge' und Vorabversionen haben in der
+    Datenbank kein Gegenstueck und liefern None."""
+    parts = version_id.strip().split(".")
+    if len(parts) < 2 or not all(part.isdigit() for part in parts[:2]):
+        return None
+    return f"Alpine:v{parts[0]}.{parts[1]}"
 
 
 def run_dpkg_query(timeout: float) -> str:
@@ -550,24 +608,31 @@ def installed_packages(opts: LocalOptions, timeout: float) -> list[Package]:
     return packages
 
 
-def container_release(os_release_text: str) -> str | None:
-    """Debian-Hauptversion eines Containers, oder None. Bewusst ohne Rueckfall
-    auf die Version des Hosts: ein bookworm-Host und ein trixie-Container haben
-    verschiedene Fixversionen, und ein Vergleich gegen die falsche Suite waere
-    schlimmer als gar keiner."""
+def container_ecosystem(os_release_text: str) -> str | None:
+    """OSV-Oekosystem eines Containers aus dessen /etc/os-release, oder None.
+
+    Bewusst ohne Rueckfall auf den Host: ein bookworm-Host und ein
+    trixie-Container haben verschiedene Fixversionen, und ein Vergleich gegen
+    die falsche Suite waere schlimmer als gar keiner."""
     fields = parse_os_release(os_release_text)
-    if fields.get("ID", "").lower() not in ("", "debian"):
-        return None
+    ident = fields.get("ID", "").lower()
     version_id = fields.get("VERSION_ID", "")
-    if version_id.isdigit():
-        return version_id
-    return CODENAME_RELEASES.get(fields.get("VERSION_CODENAME", "").lower())
+
+    if ident == "alpine":
+        return alpine_ecosystem(version_id)
+    if ident in ("", "debian"):
+        if version_id.isdigit():
+            return f"Debian:{version_id}"
+        codename = CODENAME_RELEASES.get(fields.get("VERSION_CODENAME", "").lower())
+        return f"Debian:{codename}" if codename else None
+    return None
 
 
 def host_target(opts: LocalOptions, timeout: float) -> ScanTarget:
     packages = installed_packages(opts, timeout)
     release = opts.release or os.environ.get("SECFEED_DEBIAN_RELEASE") or debian_release()
-    return ScanTarget(name="", packages=tuple(packages), release=release.strip())
+    return ScanTarget(name="", packages=tuple(packages),
+                      ecosystem=f"Debian:{release.strip()}")
 
 
 def read_container_list(directory: str, name: str) -> ScanTarget | SkippedTarget:
@@ -583,26 +648,34 @@ def read_container_list(directory: str, name: str) -> ScanTarget | SkippedTarget
     except OSError:
         pass
 
-    try:
-        with open(os.path.join(base, CONTAINER_STATUS_FILE),
-                  "r", encoding="utf-8", errors="replace") as fh:
-            packages = parse_dpkg_status(fh.read())
-    except OSError as exc:
-        return SkippedTarget(name, f"Paketliste nicht lesbar: {exc}")
+    # Je nachdem, was das Sammelskript vorgefunden hat: dpkg oder apk.
+    packages: list[Package] = []
+    for filename, parser in ((CONTAINER_STATUS_FILE, parse_dpkg_status),
+                             (CONTAINER_APK_FILE, parse_apk_installed)):
+        try:
+            with open(os.path.join(base, filename),
+                      "r", encoding="utf-8", errors="replace") as fh:
+                packages = parser(fh.read())
+        except OSError:
+            continue
+        break
+    else:
+        return SkippedTarget(name, "keine Paketliste abgelegt")
     if not packages:
         return SkippedTarget(name, "Paketliste enthaelt kein installiertes Paket")
 
     try:
         with open(os.path.join(base, CONTAINER_OS_RELEASE_FILE),
                   "r", encoding="utf-8", errors="replace") as fh:
-            release = container_release(fh.read())
+            ecosystem = container_ecosystem(fh.read())
     except OSError:
-        release = None
-    if not release:
+        ecosystem = None
+    if not ecosystem:
         return SkippedTarget(
-            name, "Debian-Version nicht erkennbar - kein Debian-Container?"
+            name, "Distribution oder Version nicht erkennbar - unterstuetzt "
+                  "werden Debian und Alpine"
         )
-    return ScanTarget(name=name, packages=tuple(packages), release=release)
+    return ScanTarget(name=name, packages=tuple(packages), ecosystem=ecosystem)
 
 
 def container_targets(directory: str) -> tuple[list[ScanTarget], list[SkippedTarget]]:
@@ -673,13 +746,44 @@ def osv_batch(queries: list[tuple[str, str, str]], timeout: float) -> list[list[
 
 
 def cve_id(osv_id: str) -> str:
-    """'DEBIAN-CVE-2025-9230' -> 'CVE-2025-9230'. Alles andere bleibt stehen."""
-    stripped = osv_id[7:] if osv_id.startswith("DEBIAN-") else osv_id
-    return stripped if CVE_RE.fullmatch(stripped) else osv_id
+    """'DEBIAN-CVE-2025-9230' -> 'CVE-2025-9230', ebenso ALPINE- und UBUNTU-.
+
+    Bleibt nach dem Abschneiden keine gueltige CVE-Nummer uebrig, bleibt die
+    OSV-Kennung stehen - eine erfundene Nummer waere schlimmer als eine
+    sperrige."""
+    _, found, rest = osv_id.partition("CVE-")
+    candidate = "CVE-" + rest if found else osv_id
+    return candidate if CVE_RE.fullmatch(candidate) else osv_id
+
+
+def reminder_window(now: datetime, days: float) -> str:
+    """Kennung des laufenden Wiedervorlage-Fensters.
+
+    Sie steckt im Zustandsschluessel: solange sie gleich bleibt, gilt ein
+    unveraenderter Fund als schon gemeldet. Springt sie um, taucht er wieder
+    auf. Bei 0 gibt es nur eine Kennung und damit die alte Einmal-Meldung.
+
+    Die Grenzen liegen fest auf dem Zeitstrahl, nicht ab der Erstmeldung. Ein
+    Fund kurz vor einer Grenze wiederholt sich deshalb frueher als nach der
+    vollen Frist - "hoechstens alle N Tage", nicht "genau alle N Tage". Das
+    spart einen Erstmeldungszeitpunkt je Fund im Zustandsspeicher, und
+    frueher erinnert zu werden ist der harmlose Fehler."""
+    if days <= 0:
+        return "einmalig"
+    return str(int(now.timestamp() // (days * 86400)))
+
+
+def tracker_url(ecosystem: str, package: str) -> str:
+    """Seite zum Nachlesen. Fuer Debian der Security-Tracker: er zeigt den
+    Status je Suite, das kann OSV so nicht. Fuer alles andere die OSV-Liste -
+    Alpines Tracker hat keine brauchbare Adresse je Paket."""
+    if ecosystem.split(":")[0] == "Debian":
+        return DEBIAN_TRACKER_URL + urllib.parse.quote(package)
+    return OSV_LIST_URL + urllib.parse.urlencode({"ecosystem": ecosystem, "q": package})
 
 
 def local_entry(target: ScanTarget, package: Package, cves: list[str], unfixed: int,
-                now: datetime, *, fixable: bool = True,
+                now: datetime, window: str = "einmalig", *, fixable: bool = True,
                 truncated: bool = False) -> Entry:
     binaries = list(package.binaries) or [package.name]
     shown = ", ".join(binaries[:6]) + (" ..." if len(binaries) > 6 else "")
@@ -699,15 +803,15 @@ def local_entry(target: ScanTarget, package: Package, cves: list[str], unfixed: 
         )
         if unfixed:
             summary += (
-                f"{unfixed} weitere sind bekannt, aber in dieser Debian-Version "
-                "noch nicht behoben. "
+                f"{unfixed} weitere sind bekannt, aber in dieser Version der "
+                "Distribution noch nicht behoben. "
             )
     else:
         title = f"{package.name} {package.version}: {len(cves)} Luecke(n) ohne Fix"
         summary = (
-            "Fuer diese Schwachstellen gibt es in dieser Debian-Version noch kein "
-            "Update. Debian stuft solche Faelle meist als geringfuegig ein und "
-            "behebt sie erst mit dem naechsten Release. "
+            "Fuer diese Schwachstellen gibt es in dieser Version der Distribution "
+            "noch kein Update. Solche Faelle gelten meist als geringfuegig und "
+            "werden erst mit dem naechsten Release behoben. "
         )
 
     summary += f"Installiert als: {shown}."
@@ -723,7 +827,7 @@ def local_entry(target: ScanTarget, package: Package, cves: list[str], unfixed: 
     return Entry(
         source=target.label,
         title=title,
-        link=DEBIAN_TRACKER_URL + urllib.parse.quote(package.name),
+        link=tracker_url(target.ecosystem, package.name),
         published=now,
         summary=summary,
         cves=cves,
@@ -735,13 +839,15 @@ def local_entry(target: ScanTarget, package: Package, cves: list[str], unfixed: 
         # Der Link zeigt fuer ein Paket immer auf dieselbe Tracker-Seite. Ohne
         # Ziel, Anzahl und juengste CVE im Schluessel bliebe jede spaeter dazu
         # gekommene Luecke ungemeldet - und dasselbe Paket auf Host und in
-        # einem Container waere derselbe Eintrag.
+        # einem Container waere derselbe Eintrag. Das Fenster am Ende sorgt
+        # dafuer, dass ein ungepatchter Fund wiederkommt statt zu verschwinden.
         key=f"local:{target.name or 'host'}:{package.name}:{len(cves)}:"
-            f"{max(cves) if cves else package.version}",
+            f"{max(cves) if cves else package.version}:{window}",
     )
 
 
-def unscanned_entry(skipped: SkippedTarget, now: datetime) -> Entry:
+def unscanned_entry(skipped: SkippedTarget, now: datetime,
+                    window: str = "einmalig") -> Entry:
     """Ein Ziel, das sich nicht pruefen liess. Ohne diesen Eintrag saehe ein
     unpruefbarer Container aus wie ein unauffaelliger."""
     what = f"Container {skipped.name}" if skipped.name else "Lokales System"
@@ -755,7 +861,9 @@ def unscanned_entry(skipped: SkippedTarget, now: datetime) -> Entry:
                 "befunden.",
         advisory=True,
         local=True,
-        key=f"local:{skipped.name or 'host'}:ungeprueft:{skipped.reason}",
+        # Ein blinder Fleck bleibt einer, bis sich etwas aendert - deshalb
+        # dieselbe Wiedervorlage wie bei den Funden.
+        key=f"local:{skipped.name or 'host'}:ungeprueft:{skipped.reason}:{window}",
     )
 
 
@@ -813,16 +921,17 @@ def scan_local(opts: LocalOptions, timeout: float) -> list[Entry]:
     # einzelnen Abfrage, ein Request bedient also Host und Container zugleich.
     queries: list[tuple[str, str, str]] = []
     for target in targets:
-        ecosystem = f"Debian:{target.release}"
+        sentinel = sentinel_version(target.ecosystem)
         for package in target.packages:
-            queries.append((package.name, package.version, ecosystem))
-            queries.append((package.name, OSV_SENTINEL_VERSION, ecosystem))
+            queries.append((package.name, package.version, target.ecosystem))
+            queries.append((package.name, sentinel, target.ecosystem))
     # Ein Paket im Feed-Timeout abzufragen ist etwas anderes als 500 Pakete in
     # zwei Dutzend Abfragen - die Antwort braucht hier schlicht laenger.
     answers = osv_batch(queries, max(timeout, 60.0))
 
     now = datetime.now(timezone.utc)
-    entries = [unscanned_entry(item, now) for item in skipped]
+    window = reminder_window(now, opts.remind_days)
+    entries = [unscanned_entry(item, now, window) for item in skipped]
 
     directory = opts.containers or os.environ.get("SECFEED_CONTAINER_LISTS")
     if directory:
@@ -840,18 +949,20 @@ def scan_local(opts: LocalOptions, timeout: float) -> list[Entry]:
             if len(current) >= OSV_RESULT_CAP or len(sentinel) >= OSV_RESULT_CAP:
                 entries.append(local_entry(
                     target, package, sorted({cve_id(i) for i in current}), 0, now,
-                    truncated=True,
+                    window, truncated=True,
                 ))
                 continue
 
             unfixed = set(sentinel)
             fixable = sorted({cve_id(i) for i in current if i not in unfixed})
             if fixable:
-                entries.append(local_entry(target, package, fixable, len(unfixed), now))
+                entries.append(local_entry(
+                    target, package, fixable, len(unfixed), now, window
+                ))
             elif opts.unfixed:
                 entries.append(local_entry(
                     target, package, sorted({cve_id(i) for i in unfixed}), 0, now,
-                    fixable=False,
+                    window, fixable=False,
                 ))
     return entries
 
@@ -1388,7 +1499,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Warnungen zu fehlgeschlagenen Feeds unterdruecken.")
 
     scan = parser.add_argument_group(
-        "Paketscan", "Installierte Debian-Pakete gegen die OSV-Datenbank halten."
+        "Paketscan", "Installierte Pakete gegen die OSV-Datenbank halten - Debian "
+                    "auf dem Host, Debian und Alpine in den Containern."
     )
     scan.add_argument("--local", action="store_true",
                       help="Paketscan zusaetzlich zu den Nachrichtenquellen laufen lassen "
@@ -1405,6 +1517,12 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--debian-release", metavar="N",
                       help="Debian-Hauptversion erzwingen, z.B. 12, falls sie sich nicht "
                            "aus /etc/os-release ergibt (SECFEED_DEBIAN_RELEASE).")
+    scan.add_argument("--local-remind", metavar="TAGE", type=float,
+                      default=LOCAL_REMIND_DAYS,
+                      help="Unveraenderte Funde nach so vielen Tagen erneut melden "
+                           "(SECFEED_LOCAL_REMIND). Ein verwundbares Paket ist ein "
+                           "Zustand, keine Nachricht - ohne Wiedervorlage verschwaende "
+                           "es nach der ersten Mail. 0 = nur einmal melden.")
     scan.add_argument("--local-unfixed", action="store_true",
                       help="Auch Luecken melden, gegen die es noch kein Update gibt "
                            "(SECFEED_LOCAL_UNFIXED=1). Deutlich mehr Rauschen.")
@@ -1469,11 +1587,24 @@ def select_sources(args: argparse.Namespace) -> list[Source]:
 
 
 def local_options(args: argparse.Namespace) -> LocalOptions:
+    # Der Default steckt schon im Parser, die Umgebung zieht also nur, wenn auf
+    # der Kommandozeile nichts Abweichendes steht.
+    remind = args.local_remind
+    if remind == LOCAL_REMIND_DAYS and os.environ.get("SECFEED_LOCAL_REMIND"):
+        try:
+            remind = float(os.environ["SECFEED_LOCAL_REMIND"])
+        except ValueError:
+            raise ConfigError(
+                "SECFEED_LOCAL_REMIND muss eine Zahl in Tagen sein, z.B. 7 "
+                f"(steht dort: {os.environ['SECFEED_LOCAL_REMIND']!r})."
+            ) from None
+
     return LocalOptions(
         status_path=args.dpkg_status,
         release=args.debian_release,
         unfixed=args.local_unfixed or env_flag("SECFEED_LOCAL_UNFIXED"),
         containers=args.container_lists,
+        remind_days=remind,
     )
 
 
@@ -1665,6 +1796,9 @@ def main(argv: list[str] | None = None) -> int:
     # nach 20 Sekunden Feedabruf, und im Dauerbetrieb gar nicht erst starten.
     try:
         mail_cfg = mail_config_from_env(args) if args.email else None
+        # Nur zur Pruefung - im Dauerbetrieb soll ein Zahlendreher in der
+        # Umgebung sofort auffallen und nicht erst beim ersten Lauf.
+        local_options(args)
         # SECFEED_SCHEDULE steckt im Container in der Service-Umgebung und wird
         # daher auch an "docker compose run" durchgereicht. Ohne diese Ausnahme
         # wuerde ein dortiger Einzelaufruf den Scheduler starten und haengen.

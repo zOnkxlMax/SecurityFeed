@@ -34,6 +34,11 @@ services:
       # bekommt bewusst keinen Docker-Socket, der waere faktisch root auf dem Pi.
       SECFEED_CONTAINER_LISTS: ${SECFEED_CONTAINER_LISTS:-}
 
+      # Unveraenderte Funde nach so vielen Tagen erneut melden. Ein verwundbares
+      # Paket ist ein Zustand, keine Nachricht - ohne Wiedervorlage verschwaende
+      # es nach der ersten Mail. 0 = nur einmal melden.
+      SECFEED_LOCAL_REMIND: ${SECFEED_LOCAL_REMIND:-7}
+
     # Merkt sich ueber Neustarts hinweg, was schon gemeldet wurde.
     volumes:
       - securityfeed-state:/var/lib/securityfeed

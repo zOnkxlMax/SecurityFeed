@@ -15,7 +15,7 @@ Reines Python 3.10+ aus der Standardbibliothek — keine Abhängigkeiten, kein
 | `heise-alerts`   | heise Security Alerts (Atom)  | reine Schwachstellen-/Advisory-Meldungen  |
 | `heise-security` | heise Security (Atom)         | Security-News allgemein, wird gefiltert   |
 | `hackernews`     | Hacker News (Algolia-API)     | Diskutierte Security-Themen ab 50 Punkten |
-| `local`          | OSV-Datenbank + `dpkg`        | Verwundbare Pakete **auf diesem System** — nur mit `--local` |
+| `local`          | OSV-Datenbank + `dpkg`/`apk`  | Verwundbare Pakete **auf diesem System** und in den Containern — nur mit `--local` |
 
 Hacker News läuft anders als die übrigen Quellen. Der Frontpage-Feed taugt
 dafür nicht — dort steht meist nichts Sicherheitsrelevantes. Stattdessen wird
@@ -77,6 +77,7 @@ py -3 vulnfeed.py --cve-only --since 3
 | `--dpkg-status`     | `SECFEED_DPKG_STATUS`    | Statusdatei lesen statt `dpkg-query` aufzurufen |
 | `--container-lists` | `SECFEED_CONTAINER_LISTS` | Auch die abgelegten Paketlisten der Container prüfen |
 | `--debian-release`  | `SECFEED_DEBIAN_RELEASE` | Debian-Hauptversion erzwingen, z. B. `12` |
+| `--local-remind N`  | `SECFEED_LOCAL_REMIND`   | Unveränderte Funde nach N Tagen erneut melden (Default 7, `0` = nur einmal) |
 | `--local-unfixed`   | `SECFEED_LOCAL_UNFIXED`  | Auch Lücken ohne verfügbares Update melden |
 
 Siehe Abschnitt [Paketscan](#paketscan-was-steckt-hier-drin) weiter unten.
@@ -180,6 +181,19 @@ Ein gepflegtes System meldet deshalb fast nichts. `openssl 3.0.11` liefert 41
 Treffer, davon 39 behebbar; die aktuelle Version liefert 2 — beide ohne Fix und
 damit stumm, solange du nicht `--local-unfixed` setzt.
 
+### Warum Funde wiederkommen
+
+Eine Nachricht ist ein Ereignis — einmal gemeldet, erledigt. Ein verwundbares
+Paket ist ein **Zustand**, der bleibt, bis jemand patcht. Deshalb unterliegen
+Scan-Funde nicht der üblichen Einmal-Meldung: unverändert bestehende Funde
+tauchen nach sieben Tagen wieder auf (`--local-remind`, `0` schaltet es ab).
+
+Ohne das würde ein übersehener Hinweis dafür sorgen, dass ein ungepatchter Pi
+für immer sauber aussieht. Die Frist ist eine Obergrenze, keine exakte Zusage:
+die Fenstergrenzen liegen fest auf dem Zeitstrahl und nicht ab der Erstmeldung,
+ein Fund kurz vor einer Grenze kommt also früher wieder. Zu früh erinnert zu
+werden ist der harmlose Fehler.
+
 ### Grenzen
 
 Drei Dinge, die der Scan **nicht** leistet:
@@ -188,9 +202,10 @@ Drei Dinge, die der Scan **nicht** leistet:
   `raspberrypi-bootloader` und die Firmware-Pakete aus dem RPi-Repo stehen nicht
   in der Debian-Datenbank und kommen als „unauffällig" zurück, obwohl sie nie
   geprüft wurden. Für den Kernel bleibt `sudo apt list --upgradable`.
-- **Nur Debian.** Auf einem Abkömmling mit eigener `ID` in `/etc/os-release`
-  verweigert er den Dienst, statt gegen die falsche Datenbank zu prüfen. Mit
-  `--debian-release` lässt sich das überstimmen, wenn du weißt, was du tust.
+- **Nur Debian und Alpine.** Der Host wird als Debian geprüft, Container
+  zusätzlich als Alpine. Alles andere — Fedora, distroless, scratch — meldet er
+  als „nicht prüfbar", statt gegen die falsche Datenbank zu vergleichen. Für den
+  Host lässt sich das mit `--debian-release` überstimmen.
 - **Nur Systempakete.** Was per `pip`, `npm` oder `docker` danebenliegt, taucht
   in `dpkg` nicht auf. Dafür sind `pip-audit` bzw. `osv-scanner` zuständig.
 
@@ -237,9 +252,10 @@ gegen Debian 12 neununddreißig Treffer und gegen Debian 13 vierundfünfzig.
 
 Zwei Dinge, die bewusst laut sind statt still:
 
-- **Container ohne `dpkg`** (Alpine, distroless, scratch) erscheinen als
+- **Container ohne Paketdatenbank** (distroless, scratch) erscheinen als
   „nicht prüfbar" samt Imagename, statt einfach zu fehlen. Ein ungeprüfter
-  Container darf nicht aussehen wie ein unauffälliger.
+  Container darf nicht aussehen wie ein unauffälliger. Alpine-Container werden
+  dagegen normal geprüft, über `/lib/apk/db/installed`.
 - **Veraltete Listen** melden sich selbst. Bleibt der Timer stehen, steht ab 48
   Stunden ein Hinweis in der Mail — ein stehengebliebener Sammler, der „alles
   ruhig" suggeriert, wäre die gefährlichste Art, falsch zu liegen.

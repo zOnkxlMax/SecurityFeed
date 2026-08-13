@@ -181,6 +181,8 @@ jobs:
         # keinen Pull Request blockieren.
         run: |
           docker run -d --name ci-alpine alpine:3 sleep 300
+          # busybox hat weder dpkg noch apk - der Fall "gar keine Paketliste".
+          docker run -d --name ci-busybox busybox:latest sleep 300
           sudo ./deploy/dump-container-packages.sh /tmp/ci-container-lists
           find /tmp/ci-container-lists
 
@@ -192,18 +194,25 @@ jobs:
           # ihm folgen, sonst steht hier nur ein toter Verweis.
           grep -q "^ID=debian" /tmp/ci-container-lists/securityfeed/os-release
 
-          # Alpine hat kein dpkg und muss als nicht pruefbar vermerkt sein,
+          # Alpine fuehrt seine Pakete in /lib/apk/db/installed.
+          test -s /tmp/ci-container-lists/ci-alpine/apk-installed
+          grep -q "^P:" /tmp/ci-container-lists/ci-alpine/apk-installed
+          grep -q "^ID=alpine" /tmp/ci-container-lists/ci-alpine/os-release
+          test ! -f /tmp/ci-container-lists/ci-alpine/unsupported
+
+          # Ohne beides muss der Container als nicht pruefbar vermerkt sein,
           # statt stillschweigend zu fehlen.
-          test -s /tmp/ci-container-lists/ci-alpine/unsupported
-          grep -q "alpine" /tmp/ci-container-lists/ci-alpine/unsupported
+          test -s /tmp/ci-container-lists/ci-busybox/unsupported
+          grep -q "busybox" /tmp/ci-container-lists/ci-busybox/unsupported
 
           # Zeitstempel, an dem SecurityFeed veraltete Listen erkennt.
           test -f /tmp/ci-container-lists/updated
 
           # Beendete Container fliegen beim naechsten Lauf wieder raus.
-          docker rm -f ci-alpine
+          docker rm -f ci-alpine ci-busybox
           sudo ./deploy/dump-container-packages.sh /tmp/ci-container-lists
           test ! -d /tmp/ci-container-lists/ci-alpine
+          test ! -d /tmp/ci-container-lists/ci-busybox
 
       - name: Aufräumen
         # Muss auch nach einem Fehlschlag laufen, sonst sammeln sich auf einem
@@ -211,7 +220,7 @@ jobs:
         if: always()
         run: |
           docker compose down -v --remove-orphans || true
-          docker rm -f sf-sched ci-alpine 2>/dev/null || true
+          docker rm -f sf-sched ci-alpine ci-busybox 2>/dev/null || true
           sudo rm -rf /tmp/ci-container-lists
           rm -f .env
 

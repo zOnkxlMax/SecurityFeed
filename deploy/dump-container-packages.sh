@@ -50,27 +50,42 @@ for NAME in $LAUFEND; do
     rm -f "$VERZ/unsupported"
 
     # docker cp braucht keine Shell im Container und funktioniert deshalb auch
-    # bei schlanken Images. Bei distroless und scratch fehlt dpkg trotzdem.
+    # bei schlanken Images.
+    ART=""
     if docker cp -L "$NAME:/var/lib/dpkg/status" "$VERZ/status.neu" >/dev/null 2>&1; then
+        ART="dpkg"
+        rm -f "$VERZ/apk-installed"
         mv "$VERZ/status.neu" "$VERZ/status"
         chmod 0644 "$VERZ/status"
+    elif docker cp -L "$NAME:/lib/apk/db/installed" "$VERZ/apk-installed.neu" >/dev/null 2>&1; then
+        ART="apk"
+        rm -f "$VERZ/status"
+        mv "$VERZ/apk-installed.neu" "$VERZ/apk-installed"
+        chmod 0644 "$VERZ/apk-installed"
+    fi
+    rm -f "$VERZ/status.neu" "$VERZ/apk-installed.neu"
+
+    if [ -n "$ART" ]; then
+        # Ohne os-release fehlt die Distributionsversion, und ohne die wird
+        # nicht geraten, sondern nicht geprueft.
         if docker cp -L "$NAME:/etc/os-release" "$VERZ/os-release.neu" >/dev/null 2>&1; then
             mv "$VERZ/os-release.neu" "$VERZ/os-release"
             chmod 0644 "$VERZ/os-release"
         else
             rm -f "$VERZ/os-release.neu" "$VERZ/os-release"
         fi
-        echo "$NAME: Paketliste abgelegt"
+        echo "$NAME: Paketliste abgelegt ($ART)"
     else
-        rm -f "$VERZ/status.neu" "$VERZ/status" "$VERZ/os-release"
-        # Kein dpkg: Alpine, distroless oder scratch. Der Vermerk sorgt dafuer,
-        # dass der Container in der Mail als "nicht pruefbar" auftaucht, statt
-        # stillschweigend als unauffaellig durchzugehen.
+        rm -f "$VERZ/os-release"
+        # Weder dpkg noch apk: distroless, scratch oder eine andere Basis. Der
+        # Vermerk sorgt dafuer, dass der Container in der Mail als "nicht
+        # pruefbar" auftaucht, statt stillschweigend als unauffaellig
+        # durchzugehen.
         IMAGE=$(docker inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null || echo "unbekannt")
-        printf 'keine dpkg-Paketliste im Container (Image: %s) - Alpine, distroless oder scratch?\n' \
+        printf 'keine Paketliste im Container gefunden, weder dpkg noch apk (Image: %s)\n' \
             "$IMAGE" > "$VERZ/unsupported"
         chmod 0644 "$VERZ/unsupported"
-        echo "$NAME: kein dpkg, als nicht pruefbar vermerkt"
+        echo "$NAME: weder dpkg noch apk, als nicht pruefbar vermerkt"
     fi
 done
 
