@@ -77,6 +77,7 @@ py -3 vulnfeed.py --cve-only --since 3
 | `--dpkg-status`     | `SECFEED_DPKG_STATUS`    | Statusdatei lesen statt `dpkg-query` aufzurufen |
 | `--container-lists` | `SECFEED_CONTAINER_LISTS` | Auch die abgelegten Paketlisten der Container prüfen |
 | `--debian-release`  | `SECFEED_DEBIAN_RELEASE` | Debian-Hauptversion erzwingen, z. B. `12` |
+| `--local-remind N`  | `SECFEED_LOCAL_REMIND`   | Unveränderte Funde nach N Tagen erneut melden (Default 7, `0` = nur einmal) |
 | `--local-unfixed`   | `SECFEED_LOCAL_UNFIXED`  | Auch Lücken ohne verfügbares Update melden |
 
 Siehe Abschnitt [Paketscan](#paketscan-was-steckt-hier-drin) weiter unten.
@@ -179,6 +180,19 @@ Software auf dem Pi.
 Ein gepflegtes System meldet deshalb fast nichts. `openssl 3.0.11` liefert 41
 Treffer, davon 39 behebbar; die aktuelle Version liefert 2 — beide ohne Fix und
 damit stumm, solange du nicht `--local-unfixed` setzt.
+
+### Warum Funde wiederkommen
+
+Eine Nachricht ist ein Ereignis — einmal gemeldet, erledigt. Ein verwundbares
+Paket ist ein **Zustand**, der bleibt, bis jemand patcht. Deshalb unterliegen
+Scan-Funde nicht der üblichen Einmal-Meldung: unverändert bestehende Funde
+tauchen nach sieben Tagen wieder auf (`--local-remind`, `0` schaltet es ab).
+
+Ohne das würde ein übersehener Hinweis dafür sorgen, dass ein ungepatchter Pi
+für immer sauber aussieht. Die Frist ist eine Obergrenze, keine exakte Zusage:
+die Fenstergrenzen liegen fest auf dem Zeitstrahl und nicht ab der Erstmeldung,
+ein Fund kurz vor einer Grenze kommt also früher wieder. Zu früh erinnert zu
+werden ist der harmlose Fehler.
 
 ### Grenzen
 

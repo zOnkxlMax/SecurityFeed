@@ -125,6 +125,15 @@ CODENAME_RELEASES = {
     "buster": "10", "bullseye": "11", "bookworm": "12", "trixie": "13", "forky": "14",
 }
 
+# Nach so vielen Tagen wird ein unveraenderter Fund erneut gemeldet.
+#
+# Eine Nachricht ist ein Ereignis - einmal melden, fertig. Ein verwundbares
+# Paket ist ein Zustand, der bleibt, bis jemand patcht. Ohne Wiedervorlage
+# verschwaende der Fund nach der ersten Mail und das System saehe fuer immer
+# sauber aus. Woechentlich ist der Kompromiss: haeufig genug, um nicht in
+# Vergessenheit zu geraten, selten genug, um nicht weggefiltert zu werden.
+LOCAL_REMIND_DAYS = 7.0
+
 # So viele CVE-Nummern werden je Eintrag ausgegeben. Ein lange nicht gepflegtes
 # Paket bringt schnell 40 mit - die Liste ist dann keine Information mehr.
 CVE_DISPLAY_CAP = 8
@@ -361,6 +370,7 @@ class LocalOptions:
     release: str | None = None      # Debian-Hauptversion, z.B. "12"
     unfixed: bool = False           # auch Luecken ohne verfuegbaren Fix melden
     containers: str | None = None   # Verzeichnis mit Container-Paketlisten
+    remind_days: float = 7.0        # unveraenderte Funde nach so vielen Tagen erneut
 
 
 @dataclass(frozen=True)
@@ -678,8 +688,25 @@ def cve_id(osv_id: str) -> str:
     return stripped if CVE_RE.fullmatch(stripped) else osv_id
 
 
+def reminder_window(now: datetime, days: float) -> str:
+    """Kennung des laufenden Wiedervorlage-Fensters.
+
+    Sie steckt im Zustandsschluessel: solange sie gleich bleibt, gilt ein
+    unveraenderter Fund als schon gemeldet. Springt sie um, taucht er wieder
+    auf. Bei 0 gibt es nur eine Kennung und damit die alte Einmal-Meldung.
+
+    Die Grenzen liegen fest auf dem Zeitstrahl, nicht ab der Erstmeldung. Ein
+    Fund kurz vor einer Grenze wiederholt sich deshalb frueher als nach der
+    vollen Frist - "hoechstens alle N Tage", nicht "genau alle N Tage". Das
+    spart einen Erstmeldungszeitpunkt je Fund im Zustandsspeicher, und
+    frueher erinnert zu werden ist der harmlose Fehler."""
+    if days <= 0:
+        return "einmalig"
+    return str(int(now.timestamp() // (days * 86400)))
+
+
 def local_entry(target: ScanTarget, package: Package, cves: list[str], unfixed: int,
-                now: datetime, *, fixable: bool = True,
+                now: datetime, window: str = "einmalig", *, fixable: bool = True,
                 truncated: bool = False) -> Entry:
     binaries = list(package.binaries) or [package.name]
     shown = ", ".join(binaries[:6]) + (" ..." if len(binaries) > 6 else "")
@@ -735,13 +762,15 @@ def local_entry(target: ScanTarget, package: Package, cves: list[str], unfixed: 
         # Der Link zeigt fuer ein Paket immer auf dieselbe Tracker-Seite. Ohne
         # Ziel, Anzahl und juengste CVE im Schluessel bliebe jede spaeter dazu
         # gekommene Luecke ungemeldet - und dasselbe Paket auf Host und in
-        # einem Container waere derselbe Eintrag.
+        # einem Container waere derselbe Eintrag. Das Fenster am Ende sorgt
+        # dafuer, dass ein ungepatchter Fund wiederkommt statt zu verschwinden.
         key=f"local:{target.name or 'host'}:{package.name}:{len(cves)}:"
-            f"{max(cves) if cves else package.version}",
+            f"{max(cves) if cves else package.version}:{window}",
     )
 
 
-def unscanned_entry(skipped: SkippedTarget, now: datetime) -> Entry:
+def unscanned_entry(skipped: SkippedTarget, now: datetime,
+                    window: str = "einmalig") -> Entry:
     """Ein Ziel, das sich nicht pruefen liess. Ohne diesen Eintrag saehe ein
     unpruefbarer Container aus wie ein unauffaelliger."""
     what = f"Container {skipped.name}" if skipped.name else "Lokales System"
@@ -755,7 +784,9 @@ def unscanned_entry(skipped: SkippedTarget, now: datetime) -> Entry:
                 "befunden.",
         advisory=True,
         local=True,
-        key=f"local:{skipped.name or 'host'}:ungeprueft:{skipped.reason}",
+        # Ein blinder Fleck bleibt einer, bis sich etwas aendert - deshalb
+        # dieselbe Wiedervorlage wie bei den Funden.
+        key=f"local:{skipped.name or 'host'}:ungeprueft:{skipped.reason}:{window}",
     )
 
 
@@ -822,7 +853,8 @@ def scan_local(opts: LocalOptions, timeout: float) -> list[Entry]:
     answers = osv_batch(queries, max(timeout, 60.0))
 
     now = datetime.now(timezone.utc)
-    entries = [unscanned_entry(item, now) for item in skipped]
+    window = reminder_window(now, opts.remind_days)
+    entries = [unscanned_entry(item, now, window) for item in skipped]
 
     directory = opts.containers or os.environ.get("SECFEED_CONTAINER_LISTS")
     if directory:
@@ -840,18 +872,20 @@ def scan_local(opts: LocalOptions, timeout: float) -> list[Entry]:
             if len(current) >= OSV_RESULT_CAP or len(sentinel) >= OSV_RESULT_CAP:
                 entries.append(local_entry(
                     target, package, sorted({cve_id(i) for i in current}), 0, now,
-                    truncated=True,
+                    window, truncated=True,
                 ))
                 continue
 
             unfixed = set(sentinel)
             fixable = sorted({cve_id(i) for i in current if i not in unfixed})
             if fixable:
-                entries.append(local_entry(target, package, fixable, len(unfixed), now))
+                entries.append(local_entry(
+                    target, package, fixable, len(unfixed), now, window
+                ))
             elif opts.unfixed:
                 entries.append(local_entry(
                     target, package, sorted({cve_id(i) for i in unfixed}), 0, now,
-                    fixable=False,
+                    window, fixable=False,
                 ))
     return entries
 
@@ -1405,6 +1439,12 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--debian-release", metavar="N",
                       help="Debian-Hauptversion erzwingen, z.B. 12, falls sie sich nicht "
                            "aus /etc/os-release ergibt (SECFEED_DEBIAN_RELEASE).")
+    scan.add_argument("--local-remind", metavar="TAGE", type=float,
+                      default=LOCAL_REMIND_DAYS,
+                      help="Unveraenderte Funde nach so vielen Tagen erneut melden "
+                           "(SECFEED_LOCAL_REMIND). Ein verwundbares Paket ist ein "
+                           "Zustand, keine Nachricht - ohne Wiedervorlage verschwaende "
+                           "es nach der ersten Mail. 0 = nur einmal melden.")
     scan.add_argument("--local-unfixed", action="store_true",
                       help="Auch Luecken melden, gegen die es noch kein Update gibt "
                            "(SECFEED_LOCAL_UNFIXED=1). Deutlich mehr Rauschen.")
@@ -1469,11 +1509,24 @@ def select_sources(args: argparse.Namespace) -> list[Source]:
 
 
 def local_options(args: argparse.Namespace) -> LocalOptions:
+    # Der Default steckt schon im Parser, die Umgebung zieht also nur, wenn auf
+    # der Kommandozeile nichts Abweichendes steht.
+    remind = args.local_remind
+    if remind == LOCAL_REMIND_DAYS and os.environ.get("SECFEED_LOCAL_REMIND"):
+        try:
+            remind = float(os.environ["SECFEED_LOCAL_REMIND"])
+        except ValueError:
+            raise ConfigError(
+                "SECFEED_LOCAL_REMIND muss eine Zahl in Tagen sein, z.B. 7 "
+                f"(steht dort: {os.environ['SECFEED_LOCAL_REMIND']!r})."
+            ) from None
+
     return LocalOptions(
         status_path=args.dpkg_status,
         release=args.debian_release,
         unfixed=args.local_unfixed or env_flag("SECFEED_LOCAL_UNFIXED"),
         containers=args.container_lists,
+        remind_days=remind,
     )
 
 
@@ -1665,6 +1718,9 @@ def main(argv: list[str] | None = None) -> int:
     # nach 20 Sekunden Feedabruf, und im Dauerbetrieb gar nicht erst starten.
     try:
         mail_cfg = mail_config_from_env(args) if args.email else None
+        # Nur zur Pruefung - im Dauerbetrieb soll ein Zahlendreher in der
+        # Umgebung sofort auffallen und nicht erst beim ersten Lauf.
+        local_options(args)
         # SECFEED_SCHEDULE steckt im Container in der Service-Umgebung und wird
         # daher auch an "docker compose run" durchgereicht. Ohne diese Ausnahme
         # wuerde ein dortiger Einzelaufruf den Scheduler starten und haengen.
