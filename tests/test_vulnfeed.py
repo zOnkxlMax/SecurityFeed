@@ -1022,6 +1022,75 @@ class TestScanLocal(unittest.TestCase):
         self.assertNotEqual(first[0].state_key, second[0].state_key)
 
 
+class TestReminder(unittest.TestCase):
+    """Eine Nachricht ist ein Ereignis, ein verwundbares Paket ein Zustand.
+    Ohne Wiedervorlage verschwaende der Fund nach der ersten Mail und das
+    System saehe fuer immer sauber aus."""
+
+    def _window(self, tage: float, stunden: float) -> str:
+        # Auf einem Fensteranfang starten: die Grenzen liegen fest auf dem
+        # Zeitstrahl, ein beliebiger Startpunkt laege irgendwo mittendrin.
+        start = (datetime.fromtimestamp(tage * 86400 * 3000, timezone.utc)
+                 if tage > 0 else datetime(2026, 3, 1, tzinfo=timezone.utc))
+        return vf.reminder_window(start + timedelta(hours=stunden), tage)
+
+    def test_window_holds_within_the_interval(self):
+        self.assertEqual(self._window(7, 0), self._window(7, 24))
+        self.assertEqual(self._window(7, 0), self._window(7, 167))
+
+    def test_window_moves_on_after_the_interval(self):
+        self.assertNotEqual(self._window(7, 0), self._window(7, 168))
+
+    def test_reminder_is_at_most_but_not_exactly_the_interval(self):
+        # Die Grenze haengt am Zeitstrahl, nicht an der Erstmeldung. Ein Fund
+        # kurz davor kommt frueher wieder - der harmlose Fehler, und er spart
+        # einen Erstmeldungszeitpunkt je Fund im Zustandsspeicher.
+        self.assertNotEqual(self._window(7, 167), self._window(7, 169))
+
+    def test_zero_days_keeps_the_old_report_once_behaviour(self):
+        self.assertEqual(self._window(0, 0), self._window(0, 24 * 365))
+
+    def test_unchanged_finding_reappears_in_the_next_window(self):
+        package = vf.Package("openssl", "3.0.11-1")
+        target = vf.ScanTarget(name="", packages=(package,), release="12")
+        now = datetime.now(timezone.utc)
+        first = vf.local_entry(target, package, ["CVE-2024-1001"], 0, now, "100")
+        later = vf.local_entry(target, package, ["CVE-2024-1001"], 0, now, "101")
+        self.assertNotEqual(first.state_key, later.state_key)
+
+    def test_unscannable_target_also_comes_back(self):
+        skipped = vf.SkippedTarget("alpine", "kein dpkg")
+        now = datetime.now(timezone.utc)
+        self.assertNotEqual(
+            vf.unscanned_entry(skipped, now, "100").state_key,
+            vf.unscanned_entry(skipped, now, "101").state_key,
+        )
+
+    def test_default_is_weekly(self):
+        args = vf.build_parser().parse_args([])
+        self.assertEqual(vf.local_options(args).remind_days, 7.0)
+
+    def test_environment_can_change_the_interval(self):
+        os.environ["SECFEED_LOCAL_REMIND"] = "2"
+        self.addCleanup(os.environ.pop, "SECFEED_LOCAL_REMIND", None)
+        args = vf.build_parser().parse_args([])
+        self.assertEqual(vf.local_options(args).remind_days, 2.0)
+
+    def test_command_line_beats_the_environment(self):
+        os.environ["SECFEED_LOCAL_REMIND"] = "2"
+        self.addCleanup(os.environ.pop, "SECFEED_LOCAL_REMIND", None)
+        args = vf.build_parser().parse_args(["--local-remind", "30"])
+        self.assertEqual(vf.local_options(args).remind_days, 30.0)
+
+    def test_unusable_interval_is_a_configuration_error(self):
+        os.environ["SECFEED_LOCAL_REMIND"] = "woechentlich"
+        self.addCleanup(os.environ.pop, "SECFEED_LOCAL_REMIND", None)
+        with self.assertRaises(vf.ConfigError):
+            vf.local_options(vf.build_parser().parse_args([]))
+        # Und der Lauf bricht sauber mit Code 2 ab, statt mit einem Traceback.
+        self.assertEqual(vf.main(["--no-state", "-s", "local"]), 2)
+
+
 class TestOsvBatch(unittest.TestCase):
     def _patch_urlopen(self, handler) -> None:
         original = vf.urllib.request.urlopen
