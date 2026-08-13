@@ -866,6 +866,100 @@ class TestDpkgParsing(unittest.TestCase):
         self.assertNotIn("", packages)
 
 
+APK_FIXTURE = """C:Q1eVpkasfsuSNoRy5aAceFsSJZ9BE=
+P:libcrypto3
+V:3.3.2-r0
+A:aarch64
+S:1129672
+I:4747264
+T:Crypto library from openssl
+o:openssl
+p:so:libcrypto.so.3=3
+D:so:libc.musl-aarch64.so.1
+
+C:Q1yg4dUCXQaNXvXqmZfLnzSGvfr8s=
+P:libssl3
+V:3.3.2-r0
+A:aarch64
+o:openssl
+
+C:Q1CjQoUq3rSCLcvHFTVKdcpwEG3EE=
+P:busybox
+V:1.37.0-r12
+A:aarch64
+T:Size optimized toolbox of many common UNIX utilities
+
+P:kaputt-ohne-version
+A:aarch64
+"""
+
+
+class TestApkParsing(unittest.TestCase):
+    """Alpine-Container - postgres:17-alpine, n8n, adguardhome - fuehren ihre
+    Pakete in /lib/apk/db/installed statt in einer dpkg-Statusdatei."""
+
+    def setUp(self):
+        self.packages = {p.name: p for p in vf.parse_apk_installed(APK_FIXTURE)}
+
+    def test_subpackages_are_folded_onto_their_origin(self):
+        # OSV kennt auch bei Alpine nur das Ursprungspaket: eine Abfrage nach
+        # libssl3 liefert nichts, die nach openssl alles.
+        self.assertIn("openssl", self.packages)
+        self.assertNotIn("libssl3", self.packages)
+        self.assertEqual(self.packages["openssl"].binaries, ("libcrypto3", "libssl3"))
+        self.assertEqual(self.packages["openssl"].version, "3.3.2-r0")
+
+    def test_package_without_origin_stands_for_itself(self):
+        self.assertEqual(self.packages["busybox"].version, "1.37.0-r12")
+
+    def test_records_without_a_version_are_skipped(self):
+        self.assertNotIn("kaputt-ohne-version", self.packages)
+
+    def test_checksum_lines_are_not_mistaken_for_fields(self):
+        # "C:Q1..." und "D:so:libc..." enthalten Doppelpunkte im Wert.
+        self.assertEqual(set(self.packages), {"openssl", "busybox"})
+
+    def test_alpine_version_becomes_the_osv_ecosystem(self):
+        # OSV verlangt genau diese Schreibweise - "Alpine:3.21" und "Alpine"
+        # liefern beide nichts.
+        self.assertEqual(vf.alpine_ecosystem("3.21.2"), "Alpine:v3.21")
+        self.assertEqual(vf.alpine_ecosystem("3.19"), "Alpine:v3.19")
+        self.assertIsNone(vf.alpine_ecosystem("edge"))
+        self.assertIsNone(vf.alpine_ecosystem(""))
+
+
+class TestSentinelPerEcosystem(unittest.TestCase):
+    """Der Sentinel muss zum Oekosystem passen. Ein Debian-Sentinel liefert
+    bei Alpine heute zwar auch nichts - aber nur, weil OSV eine unparsbare
+    Version als 'kein Treffer' behandelt. Aenderte sich das je, wuerde die
+    Differenz saemtliche Alpine-Funde ausloeschen."""
+
+    def test_debian_style_for_debian_and_ubuntu(self):
+        self.assertEqual(vf.sentinel_version("Debian:12"), "999999:0-0")
+        self.assertEqual(vf.sentinel_version("Ubuntu:24.04"), "999999:0-0")
+
+    def test_apk_style_for_alpine(self):
+        self.assertEqual(vf.sentinel_version("Alpine:v3.21"), "999999.0-r0")
+        self.assertIn("-r", vf.sentinel_version("Alpine:v3.21"))
+        self.assertNotIn(":", vf.sentinel_version("Alpine:v3.21"))
+
+
+class TestTrackerLink(unittest.TestCase):
+    def test_debian_goes_to_the_debian_tracker(self):
+        # Nur der zeigt den Status je Suite.
+        self.assertEqual(vf.tracker_url("Debian:12", "openssl"),
+                         "https://security-tracker.debian.org/tracker/source-package/openssl")
+
+    def test_alpine_goes_to_osv(self):
+        # Alpines Tracker hat keine brauchbare Adresse je Paket - ein Link auf
+        # den Debian-Tracker waere fuer ein Alpine-Paket schlicht falsch.
+        link = vf.tracker_url("Alpine:v3.21", "openssl")
+        self.assertNotIn("debian", link)
+        self.assertIn("osv.dev", link)
+        self.assertIn("ecosystem=Alpine%3Av3.21", link)
+        self.assertIn("q=openssl", link)
+
+
 class TestDebianRelease(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -920,6 +1014,10 @@ class TestCveId(unittest.TestCase):
     def test_debian_prefix_is_removed(self):
         self.assertEqual(vf.cve_id("DEBIAN-CVE-2025-9230"), "CVE-2025-9230")
 
+    def test_prefixes_of_the_other_distributions_too(self):
+        self.assertEqual(vf.cve_id("ALPINE-CVE-2024-13176"), "CVE-2024-13176")
+        self.assertEqual(vf.cve_id("UBUNTU-CVE-2022-40735"), "CVE-2022-40735")
+
     def test_other_identifiers_stay_untouched(self):
         self.assertEqual(vf.cve_id("GHSA-abcd-1234"), "GHSA-abcd-1234")
         self.assertEqual(vf.cve_id("DEBIAN-DSA-5678-1"), "DEBIAN-DSA-5678-1")
@@ -948,7 +1046,8 @@ class TestScanLocal(unittest.TestCase):
             answers = []
             for name, version, _ecosystem in queries:
                 real, sentinel = vulns.get(name, ([], []))
-                answers.append(sentinel if version == vf.OSV_SENTINEL_VERSION else real)
+                passend = version == vf.sentinel_version(_ecosystem)
+                answers.append(sentinel if passend else real)
             return answers
         return fake_batch
 
@@ -973,7 +1072,7 @@ class TestScanLocal(unittest.TestCase):
         self._scan([vf.Package("openssl", "3.0.11-1")], {})
         self.assertEqual(self.queries, [
             ("openssl", "3.0.11-1", "Debian:12"),
-            ("openssl", vf.OSV_SENTINEL_VERSION, "Debian:12"),
+            ("openssl", vf.sentinel_version("Debian:12"), "Debian:12"),
         ])
 
     def test_package_without_findings_yields_nothing(self):
@@ -1052,7 +1151,7 @@ class TestReminder(unittest.TestCase):
 
     def test_unchanged_finding_reappears_in_the_next_window(self):
         package = vf.Package("openssl", "3.0.11-1")
-        target = vf.ScanTarget(name="", packages=(package,), release="12")
+        target = vf.ScanTarget(name="", packages=(package,), ecosystem="Debian:12")
         now = datetime.now(timezone.utc)
         first = vf.local_entry(target, package, ["CVE-2024-1001"], 0, now, "100")
         later = vf.local_entry(target, package, ["CVE-2024-1001"], 0, now, "101")
@@ -1163,12 +1262,24 @@ class TestContainerLists(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
 
+    # Auszug aus /lib/apk/db/installed: P Name, V Version, o Ursprungspaket.
+    APK = ("C:Q1eVpkasfsuSNoRy5aAceFsSJZ9BE=\n"
+           "P:libssl3\n"
+           "V:3.3.2-r0\n"
+           "A:aarch64\n"
+           "o:openssl\n"
+           "\n"
+           "P:busybox\n"
+           "V:1.37.0-r12\n"
+           "A:aarch64\n")
+
     def _container(self, name: str, status: str | None = None,
                    os_release: str | None = "ID=debian\nVERSION_ID=\"12\"\n",
-                   unsupported: str | None = None) -> str:
+                   unsupported: str | None = None, apk: str | None = None) -> str:
         base = os.path.join(self.dir, name)
         os.makedirs(base, exist_ok=True)
         for filename, text in ((vf.CONTAINER_STATUS_FILE, status),
+                               (vf.CONTAINER_APK_FILE, apk),
                                (vf.CONTAINER_OS_RELEASE_FILE, os_release),
                                (vf.CONTAINER_UNSUPPORTED_FILE, unsupported)):
             if text is not None:
@@ -1181,7 +1292,7 @@ class TestContainerLists(unittest.TestCase):
         targets, skipped = vf.container_targets(self.dir)
         self.assertEqual(skipped, [])
         self.assertEqual(targets[0].name, "web")
-        self.assertEqual(targets[0].release, "12")
+        self.assertEqual(targets[0].ecosystem, "Debian:12")
         self.assertEqual([p.name for p in targets[0].packages], ["openssl"])
 
     def test_unsupported_marker_wins_and_carries_the_reason(self):
@@ -1191,20 +1302,37 @@ class TestContainerLists(unittest.TestCase):
         self.assertEqual(skipped[0].name, "alpine")
         self.assertIn("dpkg", skipped[0].reason)
 
+    def test_alpine_container_becomes_a_target(self):
+        # postgres:17-alpine und Konsorten: apk statt dpkg.
+        self._container("db", apk=self.APK,
+                        os_release='ID=alpine\nVERSION_ID="3.21.2"\n')
+        targets, skipped = vf.container_targets(self.dir)
+        self.assertEqual(skipped, [])
+        self.assertEqual(targets[0].ecosystem, "Alpine:v3.21")
+        # libssl3 gehoert zum Ursprungspaket openssl - danach fragt OSV.
+        self.assertEqual([p.name for p in targets[0].packages], ["busybox", "openssl"])
+
     def test_container_without_os_release_is_skipped_not_guessed(self):
         # Ein bookworm-Host und ein trixie-Container haben verschiedene
         # Fixversionen. Lieber nicht pruefen als gegen die falsche Suite.
         self._container("fremd", status=self.STATUS, os_release=None)
         targets, skipped = vf.container_targets(self.dir)
         self.assertEqual(targets, [])
-        self.assertIn("Debian-Version", skipped[0].reason)
+        self.assertIn("nicht erkennbar", skipped[0].reason)
 
-    def test_non_debian_container_is_skipped(self):
-        self._container("alpine", status=self.STATUS,
-                        os_release='ID=alpine\nVERSION_ID="3.19.1"\n')
+    def test_unknown_distribution_is_skipped(self):
+        self._container("fedora", status=self.STATUS,
+                        os_release='ID=fedora\nVERSION_ID="41"\n')
         targets, skipped = vf.container_targets(self.dir)
         self.assertEqual(targets, [])
-        self.assertEqual(skipped[0].name, "alpine")
+        self.assertEqual(skipped[0].name, "fedora")
+
+    def test_alpine_edge_is_skipped_rather_than_guessed(self):
+        # "edge" hat in der Datenbank kein Gegenstueck.
+        self._container("edge", apk=self.APK, os_release="ID=alpine\nVERSION_ID=edge\n")
+        targets, skipped = vf.container_targets(self.dir)
+        self.assertEqual(targets, [])
+        self.assertIn("nicht erkennbar", skipped[0].reason)
 
     def test_empty_status_file_is_skipped(self):
         self._container("leer", status="")
@@ -1216,11 +1344,15 @@ class TestContainerLists(unittest.TestCase):
         self.assertEqual(targets, [])
         self.assertIn("nicht lesbar", skipped[0].reason)
 
-    def test_release_is_read_from_the_container_itself(self):
-        self.assertEqual(vf.container_release('ID=debian\nVERSION_ID="13"\n'), "13")
-        self.assertEqual(vf.container_release("VERSION_CODENAME=bookworm\n"), "12")
-        self.assertIsNone(vf.container_release('ID=alpine\nVERSION_ID="3.19"\n'))
-        self.assertIsNone(vf.container_release(""))
+    def test_ecosystem_is_read_from_the_container_itself(self):
+        self.assertEqual(vf.container_ecosystem('ID=debian\nVERSION_ID="13"\n'),
+                         "Debian:13")
+        self.assertEqual(vf.container_ecosystem("VERSION_CODENAME=bookworm\n"),
+                         "Debian:12")
+        self.assertEqual(vf.container_ecosystem('ID=alpine\nVERSION_ID="3.21.2"\n'),
+                         "Alpine:v3.21")
+        self.assertIsNone(vf.container_ecosystem('ID=fedora\nVERSION_ID="41"\n'))
+        self.assertIsNone(vf.container_ecosystem(""))
 
     def test_age_of_the_stamp_file(self):
         self.assertIsNone(vf.container_list_age(self.dir))
@@ -1277,7 +1409,8 @@ class TestScanAcrossTargets(unittest.TestCase):
             answers = []
             for name, version, _ecosystem in queries:
                 real, sentinel = vulns.get(name, ([], []))
-                answers.append(sentinel if version == vf.OSV_SENTINEL_VERSION else real)
+                passend = version == vf.sentinel_version(_ecosystem)
+                answers.append(sentinel if passend else real)
             return answers
 
         self._patch("installed_packages", packages)

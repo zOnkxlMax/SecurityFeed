@@ -353,7 +353,9 @@ SECFEED_CONTAINER_LISTS=/var/lib/securityfeed/containers
 ```
 
 Jeder Fund nennt danach seine Herkunft — „Lokales System" oder „Container
-nextcloud". Container ohne `dpkg` (Alpine, distroless) erscheinen ausdrücklich
+nextcloud". Debian- und Alpine-Container werden beide geprüft, jeder gegen
+seine eigene Distributionsversion. Container ohne Paketdatenbank (distroless,
+scratch) erscheinen ausdrücklich
 als „nicht prüfbar", und bleibt der Timer stehen, meldet SecurityFeed die
 veralteten Listen von sich aus. Behoben werden Container-Funde nicht per `apt`,
 sondern über ein neues Image.
