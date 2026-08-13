@@ -383,9 +383,11 @@ Container falsch bewertet.
 
 Zwei Dinge, die das Verfahren bewusst anders macht als ein stiller Scanner:
 
-- **Container ohne `dpkg`** (Alpine, distroless, scratch) erscheinen als
+- **Container ohne Paketdatenbank** (distroless, scratch) erscheinen als
   „Container xy: nicht prüfbar" samt Imagename. Sie fehlen nicht einfach — sonst
-  sähe ein ungeprüfter Container aus wie ein unauffälliger.
+  sähe ein ungeprüfter Container aus wie ein unauffälliger. Debian- und
+  Alpine-Container werden dagegen beide normal geprüft, jeder gegen seine
+  eigene Distributionsversion.
 - **Veraltete Listen** melden sich selbst. Bleibt der Timer stehen, steht ab 48
   Stunden „Container-Paketlisten veraltet" in der Mail, statt einen alten Stand
   als aktuell auszugeben.

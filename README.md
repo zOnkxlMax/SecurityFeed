@@ -15,7 +15,7 @@ Reines Python 3.10+ aus der Standardbibliothek — keine Abhängigkeiten, kein
 | `heise-alerts`   | heise Security Alerts (Atom)  | reine Schwachstellen-/Advisory-Meldungen  |
 | `heise-security` | heise Security (Atom)         | Security-News allgemein, wird gefiltert   |
 | `hackernews`     | Hacker News (Algolia-API)     | Diskutierte Security-Themen ab 50 Punkten |
-| `local`          | OSV-Datenbank + `dpkg`        | Verwundbare Pakete **auf diesem System** — nur mit `--local` |
+| `local`          | OSV-Datenbank + `dpkg`/`apk`  | Verwundbare Pakete **auf diesem System** und in den Containern — nur mit `--local` |
 
 Hacker News läuft anders als die übrigen Quellen. Der Frontpage-Feed taugt
 dafür nicht — dort steht meist nichts Sicherheitsrelevantes. Stattdessen wird
@@ -202,9 +202,10 @@ Drei Dinge, die der Scan **nicht** leistet:
   `raspberrypi-bootloader` und die Firmware-Pakete aus dem RPi-Repo stehen nicht
   in der Debian-Datenbank und kommen als „unauffällig" zurück, obwohl sie nie
   geprüft wurden. Für den Kernel bleibt `sudo apt list --upgradable`.
-- **Nur Debian.** Auf einem Abkömmling mit eigener `ID` in `/etc/os-release`
-  verweigert er den Dienst, statt gegen die falsche Datenbank zu prüfen. Mit
-  `--debian-release` lässt sich das überstimmen, wenn du weißt, was du tust.
+- **Nur Debian und Alpine.** Der Host wird als Debian geprüft, Container
+  zusätzlich als Alpine. Alles andere — Fedora, distroless, scratch — meldet er
+  als „nicht prüfbar", statt gegen die falsche Datenbank zu vergleichen. Für den
+  Host lässt sich das mit `--debian-release` überstimmen.
 - **Nur Systempakete.** Was per `pip`, `npm` oder `docker` danebenliegt, taucht
   in `dpkg` nicht auf. Dafür sind `pip-audit` bzw. `osv-scanner` zuständig.
 
@@ -251,9 +252,10 @@ gegen Debian 12 neununddreißig Treffer und gegen Debian 13 vierundfünfzig.
 
 Zwei Dinge, die bewusst laut sind statt still:
 
-- **Container ohne `dpkg`** (Alpine, distroless, scratch) erscheinen als
+- **Container ohne Paketdatenbank** (distroless, scratch) erscheinen als
   „nicht prüfbar" samt Imagename, statt einfach zu fehlen. Ein ungeprüfter
-  Container darf nicht aussehen wie ein unauffälliger.
+  Container darf nicht aussehen wie ein unauffälliger. Alpine-Container werden
+  dagegen normal geprüft, über `/lib/apk/db/installed`.
 - **Veraltete Listen** melden sich selbst. Bleibt der Timer stehen, steht ab 48
   Stunden ein Hinweis in der Mail — ein stehengebliebener Sammler, der „alles
   ruhig" suggeriert, wäre die gefährlichste Art, falsch zu liegen.
