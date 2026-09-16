@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import signal
@@ -13,6 +14,9 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1879,6 +1883,333 @@ class TestSourceSelection(unittest.TestCase):
         self.assertEqual(options.status_path, "/host/status")
         self.assertEqual(options.release, "11")
         self.assertTrue(options.unfixed)
+
+
+class TestIdentity(unittest.TestCase):
+    """Die Identitaet ist der Schlussel ohne Wiedervorlage-Fenster: daran haengt
+    eine Akzeptanz, und sie muss ueber Fenster hinweg gleich bleiben."""
+
+    def _entry(self, window: str, cves=("CVE-2024-1001",)) -> vf.Entry:
+        package = vf.Package("openssl", "3.0.11-1")
+        target = vf.ScanTarget(name="", packages=(package,), ecosystem="Debian:12")
+        return vf.local_entry(target, package, list(cves), 0,
+                              datetime.now(timezone.utc), window)
+
+    def test_identity_is_stable_across_windows(self):
+        self.assertEqual(self._entry("100").identity, self._entry("101").identity)
+        self.assertNotEqual(self._entry("100").state_key, self._entry("101").state_key)
+
+    def test_state_key_is_identity_plus_window(self):
+        entry_ = self._entry("100")
+        self.assertEqual(entry_.state_key, f"{entry_.identity}:100")
+
+    def test_new_cve_changes_the_identity(self):
+        # Akzeptiert war ein anderer Stand - der Fund muss wiederkommen.
+        one = self._entry("100")
+        two = self._entry("100", cves=("CVE-2024-1001", "CVE-2025-2002"))
+        self.assertNotEqual(one.identity, two.identity)
+
+    def test_unscannable_target_has_an_identity_too(self):
+        skipped = vf.SkippedTarget("db", "keine Paketliste")
+        note = vf.unscanned_entry(skipped, datetime.now(timezone.utc), "100")
+        self.assertEqual(note.identity, "local:db:ungeprueft:keine Paketliste")
+        self.assertEqual(note.state_key, f"{note.identity}:100")
+
+    def test_news_and_stale_notes_have_none(self):
+        self.assertIsNone(entry().identity)
+        stale = vf.stale_lists_entry(None, "/x", datetime.now(timezone.utc))
+        self.assertIsNone(stale.identity)
+
+    def test_identity_is_exported(self):
+        self.assertEqual(self._entry("100").as_dict()["identity"], self._entry("100").identity)
+
+
+class TestAcceptances(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "decisions.json")
+        self.now = datetime(2026, 9, 16, 12, 0, tzinfo=timezone.utc)
+
+    def _acc(self, identity="local:host:openssl:1:CVE-2024-1001", until=None, **kw):
+        return vf.Acceptance(identity, "max", self.now, until, **kw)
+
+    def test_round_trip(self):
+        acc = self._acc(until=self.now + timedelta(days=90), comment="bekannt", title="openssl")
+        vf.save_decisions(self.path, {acc.identity: acc})
+        loaded = vf.load_decisions(self.path)
+        self.assertEqual(loaded[acc.identity], acc)
+
+    def test_missing_or_broken_file_is_empty(self):
+        self.assertEqual(vf.load_decisions(self.path), {})
+        Path(self.path).write_text("{kaputt", encoding="utf-8")
+        self.assertEqual(vf.load_decisions(self.path), {})
+
+    def test_entries_without_a_usable_timestamp_are_dropped(self):
+        Path(self.path).write_text(json.dumps({"accepted": {"x": {"by": "max"}}}),
+                                   encoding="utf-8")
+        self.assertEqual(vf.load_decisions(self.path), {})
+
+    def test_active_until_the_deadline(self):
+        acc = self._acc(until=self.now + timedelta(days=1))
+        self.assertTrue(acc.active(self.now))
+        self.assertFalse(acc.active(self.now + timedelta(days=2)))
+        self.assertTrue(self._acc(until=None).active(self.now + timedelta(days=9999)))
+
+    def test_apply_suppresses_only_active_acceptances(self):
+        package = vf.Package("openssl", "3.0.11-1")
+        target = vf.ScanTarget(name="", packages=(package,), ecosystem="Debian:12")
+        finding = vf.local_entry(target, package, ["CVE-2024-1001"], 0, self.now, "100")
+        other = vf.local_entry(target, vf.Package("bash", "5.2-1"), ["CVE-2024-2"], 0,
+                               self.now, "100")
+        news = entry(title="Nachricht", cves=["CVE-2024-1001"])
+
+        decisions = {finding.identity: self._acc(until=self.now + timedelta(days=1)),
+                     other.identity: self._acc(other.identity, until=self.now - timedelta(days=1))}
+        kept, accepted = vf.apply_acceptances([finding, other, news], decisions, self.now)
+        self.assertEqual(accepted, [finding])
+        self.assertEqual(kept, [other, news], "abgelaufen und Nachrichten bleiben")
+
+    def test_findings_snapshot_round_trip(self):
+        path = os.path.join(self.tmp.name, "findings.json")
+        vf.save_findings(path, [entry(title="T", cves=["CVE-2024-1"])], "Lauf", ["x: weg"])
+        data = vf.read_json(path)
+        self.assertEqual(data["subtitle"], "Lauf")
+        self.assertEqual(data["failed"], ["x: weg"])
+        self.assertEqual(data["entries"][0]["title"], "T")
+
+    def test_state_sibling_lives_next_to_seen(self):
+        self.assertEqual(vf.state_sibling("/var/lib/securityfeed/seen.json", "decisions.json"),
+                         os.path.join("/var/lib/securityfeed", "decisions.json"))
+
+
+class TestWebConfig(unittest.TestCase):
+    KEYS = ("SECFEED_WEB_LISTEN", "SECFEED_WEB_USER", "SECFEED_WEB_PASSWORD", "SECFEED_ACCEPT_DAYS")
+
+    def setUp(self):
+        self.saved = {k: os.environ.pop(k) for k in self.KEYS if k in os.environ}
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for key in self.KEYS:
+            os.environ.pop(key, None)
+        os.environ.update(self.saved)
+
+    def _cfg(self, *argv, **env) -> vf.WebConfig:
+        os.environ.update(env)
+        args = vf.build_parser().parse_args(list(argv))
+        return vf.web_config_from_env(args, "/state/seen.json")
+
+    def test_needs_user_and_password(self):
+        with self.assertRaises(vf.ConfigError):
+            self._cfg("--serve")
+        with self.assertRaises(vf.ConfigError):
+            self._cfg("--serve", SECFEED_WEB_USER="max")
+
+    def test_placeholder_password_is_refused(self):
+        with self.assertRaises(vf.ConfigError):
+            self._cfg("--serve", SECFEED_WEB_USER="max", SECFEED_WEB_PASSWORD="aendere-mich")
+
+    def test_defaults_and_paths(self):
+        cfg = self._cfg("--serve", SECFEED_WEB_USER="max", SECFEED_WEB_PASSWORD="lang-genug")
+        self.assertEqual((cfg.host, cfg.port), ("0.0.0.0", 8080))
+        self.assertEqual(cfg.accept_days, 90)
+        self.assertEqual(cfg.decisions_path, os.path.join("/state", "decisions.json"))
+        self.assertEqual(cfg.findings_path, os.path.join("/state", "findings.json"))
+
+    def test_address_from_cli_beats_environment(self):
+        cfg = self._cfg("--serve", "127.0.0.1:9000", SECFEED_WEB_LISTEN="0.0.0.0:1",
+                        SECFEED_WEB_USER="max", SECFEED_WEB_PASSWORD="lang-genug")
+        self.assertEqual((cfg.host, cfg.port), ("127.0.0.1", 9000))
+
+    def test_bad_address_is_a_config_error(self):
+        with self.assertRaises(vf.ConfigError):
+            self._cfg("--serve", "nur-host", SECFEED_WEB_USER="max", SECFEED_WEB_PASSWORD="lang-genug")
+
+    def test_serve_absent_means_no_web(self):
+        args = vf.build_parser().parse_args([])
+        self.assertIsNone(args.serve)
+        self.assertEqual(vf.build_parser().parse_args(["--serve"]).serve, "")
+
+
+class TestAcceptanceSite(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vf.WebConfig(
+            host="127.0.0.1", port=0, user="max", password="lang-genug",
+            findings_path=os.path.join(self.tmp.name, "findings.json"),
+            decisions_path=os.path.join(self.tmp.name, "decisions.json"),
+        )
+        self.site = vf.AcceptanceSite(self.cfg)
+        package = vf.Package("openssl", "3.0.11-1", ("libssl3",))
+        target = vf.ScanTarget(name="", packages=(package,), ecosystem="Debian:12")
+        self.finding = vf.local_entry(target, package, ["CVE-2024-1001"], 0,
+                                      datetime.now(timezone.utc), "100")
+        hit = entry(title="OpenSSL-Luecke in den Nachrichten", cves=["CVE-2024-1001"],
+                    affects_local=["openssl"])
+        vf.save_findings(self.cfg.findings_path, [self.finding, hit], "Lauf 1", [])
+
+    def _auth(self, user="max", password="lang-genug") -> str:
+        return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+    def test_authorization(self):
+        self.assertEqual(self.site.authorized(self._auth()), "max")
+        self.assertIsNone(self.site.authorized(self._auth(password="falsch")))
+        self.assertIsNone(self.site.authorized(self._auth(user="anders")))
+        self.assertIsNone(self.site.authorized(None))
+        self.assertIsNone(self.site.authorized("Bearer x"))
+        self.assertIsNone(self.site.authorized("Basic %%%nicht-base64"))
+        self.assertIsNone(self.site.authorized("Basic " + base64.b64encode(b"ohnedoppelpunkt").decode()))
+
+    def test_page_lists_open_findings_and_affected_news(self):
+        page = self.site.page()
+        self.assertIn("Offene Funde (1)", page)
+        self.assertIn("openssl 3.0.11-1", page)
+        self.assertIn("OpenSSL-Luecke in den Nachrichten", page)
+        self.assertIn(self.site.form_token, page)
+        self.assertIn('name="identity"', page)
+
+    def test_accept_moves_the_finding_and_records_who(self):
+        message = self.site.accept(self.finding.identity, "max", "kein Update", "2099-01-01")
+        self.assertIn("Akzeptiert", message)
+        decisions = vf.load_decisions(self.cfg.decisions_path)
+        acc = decisions[self.finding.identity]
+        self.assertEqual(acc.by, "max")
+        self.assertEqual(acc.comment, "kein Update")
+        self.assertEqual(acc.title, self.finding.title)
+        self.assertEqual(acc.until.date().isoformat(), "2099-01-01")
+        page = self.site.page()
+        self.assertIn("Offene Funde (0)", page)
+        self.assertIn("Akzeptiert (1)", page)
+        self.assertIn("Widerrufen", page)
+
+    def test_accept_without_a_date_is_unlimited(self):
+        self.site.accept(self.finding.identity, "max", "", "")
+        self.assertIsNone(vf.load_decisions(self.cfg.decisions_path)[self.finding.identity].until)
+
+    def test_bad_or_past_dates_are_refused(self):
+        self.assertIn("JJJJ-MM-TT", self.site.accept(self.finding.identity, "max", "", "morgen"))
+        self.assertIn("Vergangenheit", self.site.accept(self.finding.identity, "max", "", "2000-01-01"))
+        self.assertEqual(vf.load_decisions(self.cfg.decisions_path), {})
+
+    def test_revoke_removes_the_decision(self):
+        self.site.accept(self.finding.identity, "max", "", "")
+        self.assertIn("Widerrufen", self.site.revoke(self.finding.identity, "max"))
+        self.assertEqual(vf.load_decisions(self.cfg.decisions_path), {})
+        self.assertIn("nicht (mehr)", self.site.revoke(self.finding.identity, "max"))
+
+    def test_expired_acceptance_shows_as_expired_and_finding_is_open_again(self):
+        past = vf.Acceptance(self.finding.identity, "max",
+                             datetime.now(timezone.utc) - timedelta(days=100),
+                             datetime.now(timezone.utc) - timedelta(days=1), "", "openssl")
+        vf.save_decisions(self.cfg.decisions_path, {past.identity: past})
+        page = self.site.page()
+        self.assertIn("Offene Funde (1)", page)
+        self.assertIn("Abgelaufen", page)
+
+    def test_orphaned_acceptance_stays_visible(self):
+        acc = vf.Acceptance("local:host:weg:1:CVE-2020-1", "max", datetime.now(timezone.utc),
+                            None, "", "weg 1.0: 1 Luecke(n)")
+        vf.save_decisions(self.cfg.decisions_path, {acc.identity: acc})
+        page = self.site.page()
+        self.assertIn("nicht mehr gemeldet", page)
+        self.assertIn("weg 1.0", page)
+
+    def test_page_escapes_content(self):
+        vf.save_findings(self.cfg.findings_path,
+                         [entry(title="<script>alert(1)</script>", local=True,
+                                identity="local:host:x:1:CVE-2024-1")], "<b>", [])
+        page = self.site.page("<img src=x>")
+        self.assertNotIn("<script>", page)
+        self.assertNotIn("<img src=x>", page)
+        self.assertIn("&lt;script&gt;", page)
+
+
+class TestWebServer(unittest.TestCase):
+    """Echter Server auf einem freien Port, echte Anfragen per urllib."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vf.WebConfig(
+            host="127.0.0.1", port=0, user="max", password="lang-genug",
+            findings_path=os.path.join(self.tmp.name, "findings.json"),
+            decisions_path=os.path.join(self.tmp.name, "decisions.json"),
+        )
+        package = vf.Package("openssl", "3.0.11-1")
+        target = vf.ScanTarget(name="", packages=(package,), ecosystem="Debian:12")
+        self.finding = vf.local_entry(target, package, ["CVE-2024-1001"], 0,
+                                      datetime.now(timezone.utc), "100")
+        vf.save_findings(self.cfg.findings_path, [self.finding], "Lauf", [])
+        self.server = vf.start_web(self.cfg)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.token = self.server.site.form_token
+
+    def _request(self, path: str, data: dict | None = None, auth: bool = True):
+        headers = {}
+        if auth:
+            headers["Authorization"] = "Basic " + base64.b64encode(b"max:lang-genug").decode()
+        body = urllib.parse.urlencode(data).encode() if data is not None else None
+        request = urllib.request.Request(self.base + path, data=body, headers=headers,
+                                         method="POST" if data is not None else "GET")
+        # Umleitungen nicht folgen - der 303 selbst ist das Pruefobjekt.
+        opener = urllib.request.build_opener(_NoRedirect)
+        try:
+            with opener.open(request, timeout=10) as response:
+                return response.status, response.read().decode("utf-8"), dict(response.headers)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8"), dict(exc.headers)
+
+    def test_health_needs_no_login(self):
+        status, body, _ = self._request("/health", auth=False)
+        self.assertEqual((status, body), (200, "ok"))
+
+    def test_page_requires_login(self):
+        status, _, headers = self._request("/", auth=False)
+        self.assertEqual(status, 401)
+        self.assertIn("Basic", headers.get("WWW-Authenticate", ""))
+        status, body, _ = self._request("/")
+        self.assertEqual(status, 200)
+        self.assertIn("openssl 3.0.11-1", body)
+
+    def test_unknown_path_is_404(self):
+        self.assertEqual(self._request("/gibtsnicht")[0], 404)
+
+    def test_accept_needs_the_form_token(self):
+        status, _, _ = self._request("/accept", {"identity": self.finding.identity})
+        self.assertEqual(status, 403)
+        self.assertFalse(os.path.exists(self.cfg.decisions_path))
+
+    def test_accept_then_revoke_over_http(self):
+        status, _, headers = self._request("/accept", {
+            "token": self.token, "identity": self.finding.identity,
+            "comment": "per HTTP", "until": "",
+        })
+        self.assertEqual(status, 303)
+        self.assertTrue(headers.get("Location", "").startswith("/?m="))
+        acc = vf.load_decisions(self.cfg.decisions_path)[self.finding.identity]
+        self.assertEqual((acc.by, acc.comment), ("max", "per HTTP"))
+
+        status, body, _ = self._request("/")
+        self.assertIn("Akzeptiert (1)", body)
+
+        status, _, _ = self._request("/revoke", {"token": self.token,
+                                                 "identity": self.finding.identity})
+        self.assertEqual(status, 303)
+        self.assertEqual(vf.load_decisions(self.cfg.decisions_path), {})
+
+    def test_post_without_login_is_rejected_before_anything_else(self):
+        status, _, _ = self._request("/accept", {"token": self.token,
+                                                 "identity": self.finding.identity}, auth=False)
+        self.assertEqual(status, 401)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 if __name__ == "__main__":

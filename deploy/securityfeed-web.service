@@ -1,0 +1,43 @@
+[Unit]
+Description=SecurityFeed - Funde im Browser ansehen und akzeptieren
+Documentation=https://github.com/zOnkxlMax/SecurityFeed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=securityfeed
+Group=securityfeed
+
+# Anmeldung fuer die Seite (SECFEED_WEB_USER/PASSWORD) und die Adresse
+# (SECFEED_WEB_LISTEN). Datei muss root:securityfeed 0640 gehoeren.
+EnvironmentFile=/etc/securityfeed/securityfeed.env
+
+# Dasselbe Zustandsverzeichnis wie securityfeed.service: dort liegen
+# findings.json (schreibt der Scanner) und decisions.json (schreibt die Seite).
+StateDirectory=securityfeed
+Environment=SECFEED_STATE=/var/lib/securityfeed/seen.json
+
+ExecStart=/usr/bin/python3 /opt/securityfeed/vulnfeed.py --serve
+Restart=on-failure
+RestartSec=10
+
+# Haertung wie beim Scanner - die Seite braucht nur den Port und ihr
+# Zustandsverzeichnis.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
