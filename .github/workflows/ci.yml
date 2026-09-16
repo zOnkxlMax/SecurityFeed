@@ -59,6 +59,56 @@ jobs:
           echo "Exit-Code: $code"
           test "$code" -eq 2
 
+      - name: Webseite verlangt Anmeldung und Formular-Token
+        run: |
+          mkdir -p /tmp/sf-state
+          cat > /tmp/sf-state/findings.json <<'ENDE'
+          {"updated": "2026-09-16T08:00:00+00:00", "subtitle": "CI-Lauf", "failed": [],
+           "entries": [{"source": "Lokales System",
+                        "title": "openssl 3.0.11-1: 1 Luecke(n) mit verfuegbarem Fix",
+                        "link": "https://security-tracker.debian.org/tracker/source-package/openssl",
+                        "published": "2026-09-16T08:00:00+00:00", "cves": ["CVE-2024-1001"],
+                        "advisory": true, "local": true, "affects_local": ["openssl"],
+                        "identity": "local:host:openssl:1:CVE-2024-1001", "summary": "Test"}]}
+          ENDE
+          SECFEED_WEB_USER=ci SECFEED_WEB_PASSWORD=ci-geheim-123 \
+            python vulnfeed.py --serve 127.0.0.1:8099 --state /tmp/sf-state/seen.json &
+          for i in $(seq 1 30); do curl -fs http://127.0.0.1:8099/health >/dev/null && break; sleep 0.5; done
+          curl -fs http://127.0.0.1:8099/health | grep -q '^ok$'
+
+          # Ohne Anmeldung nichts zu sehen
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u ci:falsch http://127.0.0.1:8099/)" = "401"
+
+          curl -fs -u ci:ci-geheim-123 http://127.0.0.1:8099/ > /tmp/page.html
+          grep -q 'openssl 3.0.11-1' /tmp/page.html
+          grep -q 'Offene Funde (1)' /tmp/page.html
+
+          # Akzeptieren ohne Formular-Token: abgelehnt
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u ci:ci-geheim-123 -X POST \
+                 --data-urlencode 'identity=local:host:openssl:1:CVE-2024-1001' \
+                 http://127.0.0.1:8099/accept)" = "403"
+          test ! -f /tmp/sf-state/decisions.json
+
+          # Mit Token: Entscheidung landet in decisions.json, Seite zeigt sie
+          token=$(grep -o 'name="token" value="[^"]*"' /tmp/page.html | head -1 | sed 's/.*value="//;s/"$//')
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u ci:ci-geheim-123 -X POST \
+                 --data-urlencode "token=$token" \
+                 --data-urlencode 'identity=local:host:openssl:1:CVE-2024-1001' \
+                 --data-urlencode 'comment=CI' --data-urlencode 'until=' \
+                 http://127.0.0.1:8099/accept)" = "303"
+          grep -q 'local:host:openssl:1:CVE-2024-1001' /tmp/sf-state/decisions.json
+          grep -q '"by": "ci"' /tmp/sf-state/decisions.json
+          curl -fs -u ci:ci-geheim-123 http://127.0.0.1:8099/ | grep -q 'Offene Funde (0)'
+
+          # Beispielpasswort wird abgewiesen
+          set +e
+          SECFEED_WEB_USER=ci SECFEED_WEB_PASSWORD=aendere-mich python vulnfeed.py --serve 127.0.0.1:8098
+          code=$?
+          set -e
+          test "$code" -eq 2
+          kill %1
+
   docker:
     name: Docker-Image und Compose
     runs-on: ubuntu-latest

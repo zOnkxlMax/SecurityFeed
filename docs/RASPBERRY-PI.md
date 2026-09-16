@@ -367,6 +367,33 @@ sondern über ein neues Image.
 Ausführlich zur Funktionsweise und zu den Grenzen: Abschnitt „Paketscan" in der
 [README](../README.md#paketscan-was-steckt-hier-drin).
 
+### Funde im Browser akzeptieren
+
+Eine Seite im eigenen Netz zeigt die aktuellen Funde und lässt sie akzeptieren
+— akzeptierte Funde fallen aus Mail und Wiedervorlage, bis ihr Ablaufdatum
+erreicht ist. Kein TLS: nur im LAN betreiben, nie nach außen freigeben.
+
+Anmeldung und Adresse in der env-Datei:
+
+```bash
+SECFEED_WEB_LISTEN=0.0.0.0:8080
+SECFEED_WEB_USER=max
+SECFEED_WEB_PASSWORD=ein-eigenes-langes-passwort
+```
+
+Dann den Dienst einrichten — er nutzt dasselbe Zustandsverzeichnis wie der
+Scanner:
+
+```bash
+sudo install -m 0644 ~/securityfeed/deploy/securityfeed-web.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now securityfeed-web.service
+```
+
+Die Seite ist danach unter `http://<pi>:8080/` erreichbar. Was „akzeptieren"
+genau bedeutet, steht in [DOCKER.md](DOCKER.md#was-akzeptieren-bedeutet) — die
+Regeln sind für beide Betriebsarten dieselben.
+
 ---
 
 ## Wenn etwas nicht klappt
@@ -414,17 +441,16 @@ neue Datei.
 ## Wieder abschalten
 
 ```bash
-sudo systemctl disable --now securityfeed.timer securityfeed-containers.timer
+sudo systemctl disable --now securityfeed.timer securityfeed-containers.timer securityfeed-web.service
 ```
 
-Der zweite Timer existiert nur, wenn du den Abschnitt „Auch die
-Docker-Container prüfen" eingerichtet hast; systemd meldet ihn sonst als
-unbekannt, das ist harmlos.
+Timer und Web-Dienst existieren nur, wenn du die jeweiligen Abschnitte
+eingerichtet hast; systemd meldet sie sonst als unbekannt, das ist harmlos.
 
 Vollständig entfernen:
 
 ```bash
-sudo rm -f /etc/systemd/system/securityfeed.{service,timer} /etc/systemd/system/securityfeed-containers.{service,timer}
+sudo rm -f /etc/systemd/system/securityfeed.{service,timer} /etc/systemd/system/securityfeed-containers.{service,timer} /etc/systemd/system/securityfeed-web.service
 sudo rm -rf /opt/securityfeed /etc/securityfeed /var/lib/securityfeed
 sudo systemctl daemon-reload
 sudo userdel securityfeed

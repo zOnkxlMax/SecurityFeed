@@ -418,6 +418,171 @@ Zwei Dinge, die das Verfahren bewusst anders macht als ein stiller Scanner:
   Stunden „Container-Paketlisten veraltet" in der Mail, statt einen alten Stand
   als aktuell auszugeben.
 
+## Funde im Browser akzeptieren
+
+Die Mail meldet einen Fund — und wiederholt ihn wöchentlich, solange er
+besteht. Manchmal ist das die richtige Antwort: es gibt kein Update, der Dienst
+ist nicht von außen erreichbar, das Risiko ist bekannt. Dafür gibt es eine
+Seite im eigenen Netz, auf der sich Funde **akzeptieren** lassen. Akzeptierte
+Funde fallen aus Mail und Wiedervorlage heraus, bis ihr Ablaufdatum erreicht
+ist.
+
+Ein Punkt vorab, weil er das Tool verändert: **das ist der erste offene Port.**
+Bisher geht nur Verkehr hinaus. Die Seite hat eine Anmeldung, aber kein TLS —
+im eigenen LAN vertretbar, nach außen nie. Gib den Port nicht auf dem Router
+frei.
+
+**1. Anmeldung in der `.env`:**
+
+```bash
+SECFEED_WEB_USER=max
+SECFEED_WEB_PASSWORD=ein-eigenes-langes-passwort
+```
+
+Der Beispielwert `aendere-mich` wird abgewiesen.
+
+**2. Zweiter Dienst in der `compose.override.yaml`** — dasselbe Image, dasselbe
+State-Volume, nur dieser Container bekommt den Port:
+
+```yaml
+services:
+  securityfeed-web:
+    image: securityfeed:latest
+    container_name: securityfeed-web
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+    command: ["--serve", "0.0.0.0:8080"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - securityfeed-state:/var/lib/securityfeed
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+```
+
+Dann `docker compose up -d`. Die Seite ist unter `http://<pi>:8080/` erreichbar,
+der Browser fragt nach Benutzer und Passwort.
+
+### Was „akzeptieren" bedeutet
+
+Eine Akzeptanz gilt für **genau diesen Stand** eines Funds: dieses Paket, auf
+diesem System, mit diesen CVE-Nummern. Kommt eine neue Lücke im selben Paket
+dazu, ändert sich der Stand — der Fund erscheint wieder in der Mail und steht
+wieder unter „Offene Funde". Akzeptiert war ein anderes Problem.
+
+Das Ablaufdatum ist mit 90 Tagen vorbelegt (`SECFEED_ACCEPT_DAYS`) und lässt
+sich ändern oder leeren. Leer heißt unbefristet — das ist bequem, aber die
+bequemste Art, ein Problem für immer zu verstecken. Nach Ablauf kommt der Fund
+zurück und die Akzeptanz steht auf der Seite als „Abgelaufen", bis jemand sie
+erneuert oder entfernt.
+
+Jede Entscheidung trägt den Benutzernamen und den Zeitpunkt. Die Markierung
+„Betrifft dieses System" an Nachrichten bleibt auch für akzeptierte Pakete —
+das ist eine Tatsache, keine Mahnung.
+
+### Wie Scanner und Seite zusammenarbeiten
+
+Beide teilen sich das State-Volume. Nach jedem Lauf legt der Scanner
+`findings.json` ab, den aktuellen Stand aller Funde; die Seite liest ihn. Die
+Seite schreibt `decisions.json`, die Akzeptanzen; der Scanner liest sie vor
+jedem Lauf. Beides wird atomar geschrieben, deshalb dürfen beide Container
+gleichzeitig laufen. Die Seite zeigt immer den Stand des **letzten Laufs** —
+ein frisch akzeptierter Fund verschwindet aus der Mail ab dem nächsten Lauf.
+
+Zum Ausprobieren ohne Compose:
+
+```bash
+SECFEED_WEB_USER=max SECFEED_WEB_PASSWORD=test-1234 python3 vulnfeed.py --serve 127.0.0.1:8080
+```
+
+### Hinter Nginx Proxy Manager: TLS und ein Hostname
+
+Läuft auf dem Pi ohnehin der Nginx Proxy Manager, gehört die Seite dahinter.
+Das behebt die Schwäche von oben: der Proxy spricht TLS, die Seite bleibt
+intern, und du erreichst sie unter `https://securityfeed.<deine-domain>` statt
+über IP und Port.
+
+**1. Kein Port am Host.** Statt `ports:` hängt der Web-Container in das
+Docker-Netz des Proxy Managers — dann erreicht ihn nur der Proxy, niemand
+sonst im LAN. Den Netznamen zeigt `docker network ls`; üblich ist etwas wie
+`nginx-proxy-manager_default` oder `npm_default`. Die `compose.override.yaml`
+sieht dann so aus (nur die Unterschiede zum Rezept oben):
+
+```yaml
+services:
+  securityfeed-web:
+    image: securityfeed:latest
+    container_name: securityfeed-web
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+    command: ["--serve", "0.0.0.0:8080"]
+    # Kein "ports:" - nur der Proxy kommt an den Container heran.
+    networks:
+      - default
+      - proxy
+    volumes:
+      - securityfeed-state:/var/lib/securityfeed
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  proxy:
+    external: true
+    name: nginx-proxy-manager_default   # an "docker network ls" anpassen
+```
+
+Dann `docker compose up -d`.
+
+**2. Proxy Host im Nginx Proxy Manager anlegen** — *Hosts → Proxy Hosts →
+Add Proxy Host*:
+
+| Feld | Wert |
+| --- | --- |
+| Domain Names | `securityfeed.<deine-domain>` |
+| Scheme | `http` |
+| Forward Hostname / IP | `securityfeed-web` (der Containername — funktioniert, weil beide im selben Docker-Netz hängen) |
+| Forward Port | `8080` |
+| Block Common Exploits | an |
+| Websockets Support | aus, wird nicht gebraucht |
+
+Reiter **SSL**: ein Zertifikat wählen — *Request a new SSL Certificate* für
+Let's Encrypt (bei einer rein internen Domain per DNS-Challenge) oder ein
+eigenes/self-signed hochladen. *Force SSL* und *HTTP/2 Support* einschalten.
+
+Hängt der Proxy Manager **nicht** in Docker, oder soll er die Seite über das
+LAN erreichen: `ports: - "8080:8080"` aus dem Rezept oben behalten und als
+Forward Hostname die LAN-IP des Pi eintragen. Sicherer ist die Variante ohne
+Port.
+
+**3. Anmeldung bleibt in der App.** Nginx reicht den `Authorization`-Header
+durch, die Seite prüft Benutzer und Passwort weiterhin selbst — Zugang über den
+Proxy ändert daran nichts. Lege im Proxy Manager **keine** Access List mit
+eigener Basic Auth an: nginx würde dann seine Zugangsdaten verlangen, sie
+durchreichen, und die Seite lehnt sie ab. Eine Access List nur mit
+IP-Beschränkung ist dagegen unproblematisch und eine sinnvolle Ergänzung.
+
+Zwei Dinge, die die Seite dafür schon mitbringt: alle Verweise sind relativ,
+also unabhängig von Hostname und Schema, und im Log steht neben der
+Proxy-Adresse der Browser aus `X-Forwarded-For`. Nicht unterstützt ist ein
+Unterpfad wie `https://pi/securityfeed/` — der Proxy Host braucht einen eigenen
+Hostnamen, so wie der Nginx Proxy Manager es ohnehin vorsieht.
+
 Behoben werden Container-Funde nicht mit `apt` auf dem Pi, sondern über das
 Image — Basisimage aktualisieren und neu bauen. Der Eintrag sagt das auch so.
 

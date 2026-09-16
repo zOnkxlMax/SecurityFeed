@@ -27,12 +27,15 @@ Exit-Codes: 0 = ok, 1 = harter Fehler (alle Quellen tot / Mail fehlgeschlagen),
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
+import hmac
 import html
 import http.client
 import json
 import os
 import re
+import secrets
 import signal
 import smtplib
 import socket
@@ -40,6 +43,7 @@ import ssl
 import subprocess
 import sys
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -224,6 +228,11 @@ class Entry:
     # immer auf dieselbe Tracker-Seite je Paket - ohne eigenen Schluessel
     # bliebe eine neu hinzugekommene Luecke fuer immer ungemeldet.
     key: str | None = None
+    # Was denselben Fund ueber Laeufe und Wiedervorlage-Fenster hinweg
+    # bezeichnet: der Schluessel ohne das Fenster. Daran haengt eine Akzeptanz.
+    # Kommt eine neue CVE dazu, aendert sich die Identitaet - und der Fund
+    # kommt wieder, denn akzeptiert war ein anderer Zustand.
+    identity: str | None = None
 
     @property
     def state_key(self) -> str:
@@ -249,6 +258,7 @@ class Entry:
             "advisory": self.advisory,
             "local": self.local,
             "affects_local": self.affects_local,
+            "identity": self.identity,
             "summary": self.summary,
         }
 
@@ -877,6 +887,14 @@ def local_entry(target: ScanTarget, package: Package, cves: list[str], unfixed: 
             if target.name else f" Beheben mit: {update}"
         )
 
+    # Der Link zeigt fuer ein Paket immer auf dieselbe Tracker-Seite. Ohne
+    # Ziel, Anzahl und juengste CVE in der Identitaet bliebe jede spaeter dazu
+    # gekommene Luecke ungemeldet - und dasselbe Paket auf Host und in einem
+    # Container waere derselbe Eintrag. Das Fenster kommt nur in den
+    # Zustandsschluessel: es sorgt dafuer, dass ein ungepatchter Fund
+    # wiederkommt statt zu verschwinden.
+    identity = (f"local:{target.name or 'host'}:{package.name}:{len(cves)}:"
+                f"{max(cves) if cves else package.version}")
     return Entry(
         source=target.label,
         title=title,
@@ -889,13 +907,8 @@ def local_entry(target: ScanTarget, package: Package, cves: list[str], unfixed: 
         # Beim Scan-Eintrag ist das betroffene Paket er selbst. So kommt
         # mark_local_matches an den Namen, ohne ihn aus dem Titel zu klauben.
         affects_local=[target.qualify(package.name)],
-        # Der Link zeigt fuer ein Paket immer auf dieselbe Tracker-Seite. Ohne
-        # Ziel, Anzahl und juengste CVE im Schluessel bliebe jede spaeter dazu
-        # gekommene Luecke ungemeldet - und dasselbe Paket auf Host und in
-        # einem Container waere derselbe Eintrag. Das Fenster am Ende sorgt
-        # dafuer, dass ein ungepatchter Fund wiederkommt statt zu verschwinden.
-        key=f"local:{target.name or 'host'}:{package.name}:{len(cves)}:"
-            f"{max(cves) if cves else package.version}:{window}",
+        key=f"{identity}:{window}",
+        identity=identity,
     )
 
 
@@ -904,6 +917,10 @@ def unscanned_entry(skipped: SkippedTarget, now: datetime,
     """Ein Ziel, das sich nicht pruefen liess. Ohne diesen Eintrag saehe ein
     unpruefbarer Container aus wie ein unauffaelliger."""
     what = f"Container {skipped.name}" if skipped.name else "Lokales System"
+    # Ein blinder Fleck bleibt einer, bis sich etwas aendert - deshalb
+    # dieselbe Wiedervorlage wie bei den Funden. Und er laesst sich akzeptieren:
+    # ein distroless-Container ohne Paketdatenbank ist eine bewusste Wahl.
+    identity = f"local:{skipped.name or 'host'}:ungeprueft:{skipped.reason}"
     return Entry(
         source=what,
         title=f"{what}: nicht pruefbar",
@@ -914,9 +931,8 @@ def unscanned_entry(skipped: SkippedTarget, now: datetime,
                 "befunden.",
         advisory=True,
         local=True,
-        # Ein blinder Fleck bleibt einer, bis sich etwas aendert - deshalb
-        # dieselbe Wiedervorlage wie bei den Funden.
-        key=f"local:{skipped.name or 'host'}:ungeprueft:{skipped.reason}:{window}",
+        key=f"{identity}:{window}",
+        identity=identity,
     )
 
 
@@ -1312,20 +1328,34 @@ def load_seen(path: str) -> list[str]:
     return [s for s in seen if isinstance(s, str)] if isinstance(seen, list) else []
 
 
-def save_seen(path: str, seen: list[str], keep: int = 2000) -> None:
-    payload = {
-        "updated": datetime.now(timezone.utc).isoformat(),
-        "seen": seen[:keep],
-    }
+def write_json(path: str, payload: dict) -> None:
+    """Atomar: erst temporaer schreiben, dann ersetzen. Ein Absturz mittendrin
+    darf den bestehenden Stand nicht zerstoeren - und Scanner und Webseite
+    teilen sich Dateien, keiner darf einen halben Stand des anderen sehen."""
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    # Erst temporaer schreiben, dann ersetzen - ein Absturz mittendrin darf den
-    # bestehenden Zustand nicht zerstoeren.
     tmp = f"{path}.tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, ensure_ascii=False)
     os.replace(tmp, path)
+
+
+def read_json(path: str) -> dict:
+    """Ein JSON-Objekt, oder {} wenn die Datei fehlt oder kaputt ist."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_seen(path: str, seen: list[str], keep: int = 2000) -> None:
+    write_json(path, {
+        "updated": datetime.now(timezone.utc).isoformat(),
+        "seen": seen[:keep],
+    })
 
 
 # --------------------------------------------------------------------------
@@ -1645,6 +1675,18 @@ def build_parser() -> argparse.ArgumentParser:
     daemon.add_argument("--once", action="store_true",
                         help="Einen einzelnen Lauf erzwingen und danach beenden, auch wenn "
                              "SECFEED_SCHEDULE gesetzt ist. Fuer 'docker compose run'.")
+
+    web = parser.add_argument_group(
+        "Webseite", "Funde im internen Netz anzeigen und dort akzeptieren."
+    )
+    web.add_argument("--serve", metavar="HOST:PORT", nargs="?", const="", default=None,
+                     help="HTTP-Seite mit den aktuellen Funden anbieten, auf der sich Funde "
+                          "akzeptieren lassen (Adresse auch per SECFEED_WEB_LISTEN, Default "
+                          "0.0.0.0:8080). Braucht SECFEED_WEB_USER und SECFEED_WEB_PASSWORD. "
+                          "Zusammen mit --schedule: ein Prozess fuer beides. Kein TLS - nur "
+                          "im eigenen Netz betreiben.")
+    web.add_argument("--web-user", help="Benutzername fuer die Anmeldung (SECFEED_WEB_USER). "
+                                        "Das Passwort nur ueber SECFEED_WEB_PASSWORD.")
     return parser
 
 
@@ -1717,6 +1759,21 @@ def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
     entries.sort(key=lambda e: e.published or datetime.min.replace(tzinfo=timezone.utc),
                  reverse=True)
 
+    # Alle Scan-Eintraege dieses Laufs, bevor Akzeptanzen und Zustand
+    # aussortieren: ein akzeptierter oder schon gemeldeter Fund ist trotzdem
+    # noch installiert - fuer die Markierung der Nachrichten und fuer die
+    # Webseite zaehlt er weiter.
+    scan_all = [e for e in entries if e.local]
+
+    # Akzeptanzen: bewusst hingenommene Funde fallen aus Mail und Wiedervorlage,
+    # bis ihr Datum ablaeuft. Vor dem Zustandsfilter, damit sie nicht als
+    # "gemeldet" gespeichert werden und nach einem Widerruf sofort wiederkommen.
+    if state_path:
+        decisions = load_decisions(state_sibling(state_path, DECISIONS_FILE))
+        entries, accepted = apply_acceptances(entries, decisions, datetime.now(timezone.utc))
+        if accepted and not args.quiet:
+            print(f"{len(accepted)} akzeptierte(r) Fund(e) uebersprungen.", file=sys.stderr)
+
     # Schon gemeldete Eintraege raus, bevor Artikelseiten geladen werden.
     known = set(seen)
     fresh = [e for e in entries if e.state_key not in known]
@@ -1725,21 +1782,20 @@ def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
         news = [e for e in fresh if not e.local]
         enrich_with_cves(news[: max(args.detail_limit, 0)], args.timeout, args.quiet)
     # Erst jetzt kennen die Meldungen ihre CVE-Nummern - und erst jetzt laesst
-    # sich sagen, welche davon dieses System wirklich treffen. Die Scan-
-    # Eintraege kommen aus `entries`, nicht aus `fresh`: ein schon gemeldeter
-    # Fund ist trotzdem noch installiert.
-    mark_local_matches(fresh, [e for e in entries if e.local])
+    # sich sagen, welche davon dieses System wirklich treffen.
+    mark_local_matches(fresh, scan_all)
     if args.cve_only:
         fresh = [e for e in fresh if passes_cve_only(e)]
 
     if args.limit > 0:
         fresh = fresh[: args.limit]
 
+    subtitle = (
+        f"Lauf vom {datetime.now().astimezone().strftime('%d.%m.%Y %H:%M')} "
+        f"- Quellen: {', '.join(s.label for s in selected)}"
+    )
+
     if mail_cfg:
-        subtitle = (
-            f"Lauf vom {datetime.now().astimezone().strftime('%d.%m.%Y %H:%M')} "
-            f"- Quellen: {', '.join(s.label for s in selected)}"
-        )
         send_empty = args.send_empty or env_flag("SECFEED_SEND_EMPTY")
         if not fresh and not send_empty:
             if not args.quiet:
@@ -1775,9 +1831,533 @@ def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
         except OSError as exc:
             print(f"Zustand nicht speicherbar ({state_path}): {exc}", file=sys.stderr)
             return 1
+        # Der Ist-Zustand fuer die Webseite: alle Scan-Funde dieses Laufs -
+        # auch akzeptierte und schon gemeldete - plus die Nachrichten, die
+        # dieses System betreffen. Nicht kritisch: scheitert das, ist die
+        # Mail trotzdem raus.
+        try:
+            save_findings(state_sibling(state_path, FINDINGS_FILE),
+                          scan_all + [e for e in fresh if e.affects_local and not e.local],
+                          subtitle, failed)
+        except OSError as exc:
+            print(f"Ist-Zustand fuer die Webseite nicht speicherbar: {exc}", file=sys.stderr)
 
     # Teilausfall einzelner Quellen sichtbar machen, ohne den Lauf zu entwerten.
     return 3 if failed else 0
+
+
+# --------------------------------------------------------------------------
+# Akzeptanzen: Funde, die jemand bewusst hingenommen hat - und die Webseite,
+# auf der das passiert.
+#
+# Zwei Dateien neben seen.json. findings.json schreibt der Scanner nach jedem
+# Lauf (der Ist-Zustand), decisions.json schreibt die Webseite (die
+# Entscheidungen). Beide lesen die jeweils andere. Alle Schreibvorgaenge sind
+# atomar, deshalb duerfen beide Prozesse gleichzeitig laufen.
+# --------------------------------------------------------------------------
+
+FINDINGS_FILE = "findings.json"
+DECISIONS_FILE = "decisions.json"
+ACCEPT_DAYS_DEFAULT = 90
+
+# Werte aus den Beispieldateien. Ein Passwort, das in einem oeffentlichen
+# Repo steht, ist keins.
+PLACEHOLDER_PASSWORDS = frozenset({
+    "aendere-mich", "dein-passwort", "geheim", "changeme", "password", "passwort",
+})
+
+
+def state_sibling(state_path: str | None, name: str) -> str:
+    """Datei im selben Verzeichnis wie seen.json."""
+    return os.path.join(os.path.dirname(state_path or default_state_path()), name)
+
+
+@dataclass
+class Acceptance:
+    identity: str
+    by: str
+    at: datetime
+    until: datetime | None  # None = unbefristet
+    comment: str = ""
+    title: str = ""  # der Fund, wie er hiess - bleibt lesbar, auch wenn er weg ist
+
+    def active(self, now: datetime) -> bool:
+        return self.until is None or self.until > now
+
+    def as_dict(self) -> dict:
+        return {
+            "by": self.by,
+            "at": self.at.isoformat(),
+            "until": self.until.isoformat() if self.until else None,
+            "comment": self.comment,
+            "title": self.title,
+        }
+
+    @classmethod
+    def from_dict(cls, identity: str, raw: dict) -> "Acceptance | None":
+        at = parse_date(raw.get("at"))
+        if at is None:
+            return None
+        return cls(identity, str(raw.get("by", "")), at, parse_date(raw.get("until")),
+                   str(raw.get("comment", "")), str(raw.get("title", "")))
+
+
+def load_decisions(path: str) -> dict[str, Acceptance]:
+    raw = read_json(path).get("accepted")
+    if not isinstance(raw, dict):
+        return {}
+    decisions: dict[str, Acceptance] = {}
+    for identity, item in raw.items():
+        if isinstance(item, dict):
+            acceptance = Acceptance.from_dict(identity, item)
+            if acceptance:
+                decisions[identity] = acceptance
+    return decisions
+
+
+def save_decisions(path: str, decisions: dict[str, Acceptance]) -> None:
+    write_json(path, {
+        "updated": datetime.now(timezone.utc).isoformat(),
+        "accepted": {identity: acc.as_dict() for identity, acc in decisions.items()},
+    })
+
+
+def apply_acceptances(entries: list[Entry], decisions: dict[str, Acceptance],
+                      now: datetime) -> tuple[list[Entry], list[Entry]]:
+    """(weiter zu meldende, akzeptierte). Nur aktive Akzeptanzen zaehlen -
+    eine abgelaufene laesst den Fund wieder in die Mail."""
+    kept: list[Entry] = []
+    accepted: list[Entry] = []
+    for entry in entries:
+        acceptance = decisions.get(entry.identity) if entry.identity else None
+        (accepted if acceptance and acceptance.active(now) else kept).append(entry)
+    return kept, accepted
+
+
+def save_findings(path: str, entries: list[Entry], subtitle: str,
+                  failed: list[str]) -> None:
+    write_json(path, {
+        "updated": datetime.now(timezone.utc).isoformat(),
+        "subtitle": subtitle,
+        "failed": list(failed),
+        "entries": [entry.as_dict() for entry in entries],
+    })
+
+
+@dataclass
+class WebConfig:
+    host: str
+    port: int
+    user: str
+    password: str
+    findings_path: str
+    decisions_path: str
+    accept_days: int = ACCEPT_DAYS_DEFAULT  # Vorbelegung des Ablaufdatums
+
+
+def web_config_from_env(args: argparse.Namespace, state_path: str | None) -> WebConfig:
+    env = os.environ.get
+    listen = args.serve or env("SECFEED_WEB_LISTEN") or "0.0.0.0:8080"
+    host, sep, port_raw = listen.rpartition(":")
+    if not sep or not port_raw.isdigit():
+        raise ConfigError(f"--serve erwartet HOST:PORT, z.B. 0.0.0.0:8080 (steht dort: {listen!r}).")
+
+    user = args.web_user or env("SECFEED_WEB_USER")
+    password = env("SECFEED_WEB_PASSWORD")
+    if not user or not password:
+        raise ConfigError(
+            "Die Webseite braucht eine Anmeldung: SECFEED_WEB_USER und "
+            "SECFEED_WEB_PASSWORD setzen. Ohne sie koennte jeder im Netz Funde "
+            "stumm schalten."
+        )
+    if password.strip().lower() in PLACEHOLDER_PASSWORDS:
+        raise ConfigError("SECFEED_WEB_PASSWORD steht noch auf einem Beispielwert.")
+
+    days_raw = env("SECFEED_ACCEPT_DAYS", "").strip()
+    try:
+        days = int(days_raw) if days_raw else ACCEPT_DAYS_DEFAULT
+    except ValueError:
+        raise ConfigError(f"SECFEED_ACCEPT_DAYS muss eine Zahl in Tagen sein (steht dort: {days_raw!r}).") from None
+
+    return WebConfig(
+        host=host or "0.0.0.0", port=int(port_raw), user=user, password=password,
+        findings_path=state_sibling(state_path, FINDINGS_FILE),
+        decisions_path=state_sibling(state_path, DECISIONS_FILE),
+        accept_days=days,
+    )
+
+
+class AcceptanceSite:
+    """Inhalt und Entscheidungen der Seite - ohne HTTP, damit es sich ohne
+    Server testen laesst."""
+
+    def __init__(self, cfg: WebConfig):
+        self.cfg = cfg
+        self.lock = threading.Lock()
+        # Ein Geheimnis je Serverstart in jedem Formular. Basic Auth schickt der
+        # Browser bei jeder Anfrage mit - eine fremde Seite im selben Netz
+        # koennte ihn sonst Akzeptanzen abschicken lassen.
+        self.form_token = secrets.token_urlsafe(24)
+
+    # -- Anmeldung -----------------------------------------------------------
+
+    def authorized(self, header: str | None) -> str | None:
+        """Benutzername bei gueltiger Anmeldung, sonst None."""
+        if not header or not header.startswith("Basic "):
+            return None
+        try:
+            raw = base64.b64decode(header[6:].strip(), validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+        user, sep, password = raw.partition(":")
+        if not sep:
+            return None
+        # Beide Vergleiche immer ausfuehren - sonst verraet die Antwortzeit,
+        # ob der Benutzername stimmt.
+        user_ok = hmac.compare_digest(user.encode("utf-8"), self.cfg.user.encode("utf-8"))
+        pass_ok = hmac.compare_digest(password.encode("utf-8"), self.cfg.password.encode("utf-8"))
+        return user if (user_ok and pass_ok) else None
+
+    # -- Entscheidungen ------------------------------------------------------
+
+    def accept(self, identity: str, by: str, comment: str, until_raw: str) -> str:
+        identity = identity.strip()
+        if not identity:
+            return "Kein Fund angegeben."
+        now = datetime.now(timezone.utc)
+        until: datetime | None = None
+        if until_raw.strip():
+            try:
+                day = datetime.strptime(until_raw.strip(), "%Y-%m-%d")
+            except ValueError:
+                return "Ablaufdatum bitte als JJJJ-MM-TT angeben."
+            until = day.replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+            if until <= now:
+                return "Das Ablaufdatum liegt in der Vergangenheit."
+        with self.lock:
+            decisions = load_decisions(self.cfg.decisions_path)
+            title = self.title_for(identity)
+            decisions[identity] = Acceptance(identity, by, now, until,
+                                             comment.strip()[:500], title)
+            save_decisions(self.cfg.decisions_path, decisions)
+        log(f"Akzeptiert durch {by}: {identity} "
+            f"(bis {until.date().isoformat() if until else 'unbefristet'})")
+        return f"Akzeptiert: {title or identity}"
+
+    def revoke(self, identity: str, by: str) -> str:
+        with self.lock:
+            decisions = load_decisions(self.cfg.decisions_path)
+            acceptance = decisions.pop(identity.strip(), None)
+            if acceptance is None:
+                return "Diese Akzeptanz gibt es nicht (mehr)."
+            save_decisions(self.cfg.decisions_path, decisions)
+        log(f"Widerrufen durch {by}: {identity}")
+        return f"Widerrufen: {acceptance.title or identity}"
+
+    def findings(self) -> dict:
+        return read_json(self.cfg.findings_path)
+
+    def title_for(self, identity: str) -> str:
+        for item in self.findings().get("entries", []):
+            if isinstance(item, dict) and item.get("identity") == identity:
+                return str(item.get("title", ""))
+        return ""
+
+    # -- Seite ---------------------------------------------------------------
+
+    def page(self, message: str = "") -> str:
+        esc = html.escape
+        now = datetime.now(timezone.utc)
+        data = self.findings()
+        decisions = load_decisions(self.cfg.decisions_path)
+        entries = [e for e in data.get("entries", []) if isinstance(e, dict)]
+
+        open_findings, accepted_findings, notes, news = [], [], [], []
+        for item in entries:
+            identity = item.get("identity")
+            if not item.get("local"):
+                news.append(item)
+            elif not identity:
+                notes.append(item)
+            elif identity in decisions and decisions[identity].active(now):
+                accepted_findings.append(item)
+            else:
+                open_findings.append(item)
+        present = {item.get("identity") for item in entries}
+        orphaned = [acc for identity, acc in decisions.items() if identity not in present]
+        expired = [acc for identity, acc in decisions.items()
+                   if identity in present and not acc.active(now)]
+
+        updated = parse_date(data.get("updated"))
+        stand = updated.astimezone().strftime("%d.%m.%Y %H:%M") if updated else "noch kein Lauf"
+        default_until = (datetime.now() + timedelta(days=self.cfg.accept_days)).strftime("%Y-%m-%d")
+
+        def cves_of(item: dict) -> str:
+            cves = [c for c in item.get("cves", []) if isinstance(c, str)]
+            shown = cves[:CVE_DISPLAY_CAP]
+            tags = "".join(f'<span class="cve">{esc(c)}</span>' for c in shown)
+            if len(cves) > len(shown):
+                tags += f'<span class="muted">+{len(cves) - len(shown)} weitere</span>'
+            return f'<div class="cves">{tags}</div>' if tags else ""
+
+        def headline(item: dict) -> str:
+            title, link = esc(str(item.get("title", ""))), str(item.get("link") or "")
+            return f'<a href="{esc(link)}">{title}</a>' if link else title
+
+        def accept_form(item: dict) -> str:
+            return (
+                '<form method="post" action="/accept" class="accept">'
+                f'<input type="hidden" name="token" value="{esc(self.form_token)}">'
+                f'<input type="hidden" name="identity" value="{esc(str(item.get("identity")))}">'
+                '<label>Grund <input name="comment" maxlength="500" '
+                'placeholder="z.B. Dienst nicht von aussen erreichbar"></label>'
+                f'<label>Bis <input type="date" name="until" value="{default_until}"></label>'
+                '<button type="submit">Akzeptieren</button>'
+                '<span class="muted">Ablaufdatum leer lassen = unbefristet</span>'
+                '</form>'
+            )
+
+        def revoke_form(identity: str) -> str:
+            return (
+                '<form method="post" action="/revoke" class="revoke">'
+                f'<input type="hidden" name="token" value="{esc(self.form_token)}">'
+                f'<input type="hidden" name="identity" value="{esc(identity)}">'
+                '<button type="submit">Widerrufen</button></form>'
+            )
+
+        def acceptance_meta(acc: Acceptance) -> str:
+            until = acc.until.astimezone().strftime("%d.%m.%Y") if acc.until else "unbefristet"
+            at = acc.at.astimezone().strftime("%d.%m.%Y %H:%M")
+            comment = f" &middot; {esc(acc.comment)}" if acc.comment else ""
+            return (f'<div class="meta">akzeptiert von {esc(acc.by)} am {at}, '
+                    f'gueltig bis {until}{comment}</div>')
+
+        parts = [
+            "<!doctype html><html lang=\"de\"><head><meta charset=\"utf-8\">",
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+            "<title>SecurityFeed</title><style>",
+            "body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;",
+            "max-width:860px;margin:0 auto;padding:16px 20px;color:#1a1a1a;background:#fafafa}",
+            "h1{font-size:22px;margin:0 0 4px} h2{font-size:17px;margin:32px 0 12px;",
+            "border-bottom:1px solid #ddd;padding-bottom:4px}",
+            ".muted{color:#777;font-size:13px} .meta{color:#666;font-size:13px;margin:4px 0}",
+            ".item{background:#fff;border-left:3px solid #c81e1e;padding:10px 14px;",
+            "margin:0 0 14px;border-radius:0 4px 4px 0;box-shadow:0 1px 2px rgba(0,0,0,.06)}",
+            ".item.ok{border-left-color:#9aa} .item.news{border-left-color:#1a4fa0}",
+            ".item a{color:#1a4fa0;text-decoration:none;font-weight:600;font-size:16px}",
+            ".item .title{font-weight:600;font-size:16px}",
+            ".cves{margin:6px 0} .cve{display:inline-block;background:#fde8e8;color:#9b1c1c;",
+            "border-radius:3px;padding:1px 6px;margin:0 4px 4px 0;font-size:12px;font-family:monospace}",
+            ".summary{font-size:14px;line-height:1.5;margin:6px 0}",
+            "form.accept{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;",
+            "margin-top:8px;font-size:13px} form.accept input{margin-left:4px}",
+            "form.accept input[name=comment]{width:260px;max-width:100%}",
+            "button{background:#1a4fa0;color:#fff;border:0;border-radius:3px;padding:6px 12px;",
+            "cursor:pointer} form.revoke button{background:#888}",
+            ".message{background:#e6f4ea;border-left:3px solid #2e7d32;padding:8px 14px;margin:12px 0}",
+            ".warn{background:#fff8e1;border-left:3px solid #f0ad4e;padding:8px 14px;margin:12px 0}",
+            "</style></head><body>",
+            "<h1>SecurityFeed</h1>",
+            f'<div class="muted">Stand: {esc(stand)} &middot; {esc(str(data.get("subtitle", "")))}</div>',
+        ]
+        if message:
+            parts.append(f'<div class="message">{esc(message)}</div>')
+        failed = [f for f in data.get("failed", []) if isinstance(f, str)]
+        if failed:
+            parts.append('<div class="warn"><strong>Warnung:</strong> Diese Quellen waren '
+                         'beim letzten Lauf nicht erreichbar:<ul>'
+                         + "".join(f"<li>{esc(f)}</li>" for f in failed) + "</ul></div>")
+
+        parts.append(f"<h2>Offene Funde ({len(open_findings)})</h2>")
+        if not open_findings:
+            parts.append('<p class="muted">Keine offenen Funde.</p>')
+        for item in open_findings:
+            parts.append(
+                '<div class="item">'
+                f'<div class="meta">{esc(str(item.get("source", "")))}</div>'
+                f'{headline(item)}{cves_of(item)}'
+                f'<div class="summary">{esc(str(item.get("summary", "")))}</div>'
+                f'{accept_form(item)}</div>'
+            )
+
+        if news:
+            parts.append(f"<h2>Meldungen, die dieses System betreffen ({len(news)})</h2>")
+            for item in news:
+                affects = ", ".join(str(a) for a in item.get("affects_local", []))
+                parts.append(
+                    '<div class="item news">'
+                    f'<div class="meta">{esc(str(item.get("source", "")))} &middot; '
+                    f'betrifft: {esc(affects)}</div>'
+                    f'{headline(item)}{cves_of(item)}'
+                    f'<div class="summary">{esc(str(item.get("summary", "")))}</div></div>'
+                )
+
+        if notes:
+            parts.append("<h2>Hinweise</h2>")
+            for item in notes:
+                parts.append(f'<div class="item ok"><div class="title">{esc(str(item.get("title", "")))}'
+                             f'</div><div class="summary">{esc(str(item.get("summary", "")))}</div></div>')
+
+        total_accepted = len(accepted_findings) + len(orphaned) + len(expired)
+        parts.append(f"<h2>Akzeptiert ({total_accepted})</h2>")
+        if not total_accepted:
+            parts.append('<p class="muted">Nichts akzeptiert.</p>')
+        for item in accepted_findings:
+            acc = decisions[item["identity"]]
+            parts.append(
+                '<div class="item ok">'
+                f'<div class="meta">{esc(str(item.get("source", "")))}</div>'
+                f'{headline(item)}{cves_of(item)}{acceptance_meta(acc)}'
+                f'{revoke_form(acc.identity)}</div>'
+            )
+        for acc in expired:
+            parts.append(
+                '<div class="item">'
+                f'<div class="title">{esc(acc.title or acc.identity)}</div>'
+                f'{acceptance_meta(acc)}<div class="meta"><strong>Abgelaufen</strong> - '
+                'der Fund wird wieder gemeldet. Erneut akzeptieren oben, oder hier entfernen.</div>'
+                f'{revoke_form(acc.identity)}</div>'
+            )
+        for acc in orphaned:
+            parts.append(
+                '<div class="item ok">'
+                f'<div class="title">{esc(acc.title or acc.identity)}</div>'
+                f'{acceptance_meta(acc)}<div class="meta">Derzeit nicht mehr gemeldet - '
+                'gepatcht, oder der Stand hat sich geaendert.</div>'
+                f'{revoke_form(acc.identity)}</div>'
+            )
+
+        parts.append(f'<p class="muted" style="margin-top:32px">SecurityFeed {__version__} '
+                     '&middot; Eine Akzeptanz gilt fuer genau diesen Stand des Funds. '
+                     'Kommt eine neue Luecke dazu, wird er wieder gemeldet.</p>')
+        parts.append("</body></html>")
+        return "".join(parts)
+
+
+def client_label(forwarded_for: str | None, peer: str) -> str:
+    """Absender fuers Log. Hinter einem Reverse Proxy ist der Peer immer der
+    Proxy; der eigentliche Browser steht in X-Forwarded-For. Beides nennen,
+    nicht ersetzen - der Header ist frei setzbar und nur so viel wert, wie
+    der Proxy davor vertrauenswuerdig ist."""
+    if not forwarded_for:
+        return peer
+    origin = forwarded_for.split(",")[0].strip()[:64]
+    return f"{peer} (fuer {origin})" if origin else peer
+
+
+class AcceptanceHandler(BaseHTTPRequestHandler):
+    server_version = f"SecurityFeed/{__version__}"
+    sys_version = ""
+
+    @property
+    def site(self) -> AcceptanceSite:
+        return self.server.site  # type: ignore[attr-defined]
+
+    def log_message(self, fmt: str, *args) -> None:
+        log(f"web {client_label(self.headers.get('X-Forwarded-For'), self.client_address[0])} "
+            f"{fmt % args}")
+
+    def _send(self, status: int, body: str, content_type: str = "text/html; charset=utf-8",
+              extra: dict[str, str] | None = None) -> None:
+        data = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def _require_user(self) -> str | None:
+        user = self.site.authorized(self.headers.get("Authorization"))
+        if user is None:
+            self._send(401, "Anmeldung erforderlich.", "text/plain; charset=utf-8",
+                       {"WWW-Authenticate": 'Basic realm="SecurityFeed", charset="UTF-8"'})
+        return user
+
+    def do_GET(self) -> None:
+        path, _, query = self.path.partition("?")
+        if path == "/health":
+            # Ohne Anmeldung, damit ein Healthcheck nicht das Passwort braucht.
+            self._send(200, "ok", "text/plain; charset=utf-8")
+            return
+        if path != "/":
+            self._send(404, "Nicht gefunden.", "text/plain; charset=utf-8")
+            return
+        if self._require_user() is None:
+            return
+        message = urllib.parse.parse_qs(query).get("m", [""])[0]
+        self._send(200, self.site.page(message))
+
+    def do_HEAD(self) -> None:
+        self.do_GET()
+
+    def do_POST(self) -> None:
+        user = self._require_user()
+        if user is None:
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length > 65536:
+            self._send(413, "Zu gross.", "text/plain; charset=utf-8")
+            return
+        form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", errors="replace"))
+
+        def field(name: str) -> str:
+            return form.get(name, [""])[0]
+
+        if not hmac.compare_digest(field("token"), self.site.form_token):
+            self._send(403, "Formular abgelaufen - Seite neu laden und erneut versuchen.",
+                       "text/plain; charset=utf-8")
+            return
+        if self.path == "/accept":
+            message = self.site.accept(field("identity"), user, field("comment"), field("until"))
+        elif self.path == "/revoke":
+            message = self.site.revoke(field("identity"), user)
+        else:
+            self._send(404, "Nicht gefunden.", "text/plain; charset=utf-8")
+            return
+        # Post/Redirect/Get: ein Neuladen wiederholt die Entscheidung nicht.
+        self._send(303, "", "text/plain; charset=utf-8",
+                   {"Location": "/?" + urllib.parse.urlencode({"m": message})})
+
+
+def start_web(cfg: WebConfig) -> ThreadingHTTPServer:
+    """Server im Hintergrund-Thread. Der Aufrufer beendet ihn mit shutdown()."""
+    server = ThreadingHTTPServer((cfg.host, cfg.port), AcceptanceHandler)
+    server.daemon_threads = True
+    server.site = AcceptanceSite(cfg)  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, name="web", daemon=True)
+    thread.start()
+    log(f"Webseite: http://{cfg.host}:{server.server_address[1]}/ "
+        f"(Anmeldung als '{cfg.user}', Akzeptanzen in {cfg.decisions_path}).")
+    return server
+
+
+def run_web_only(cfg: WebConfig) -> int:
+    """--serve ohne --schedule: nur die Seite, bis SIGTERM/SIGINT."""
+    stop = threading.Event()
+
+    def request_stop(signum, _frame):
+        log(f"Signal {signal.Signals(signum).name} empfangen - beende.")
+        stop.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, request_stop)
+
+    server = start_web(cfg)
+    while not stop.wait(60):
+        pass
+    server.shutdown()
+    server.server_close()
+    log("Beendet.")
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -1881,10 +2461,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"env-file nicht lesbar: {exc}", file=sys.stderr)
             return 2
 
+    state_path = resolve_state_path(args)
+
     # Konfiguration vor dem Netzwerkzugriff pruefen - lieber sofort scheitern als
     # nach 20 Sekunden Feedabruf, und im Dauerbetrieb gar nicht erst starten.
     try:
         mail_cfg = mail_config_from_env(args) if args.email else None
+        web_cfg = web_config_from_env(args, state_path) if args.serve is not None else None
         # Nur zur Pruefung - im Dauerbetrieb soll ein Zahlendreher in der
         # Umgebung sofort auffallen und nicht erst beim ersten Lauf.
         local_options(args)
@@ -1900,10 +2483,18 @@ def main(argv: list[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
 
-    state_path = resolve_state_path(args)
-
     if times:
-        return run_scheduler(args, mail_cfg, state_path, times)
+        # Seite und Zeitplan in einem Prozess: der Server laeuft nebenher und
+        # wird beendet, sobald der Scheduler zurueckkehrt.
+        server = start_web(web_cfg) if web_cfg else None
+        try:
+            return run_scheduler(args, mail_cfg, state_path, times)
+        finally:
+            if server:
+                server.shutdown()
+                server.server_close()
+    if web_cfg:
+        return run_web_only(web_cfg)
     return run_once(args, mail_cfg, state_path)
 
 
