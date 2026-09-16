@@ -488,6 +488,50 @@ Jede Entscheidung trägt den Benutzernamen und den Zeitpunkt. Die Markierung
 „Betrifft dieses System" an Nachrichten bleibt auch für akzeptierte Pakete —
 das ist eine Tatsache, keine Mahnung.
 
+### Jetzt scannen
+
+Oben auf der Seite steht *Jetzt scannen*. Der Knopf startet keinen Scan im
+Web-Container — der hat weder die Paketlisten noch soll er sie haben. Er legt
+`scan-request.json` im State-Volume ab; der Scanner-Container sieht in seiner
+Warteschleife alle fünf Sekunden nach und läuft dann sofort, mit denselben
+Einstellungen wie ein geplanter Lauf, Mail inklusive. Solange das dauert, zeigt
+die Seite den Stand („angefordert", „läuft seit") und lädt sich alle zehn
+Sekunden selbst neu; danach steht der neue Stand oben.
+
+Wird eine Anforderung zehn Minuten lang nicht abgeholt, sagt die Seite das —
+dann läuft der Scanner nicht im Dauerbetrieb, und `docker compose ps` ist der
+nächste Schritt. Im Log des Scanners steht der Lauf als
+`Lauf gestartet (Anforderung von max)`.
+
+### Passwort ändern
+
+Oben rechts auf der Seite steht *Verwaltung* (`/admin`). Dort lässt sich das
+Passwort ändern: altes Passwort, neues Passwort, Wiederholung. Mindestens 12
+Zeichen, die Beispielwerte aus der `.env.example` werden abgewiesen.
+
+Was dabei passiert, weil es das Verhalten der `.env` ändert:
+
+- Das neue Passwort landet **nicht** in der `.env`, sondern als PBKDF2-Hash in
+  `web-auth.json` im State-Volume — neben `decisions.json`. Der Container
+  ist `read_only`, das Volume nicht; mehr Rechte braucht die Seite dafür nicht.
+- Sobald die Datei existiert, gilt sie. `SECFEED_WEB_PASSWORD` in der `.env`
+  ist dann nur noch der Startwert und öffnet die Seite nicht mehr. Der
+  Benutzername bleibt `SECFEED_WEB_USER`; wird er in der `.env` geändert,
+  passt die Datei nicht mehr zu ihm und es gilt wieder das Passwort aus der
+  `.env` — die Seite sagt das dann auch so.
+- Basic Auth kennt kein „Abmelden": nach dem Wechsel schickt der Browser beim
+  nächsten Klick noch das alte Passwort, bekommt ein 401 und fragt neu. Das ist
+  erwartet, kein Fehler.
+
+Passwort vergessen? Datei löschen, dann gilt wieder die `.env`:
+
+```bash
+docker compose exec securityfeed-web rm /var/lib/securityfeed/web-auth.json
+```
+
+Jede Änderung steht mit Benutzer und Zeitpunkt im Log (`docker compose logs
+securityfeed-web`).
+
 ### Wie Scanner und Seite zusammenarbeiten
 
 Beide teilen sich das State-Volume. Nach jedem Lauf legt der Scanner
