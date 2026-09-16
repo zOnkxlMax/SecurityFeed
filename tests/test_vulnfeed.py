@@ -2126,6 +2126,25 @@ class TestAcceptanceSite(unittest.TestCase):
         self.assertIn("&lt;script&gt;", page)
 
 
+class TestClientLabel(unittest.TestCase):
+    """Hinter dem Nginx Proxy Manager ist der Peer immer der Proxy - der
+    Browser steht in X-Forwarded-For, und der Header ist frei setzbar."""
+
+    def test_without_proxy_only_the_peer(self):
+        self.assertEqual(vf.client_label(None, "192.168.1.20"), "192.168.1.20")
+        self.assertEqual(vf.client_label("", "192.168.1.20"), "192.168.1.20")
+
+    def test_behind_proxy_both_are_named(self):
+        self.assertEqual(vf.client_label("192.168.1.77", "172.18.0.2"),
+                         "172.18.0.2 (fuer 192.168.1.77)")
+
+    def test_first_hop_of_a_chain_and_a_length_cap(self):
+        self.assertEqual(vf.client_label("10.0.0.1, 10.0.0.2", "172.18.0.2"),
+                         "172.18.0.2 (fuer 10.0.0.1)")
+        label = vf.client_label("x" * 500, "172.18.0.2")
+        self.assertLess(len(label), 100, "ein boeser Header darf das Log nicht fluten")
+
+
 class TestWebServer(unittest.TestCase):
     """Echter Server auf einem freien Port, echte Anfragen per urllib."""
 

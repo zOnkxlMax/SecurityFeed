@@ -2234,6 +2234,17 @@ class AcceptanceSite:
         return "".join(parts)
 
 
+def client_label(forwarded_for: str | None, peer: str) -> str:
+    """Absender fuers Log. Hinter einem Reverse Proxy ist der Peer immer der
+    Proxy; der eigentliche Browser steht in X-Forwarded-For. Beides nennen,
+    nicht ersetzen - der Header ist frei setzbar und nur so viel wert, wie
+    der Proxy davor vertrauenswuerdig ist."""
+    if not forwarded_for:
+        return peer
+    origin = forwarded_for.split(",")[0].strip()[:64]
+    return f"{peer} (fuer {origin})" if origin else peer
+
+
 class AcceptanceHandler(BaseHTTPRequestHandler):
     server_version = f"SecurityFeed/{__version__}"
     sys_version = ""
@@ -2243,7 +2254,8 @@ class AcceptanceHandler(BaseHTTPRequestHandler):
         return self.server.site  # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args) -> None:
-        log(f"web {self.client_address[0]} {fmt % args}")
+        log(f"web {client_label(self.headers.get('X-Forwarded-For'), self.client_address[0])} "
+            f"{fmt % args}")
 
     def _send(self, status: int, body: str, content_type: str = "text/html; charset=utf-8",
               extra: dict[str, str] | None = None) -> None:

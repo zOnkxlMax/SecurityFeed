@@ -94,9 +94,11 @@ Siehe Abschnitt [Paketscan](#paketscan-was-steckt-hier-drin) weiter unten.
 
 Akzeptierte Funde fallen aus Mail und Wiedervorlage, bis ihr Ablaufdatum
 erreicht ist. Eine Akzeptanz gilt für genau diesen Stand des Funds — kommt eine
-neue Lücke dazu, wird er wieder gemeldet. Die Seite hat Basic Auth, aber kein
-TLS: nur im eigenen Netz betreiben. Einrichtung in
-[docs/DOCKER.md](docs/DOCKER.md#funde-im-browser-akzeptieren) bzw.
+neue Lücke dazu, wird er wieder gemeldet. Die Seite hat Basic Auth, aber selbst
+kein TLS: nur im eigenen Netz betreiben — oder hinter einen Reverse Proxy wie
+den Nginx Proxy Manager legen, der das Zertifikat übernimmt. Einrichtung in
+[docs/DOCKER.md](docs/DOCKER.md#funde-im-browser-akzeptieren) (inklusive
+Proxy-Manager-Rezept) bzw.
 [docs/RASPBERRY-PI.md](docs/RASPBERRY-PI.md#funde-im-browser-akzeptieren).
 
 ### Mailversand

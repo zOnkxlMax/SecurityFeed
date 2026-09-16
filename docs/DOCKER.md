@@ -503,6 +503,86 @@ Zum Ausprobieren ohne Compose:
 SECFEED_WEB_USER=max SECFEED_WEB_PASSWORD=test-1234 python3 vulnfeed.py --serve 127.0.0.1:8080
 ```
 
+### Hinter Nginx Proxy Manager: TLS und ein Hostname
+
+Läuft auf dem Pi ohnehin der Nginx Proxy Manager, gehört die Seite dahinter.
+Das behebt die Schwäche von oben: der Proxy spricht TLS, die Seite bleibt
+intern, und du erreichst sie unter `https://securityfeed.<deine-domain>` statt
+über IP und Port.
+
+**1. Kein Port am Host.** Statt `ports:` hängt der Web-Container in das
+Docker-Netz des Proxy Managers — dann erreicht ihn nur der Proxy, niemand
+sonst im LAN. Den Netznamen zeigt `docker network ls`; üblich ist etwas wie
+`nginx-proxy-manager_default` oder `npm_default`. Die `compose.override.yaml`
+sieht dann so aus (nur die Unterschiede zum Rezept oben):
+
+```yaml
+services:
+  securityfeed-web:
+    image: securityfeed:latest
+    container_name: securityfeed-web
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+    command: ["--serve", "0.0.0.0:8080"]
+    # Kein "ports:" - nur der Proxy kommt an den Container heran.
+    networks:
+      - default
+      - proxy
+    volumes:
+      - securityfeed-state:/var/lib/securityfeed
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  proxy:
+    external: true
+    name: nginx-proxy-manager_default   # an "docker network ls" anpassen
+```
+
+Dann `docker compose up -d`.
+
+**2. Proxy Host im Nginx Proxy Manager anlegen** — *Hosts → Proxy Hosts →
+Add Proxy Host*:
+
+| Feld | Wert |
+| --- | --- |
+| Domain Names | `securityfeed.<deine-domain>` |
+| Scheme | `http` |
+| Forward Hostname / IP | `securityfeed-web` (der Containername — funktioniert, weil beide im selben Docker-Netz hängen) |
+| Forward Port | `8080` |
+| Block Common Exploits | an |
+| Websockets Support | aus, wird nicht gebraucht |
+
+Reiter **SSL**: ein Zertifikat wählen — *Request a new SSL Certificate* für
+Let's Encrypt (bei einer rein internen Domain per DNS-Challenge) oder ein
+eigenes/self-signed hochladen. *Force SSL* und *HTTP/2 Support* einschalten.
+
+Hängt der Proxy Manager **nicht** in Docker, oder soll er die Seite über das
+LAN erreichen: `ports: - "8080:8080"` aus dem Rezept oben behalten und als
+Forward Hostname die LAN-IP des Pi eintragen. Sicherer ist die Variante ohne
+Port.
+
+**3. Anmeldung bleibt in der App.** Nginx reicht den `Authorization`-Header
+durch, die Seite prüft Benutzer und Passwort weiterhin selbst — Zugang über den
+Proxy ändert daran nichts. Lege im Proxy Manager **keine** Access List mit
+eigener Basic Auth an: nginx würde dann seine Zugangsdaten verlangen, sie
+durchreichen, und die Seite lehnt sie ab. Eine Access List nur mit
+IP-Beschränkung ist dagegen unproblematisch und eine sinnvolle Ergänzung.
+
+Zwei Dinge, die die Seite dafür schon mitbringt: alle Verweise sind relativ,
+also unabhängig von Hostname und Schema, und im Log steht neben der
+Proxy-Adresse der Browser aus `X-Forwarded-For`. Nicht unterstützt ist ein
+Unterpfad wie `https://pi/securityfeed/` — der Proxy Host braucht einen eigenen
+Hostnamen, so wie der Nginx Proxy Manager es ohnehin vorsieht.
+
 Behoben werden Container-Funde nicht mit `apt` auf dem Pi, sondern über das
 Image — Basisimage aktualisieren und neu bauen. Der Eintrag sagt das auch so.
 
