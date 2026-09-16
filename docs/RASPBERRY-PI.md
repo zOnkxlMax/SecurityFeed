@@ -334,11 +334,15 @@ Bewusst getrennt — den Docker-Socket bekommt SecurityFeed nicht, wer ihn hat,
 ist faktisch root auf dem Pi.
 
 ```bash
-sudo install -m 0755 deploy/dump-container-packages.sh /opt/securityfeed/
-sudo install -m 0644 deploy/securityfeed-containers.service deploy/securityfeed-containers.timer /etc/systemd/system/
+sudo install -m 0755 ~/securityfeed/deploy/dump-container-packages.sh /opt/securityfeed/
+sudo install -m 0644 ~/securityfeed/deploy/securityfeed-containers.service ~/securityfeed/deploy/securityfeed-containers.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now securityfeed-containers.timer
 ```
+
+Das Ablageverzeichnis gehört danach `securityfeed:securityfeed` und ist für
+andere Benutzer nicht lesbar — das Skript erkennt den Dienstbenutzer und setzt
+`0750`/`0640` selbst.
 
 Einmal von Hand laufen lassen und ansehen, was er einsammelt:
 
@@ -410,14 +414,22 @@ neue Datei.
 ## Wieder abschalten
 
 ```bash
-sudo systemctl disable --now securityfeed.timer
+sudo systemctl disable --now securityfeed.timer securityfeed-containers.timer
 ```
+
+Der zweite Timer existiert nur, wenn du den Abschnitt „Auch die
+Docker-Container prüfen" eingerichtet hast; systemd meldet ihn sonst als
+unbekannt, das ist harmlos.
 
 Vollständig entfernen:
 
 ```bash
-sudo rm /etc/systemd/system/securityfeed.{service,timer}
+sudo rm -f /etc/systemd/system/securityfeed.{service,timer} /etc/systemd/system/securityfeed-containers.{service,timer}
 sudo rm -rf /opt/securityfeed /etc/securityfeed /var/lib/securityfeed
 sudo systemctl daemon-reload
 sudo userdel securityfeed
 ```
+
+Die Reihenfolge ist wichtig: erst die Timer abschalten, dann löschen. Sonst
+feuert `securityfeed-containers.timer` weiter stündlich und meldet jedes Mal
+einen Fehler, weil das Skript unter `/opt/securityfeed` schon weg ist.

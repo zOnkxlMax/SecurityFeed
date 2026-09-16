@@ -183,8 +183,19 @@ jobs:
           docker run -d --name ci-alpine alpine:3 sleep 300
           # busybox hat weder dpkg noch apk - der Fall "gar keine Paketliste".
           docker run -d --name ci-busybox busybox:latest sleep 300
-          sudo ./deploy/dump-container-packages.sh /tmp/ci-container-lists
+          # Eigentuemer explizit: auf dem Runner gibt es keinen Benutzer
+          # "securityfeed", und mit dem Default 10001 koennte der Runner die
+          # Ablage danach selbst nicht mehr lesen.
+          sudo ./deploy/dump-container-packages.sh /tmp/ci-container-lists "$(id -u):$(id -g)"
           find /tmp/ci-container-lists
+
+          # Die Ablage ist das Paketinventar aller Container - fuer niemanden
+          # sonst lesbar, und sie gehoert dem angegebenen Leser.
+          test "$(stat -c %a /tmp/ci-container-lists)" = "750"
+          test "$(stat -c %a /tmp/ci-container-lists/securityfeed)" = "750"
+          test "$(stat -c %a /tmp/ci-container-lists/securityfeed/status)" = "640"
+          test "$(stat -c %a /tmp/ci-container-lists/updated)" = "640"
+          test "$(stat -c %u /tmp/ci-container-lists/securityfeed/status)" = "$(id -u)"
 
           # Der SecurityFeed-Container basiert auf bookworm, hat also dpkg.
           # Der Name steht als container_name in der compose.yaml fest.
@@ -210,7 +221,7 @@ jobs:
 
           # Beendete Container fliegen beim naechsten Lauf wieder raus.
           docker rm -f ci-alpine ci-busybox
-          sudo ./deploy/dump-container-packages.sh /tmp/ci-container-lists
+          sudo ./deploy/dump-container-packages.sh /tmp/ci-container-lists "$(id -u):$(id -g)"
           test ! -d /tmp/ci-container-lists/ci-alpine
           test ! -d /tmp/ci-container-lists/ci-busybox
 

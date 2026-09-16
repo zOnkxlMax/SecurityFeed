@@ -927,6 +927,13 @@ class TestApkParsing(unittest.TestCase):
         self.assertIsNone(vf.alpine_ecosystem("edge"))
         self.assertIsNone(vf.alpine_ecosystem(""))
 
+    def test_alpine_prereleases_are_not_mapped_to_a_stable_branch(self):
+        # alpine:edge meldet VERSION_ID wie "3.23.0_alpha20250612". Als
+        # Alpine:v3.23 gelesen kennt OSV den Zweig vor dessen Erscheinen nicht
+        # und meldet den Container faelschlich als sauber.
+        for raw in ("3.23.0_alpha20250612", "3.22.0_rc1", "3.21.2.1", "3.21-beta", "v3.21"):
+            self.assertIsNone(vf.alpine_ecosystem(raw), raw)
+
 
 class TestSentinelPerEcosystem(unittest.TestCase):
     """Der Sentinel muss zum Oekosystem passen. Ein Debian-Sentinel liefert
@@ -986,6 +993,20 @@ class TestDebianRelease(unittest.TestCase):
                                          "ID=debian\n")
         self.assertEqual(self._release(os_release=path), "12")
 
+    def test_32bit_raspberry_pi_os_reports_as_raspbian(self):
+        # Die armhf-Variante hat ID=raspbian, fuehrt aber Debians Versionen und
+        # Paketdatenbank - ein Refus haette den Scan dort jeden Lauf uebersprungen.
+        path = self._write("os-release", "ID=raspbian\nID_LIKE=debian\n"
+                                         'VERSION_ID="12"\nVERSION_CODENAME=bookworm\n')
+        self.assertEqual(self._release(os_release=path), "12")
+
+    def test_id_like_alone_is_not_enough(self):
+        # Ubuntu hat ebenfalls ID_LIKE=debian, aber eigene Versionen und ein
+        # eigenes OSV-Oekosystem - es muss weiterhin abgelehnt werden.
+        path = self._write("os-release", "ID=ubuntu\nID_LIKE=debian\nVERSION_ID=\"24.04\"\n")
+        with self.assertRaises(vf.LocalScanError):
+            self._release(os_release=path)
+
     def test_codename_is_translated_when_version_id_is_missing(self):
         path = self._write("os-release", "ID=debian\nVERSION_CODENAME=trixie\n")
         self.assertEqual(self._release(os_release=path), "13")
@@ -1008,6 +1029,115 @@ class TestDebianRelease(unittest.TestCase):
     def test_os_release_quotes_are_stripped(self):
         fields = vf.parse_os_release('ID=debian\nVERSION_ID="12"\n# Kommentar\n')
         self.assertEqual(fields, {"ID": "debian", "VERSION_ID": "12"})
+
+    def test_os_release_parser_shares_the_env_file_quote_rule(self):
+        # Ein Parser fuer beide Dateiformate: nur ein umschliessendes Paar
+        # faellt weg, ein einzelnes Anfuehrungszeichen am Ende bleibt.
+        fields = vf.parse_os_release("A=endetAuf'\nB='paar'\nC=\"Foo 'bar'\"\n")
+        self.assertEqual(fields, {"A": "endetAuf'", "B": "paar", "C": "Foo 'bar'"})
+
+
+class TestHostTarget(unittest.TestCase):
+    """Die Paketliste des Hosts kommt im Container per Mount - dessen
+    Debian-Version muss dann ebenfalls vom Host kommen, nicht aus dem Image."""
+
+    STATUS = ("Package: openssl\n"
+              "Status: install ok installed\n"
+              "Version: 3.0.11-1~deb12u2\n")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _write(self, name: str, text: str) -> str:
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def test_foreign_status_file_without_a_release_is_refused(self):
+        # Ohne diese Weigerung kaeme die Version aus /etc/os-release des
+        # Containers - bookworm-Image, trixie-Host, falsche Fixversionen.
+        status = self._write("status", self.STATUS)
+        with self.assertRaises(vf.LocalScanError) as caught:
+            vf.host_target(vf.LocalOptions(status_path=status), 5.0)
+        self.assertIn("--host-os-release", str(caught.exception))
+        self.assertIn("--debian-release", str(caught.exception))
+
+    def test_host_os_release_provides_the_release(self):
+        status = self._write("status", self.STATUS)
+        os_release = self._write("os-release", 'ID=debian\nVERSION_ID="13"\n')
+        target = vf.host_target(
+            vf.LocalOptions(status_path=status, host_os_release=os_release), 5.0)
+        self.assertEqual(target.ecosystem, "Debian:13")
+        self.assertEqual([p.name for p in target.packages], ["openssl"])
+
+    def test_raspbian_host_is_accepted(self):
+        status = self._write("status", self.STATUS)
+        os_release = self._write("os-release", 'ID=raspbian\nID_LIKE=debian\nVERSION_ID="12"\n')
+        target = vf.host_target(
+            vf.LocalOptions(status_path=status, host_os_release=os_release), 5.0)
+        self.assertEqual(target.ecosystem, "Debian:12")
+
+    def test_explicit_release_beats_everything(self):
+        status = self._write("status", self.STATUS)
+        os_release = self._write("os-release", 'ID=debian\nVERSION_ID="13"\n')
+        target = vf.host_target(
+            vf.LocalOptions(status_path=status, host_os_release=os_release, release="11"),
+            5.0)
+        self.assertEqual(target.ecosystem, "Debian:11")
+
+
+class TestLocalOptionsEnvironment(unittest.TestCase):
+    """local_options() ist die einzige Stelle, die fuer den Scan die Umgebung
+    liest - der Scan selbst vertraut dem fertigen Objekt."""
+
+    KEYS = ("SECFEED_DPKG_STATUS", "SECFEED_DEBIAN_RELEASE", "SECFEED_CONTAINER_LISTS",
+            "SECFEED_HOST_OS_RELEASE", "SECFEED_LOCAL_REMIND")
+
+    def setUp(self):
+        self.saved = {k: os.environ.pop(k) for k in self.KEYS if k in os.environ}
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for key in self.KEYS:
+            os.environ.pop(key, None)
+        os.environ.update(self.saved)
+
+    def _options(self, *argv) -> vf.LocalOptions:
+        return vf.local_options(vf.build_parser().parse_args(list(argv)))
+
+    def test_environment_fills_every_field(self):
+        os.environ.update({
+            "SECFEED_DPKG_STATUS": "/host/dpkg/status",
+            "SECFEED_DEBIAN_RELEASE": "12",
+            "SECFEED_CONTAINER_LISTS": "/host/containers",
+            "SECFEED_HOST_OS_RELEASE": "/host/os-release",
+        })
+        options = self._options()
+        self.assertEqual(options.status_path, "/host/dpkg/status")
+        self.assertEqual(options.release, "12")
+        self.assertEqual(options.containers, "/host/containers")
+        self.assertEqual(options.host_os_release, "/host/os-release")
+
+    def test_command_line_beats_the_environment(self):
+        os.environ["SECFEED_CONTAINER_LISTS"] = "/host/containers"
+        os.environ["SECFEED_DPKG_STATUS"] = "/host/dpkg/status"
+        options = self._options("--container-lists", "/anders", "--dpkg-status", "/x")
+        self.assertEqual(options.containers, "/anders")
+        self.assertEqual(options.status_path, "/x")
+
+    def test_empty_environment_value_counts_as_unset(self):
+        # compose.yaml setzt "${SECFEED_CONTAINER_LISTS:-}" - ein leerer
+        # Wert darf nicht als Verzeichnis "" beim Scanner ankommen.
+        os.environ["SECFEED_CONTAINER_LISTS"] = ""
+        self.assertIsNone(self._options().containers)
+
+    def test_nothing_set_means_nothing_resolved(self):
+        options = self._options()
+        self.assertIsNone(options.status_path)
+        self.assertIsNone(options.containers)
+        self.assertIsNone(options.host_os_release)
 
 
 class TestCveId(unittest.TestCase):
@@ -1055,7 +1185,8 @@ class TestScanLocal(unittest.TestCase):
         self.queries: list[tuple[str, str, str]] = []
         self._patch("installed_packages", lambda opts, timeout: packages)
         self._patch("osv_batch", self._fake_batch(vulns))
-        return vf.scan_local(vf.LocalOptions(release="12", **options), 20.0)
+        entries, _error = vf.scan_local(vf.LocalOptions(release="12", **options), 20.0)
+        return entries
 
     def test_only_the_fixable_difference_is_reported(self):
         entries = self._scan(
@@ -1181,6 +1312,15 @@ class TestReminder(unittest.TestCase):
         args = vf.build_parser().parse_args(["--local-remind", "30"])
         self.assertEqual(vf.local_options(args).remind_days, 30.0)
 
+    def test_explicit_default_value_also_beats_the_environment(self):
+        # Ein ausdrueckliches "--local-remind 7" ist eine Entscheidung, auch
+        # wenn 7 der Default ist. Vorher gewann hier still die Umgebung, weil
+        # der Wert vom nicht gesetzten nicht zu unterscheiden war.
+        os.environ["SECFEED_LOCAL_REMIND"] = "0"
+        self.addCleanup(os.environ.pop, "SECFEED_LOCAL_REMIND", None)
+        args = vf.build_parser().parse_args(["--local-remind", "7"])
+        self.assertEqual(vf.local_options(args).remind_days, 7.0)
+
     def test_unusable_interval_is_a_configuration_error(self):
         os.environ["SECFEED_LOCAL_REMIND"] = "woechentlich"
         self.addCleanup(os.environ.pop, "SECFEED_LOCAL_REMIND", None)
@@ -1246,6 +1386,44 @@ class TestOsvBatch(unittest.TestCase):
         self._collect_requests(lambda n: [{}])
         with self.assertRaises(vf.LocalScanError):
             vf.osv_batch([("a", "1", "Debian:12"), ("b", "2", "Debian:12")], 30.0)
+
+    def test_connection_dropped_while_reading_fails_only_this_source(self):
+        # IncompleteRead ist keine URLError, ConnectionResetError ebenso wenig.
+        # Vorher riss so ein Abbruch den ganzen Lauf mit - samt der Ergebnisse
+        # der vier Feeds, ohne Mail, ohne gespeicherten Zustand.
+        class Dropping:
+            def __init__(self, exc):
+                self.exc = exc
+
+            def read(self):
+                raise self.exc
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        for exc in (vf.http.client.IncompleteRead(b"teil"), ConnectionResetError(104, "reset"),
+                    vf.http.client.RemoteDisconnected("weg")):
+            self._patch_urlopen(lambda request, timeout=None, exc=exc: Dropping(exc))
+            with self.assertRaises(vf.LocalScanError, msg=type(exc).__name__) as caught:
+                vf.osv_batch([("a", "1", "Debian:12")], 30.0)
+            self.assertIn("abgebrochen", str(caught.exception))
+
+    def test_load_source_turns_read_errors_into_a_source_failure(self):
+        # Dasselbe fuer die Feeds: fetch() liest den Koerper ebenfalls erst
+        # nach dem Verbindungsaufbau.
+        def dropping_fetch(url, timeout):
+            raise vf.http.client.IncompleteRead(b"teil")
+
+        original = vf.fetch
+        vf.fetch = dropping_fetch
+        self.addCleanup(setattr, vf, "fetch", original)
+        source = next(s for s in vf.SOURCES if s.key == "heise-alerts")
+        _, entries, error = vf.load_source(source, 5.0)
+        self.assertEqual(entries, [])
+        self.assertIn("abgebrochen", error)
 
 
 class TestContainerLists(unittest.TestCase):
@@ -1328,11 +1506,21 @@ class TestContainerLists(unittest.TestCase):
         self.assertEqual(skipped[0].name, "fedora")
 
     def test_alpine_edge_is_skipped_rather_than_guessed(self):
-        # "edge" hat in der Datenbank kein Gegenstueck.
-        self._container("edge", apk=self.APK, os_release="ID=alpine\nVERSION_ID=edge\n")
+        # "edge" hat in der Datenbank kein Gegenstueck - und so meldet sich
+        # ein echtes alpine:edge-Image: mit Vorabversions-Suffix.
+        for version in ("edge", "3.23.0_alpha20250612"):
+            self._container("edge", apk=self.APK,
+                            os_release=f"ID=alpine\nVERSION_ID={version}\n")
+            targets, skipped = vf.container_targets(self.dir)
+            self.assertEqual(targets, [], version)
+            self.assertIn("nicht erkennbar", skipped[0].reason)
+
+    def test_raspbian_container_is_a_debian_target(self):
+        self._container("legacy", status=self.STATUS,
+                        os_release='ID=raspbian\nID_LIKE=debian\nVERSION_ID="11"\n')
         targets, skipped = vf.container_targets(self.dir)
-        self.assertEqual(targets, [])
-        self.assertIn("nicht erkennbar", skipped[0].reason)
+        self.assertEqual(skipped, [])
+        self.assertEqual(targets[0].ecosystem, "Debian:11")
 
     def test_empty_status_file_is_skipped(self):
         self._container("leer", status="")
@@ -1415,9 +1603,10 @@ class TestScanAcrossTargets(unittest.TestCase):
 
         self._patch("installed_packages", packages)
         self._patch("osv_batch", fake_batch)
-        return vf.scan_local(
+        entries, self.error = vf.scan_local(
             vf.LocalOptions(release="12", containers=self.tmp.name, **options), 20.0
         )
+        return entries
 
     def test_each_target_is_queried_with_its_own_release(self):
         self._container("web")  # trixie, waehrend der Host bookworm ist
@@ -1466,8 +1655,39 @@ class TestScanAcrossTargets(unittest.TestCase):
         entries = self._scan({"openssl": (["DEBIAN-CVE-2024-1001"], [])},
                              host_error="dpkg-query nicht gefunden")
         self.assertTrue(any(e.source == "Container web" and e.cves for e in entries))
-        note = next(e for e in entries if "nicht pruefbar" in e.title)
-        self.assertIn("Lokales System", note.title)
+
+    def test_failed_host_scan_is_a_source_failure_not_a_note(self):
+        # Ein Host-Ausfall muss in jeder Mail im Betreff stehen und Exit-Code
+        # 3 ausloesen - nicht als Betriebsnotiz einmal je Wiedervorlage-Fenster
+        # kommen, waehrend die Container gruen aussehen.
+        self._container("web")
+        self._touch_stamp()
+        entries = self._scan({}, host_error="dpkg-Statusdatei nicht lesbar (/host/dpkg/status)")
+        self.assertIn("nicht lesbar", self.error)
+        self.assertFalse(any("Lokales System: nicht pruefbar" in e.title for e in entries),
+                         "kein Doppel aus Quellenfehler und Betriebsnotiz")
+
+    def test_successful_host_scan_reports_no_error(self):
+        self._container("web")
+        self._touch_stamp()
+        self._scan({})
+        self.assertIsNone(self.error)
+
+    def test_collect_keeps_entries_that_arrive_together_with_an_error(self):
+        # load_source liefert beim Paketscan Container-Befunde UND den
+        # Host-Fehler zugleich; collect() darf die Befunde nicht wegwerfen.
+        container_entry = entry(source="Container web", title="openssl: 1 Luecke", local=True)
+
+        def fake_load(source, timeout, local=None):
+            return source, [container_entry], "dpkg-query nicht gefunden"
+
+        original = vf.load_source
+        vf.load_source = fake_load
+        self.addCleanup(setattr, vf, "load_source", original)
+        source = next(s for s in vf.SOURCES if s.key == "local")
+        entries, failed = vf.collect([source], 5.0, quiet=True)
+        self.assertEqual(entries, [container_entry])
+        self.assertEqual(failed, ["Lokales System: dpkg-query nicht gefunden"])
 
     def test_nothing_scannable_at_all_fails_the_source(self):
         with self.assertRaises(vf.LocalScanError) as caught:
@@ -1531,26 +1751,53 @@ class TestLocalCorrelation(unittest.TestCase):
 
     def test_matching_news_entry_names_the_installed_package(self):
         scan, hit, miss = self._entries()
-        vf.mark_local_matches([scan, hit, miss])
+        vf.mark_local_matches([hit, miss], [scan])
         self.assertEqual(hit.affects_local, ["openssl"])
         self.assertEqual(miss.affects_local, [])
 
     def test_without_a_scan_nothing_is_marked(self):
         _, hit, miss = self._entries()
-        vf.mark_local_matches([hit, miss])
+        vf.mark_local_matches([hit, miss], [])
         self.assertEqual(hit.affects_local, [])
+
+    def test_already_reported_scan_entries_still_mark_the_news(self):
+        # Tag 2 im Wiedervorlage-Fenster: der Scan-Eintrag ist dem Zustand
+        # bekannt und nicht mehr "frisch" - installiert ist das Paket trotzdem.
+        # Die Markierung muss aus ALLEN Scan-Eintraegen kommen, nicht nur aus
+        # den frischen, sonst fehlt sie fuer den Rest des Fensters.
+        scan, hit, miss = self._entries()
+        fresh = [hit, miss]  # scan fehlt: schon gemeldet
+        vf.mark_local_matches(fresh, [scan])
+        self.assertEqual(hit.affects_local, ["openssl"])
+
+    def test_scan_entries_are_never_marked_themselves(self):
+        scan, hit, _ = self._entries()
+        vf.mark_local_matches([scan, hit], [scan])
+        self.assertEqual(scan.affects_local, ["openssl"], "bleibt wie vom Scan gesetzt")
 
     def test_subject_puts_the_affected_system_first(self):
         scan, hit, miss = self._entries()
-        vf.mark_local_matches([scan, hit, miss])
+        vf.mark_local_matches([hit, miss], [scan])
         cfg = vf.MailConfig(host="h", port=25, sender="a@b.de", recipients=["c@d.de"])
         subject = vf.build_message(cfg, [miss, scan, hit], "Test")["Subject"]
         self.assertIn("2 von 3", subject)
         self.assertIn("betreffen dieses System", subject)
 
+    def test_cve_only_keeps_operational_scan_notes(self):
+        # "nicht pruefbar" und "Listen veraltet" haben keine CVE, sind aber
+        # genau die Meldungen, die nie unter den Tisch fallen duerfen - und
+        # die Doku empfiehlt --cve-only als Standardkonfiguration.
+        note = vf.unscanned_entry(vf.SkippedTarget("web", "kein dpkg"),
+                                  datetime.now(timezone.utc))
+        stale = vf.stale_lists_entry(None, "/host/containers", datetime.now(timezone.utc))
+        self.assertTrue(vf.passes_cve_only(note))
+        self.assertTrue(vf.passes_cve_only(stale))
+        self.assertTrue(vf.passes_cve_only(entry(cves=["CVE-2024-1"])))
+        self.assertFalse(vf.passes_cve_only(entry(cves=[])))
+
     def test_rendering_marks_the_hit_but_not_the_scan_entry(self):
         scan, hit, miss = self._entries()
-        vf.mark_local_matches([scan, hit, miss])
+        vf.mark_local_matches([hit, miss], [scan])
         for text in (vf.render_table([scan, hit]), vf.render_markdown([scan, hit]),
                      vf.render_html([scan, hit], "Test")):
             self.assertIn("Betrifft dieses System", text)

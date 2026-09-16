@@ -21,11 +21,16 @@ services:
       TZ: ${TZ:-Europe/Berlin}
 
       # Paketscan des Hosts. Zum Einschalten SECFEED_LOCAL=1 in die .env
-      # schreiben und die Paketliste des Hosts per compose.override.yaml
-      # einhaengen - ohne sie sieht der Container nur seine eigenen Pakete.
-      # Rezept in docs/DOCKER.md, Abschnitt "Paketscan".
+      # schreiben und per compose.override.yaml zwei Dinge des Hosts
+      # einhaengen: das Verzeichnis /var/lib/dpkg (das ganze Verzeichnis, nicht
+      # nur die Datei - dpkg ersetzt "status" bei jedem Update per rename, ein
+      # Datei-Mount bliebe am alten Inode haengen) und /etc/os-release, aus
+      # der die Debian-Version des Hosts kommt. Ohne sie wuerde die Version
+      # dieses Images genommen, und das ist die falsche Suite, sobald der Pi
+      # nicht auf bookworm laeuft. Rezept in docs/DOCKER.md, "Paketscan".
       SECFEED_LOCAL: ${SECFEED_LOCAL:-0}
-      SECFEED_DPKG_STATUS: /host/dpkg-status
+      SECFEED_DPKG_STATUS: /host/dpkg/status
+      SECFEED_HOST_OS_RELEASE: /host/os-release
 
       # Zusaetzlich die Pakete der anderen Container pruefen. Leer = aus.
       # Zum Einschalten in der .env auf /host/containers setzen und das
