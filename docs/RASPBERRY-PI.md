@@ -394,6 +394,11 @@ Die Seite ist danach unter `http://<pi>:8080/` erreichbar. Was „akzeptieren"
 genau bedeutet, steht in [DOCKER.md](DOCKER.md#was-akzeptieren-bedeutet) — die
 Regeln sind für beide Betriebsarten dieselben.
 
+Das Passwort lässt sich unter `/admin` ändern; es liegt danach als Hash in
+`/var/lib/securityfeed/web-auth.json`, und der Wert in der env-Datei gilt nicht
+mehr. Details und das Zurücksetzen in [DOCKER.md](DOCKER.md#passwort-ändern) —
+auf dem Pi ohne Docker ist es `sudo rm /var/lib/securityfeed/web-auth.json`.
+
 ---
 
 ## Wenn etwas nicht klappt

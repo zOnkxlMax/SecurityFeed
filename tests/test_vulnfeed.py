@@ -2016,6 +2016,7 @@ class TestWebConfig(unittest.TestCase):
         self.assertEqual(cfg.accept_days, 90)
         self.assertEqual(cfg.decisions_path, os.path.join("/state", "decisions.json"))
         self.assertEqual(cfg.findings_path, os.path.join("/state", "findings.json"))
+        self.assertEqual(cfg.auth_path, os.path.join("/state", "web-auth.json"))
 
     def test_address_from_cli_beats_environment(self):
         cfg = self._cfg("--serve", "127.0.0.1:9000", SECFEED_WEB_LISTEN="0.0.0.0:1",
@@ -2116,6 +2117,70 @@ class TestAcceptanceSite(unittest.TestCase):
         self.assertIn("nicht mehr gemeldet", page)
         self.assertIn("weg 1.0", page)
 
+
+    def test_change_password_switches_the_login(self):
+        ok, message = self.site.change_password("max", "lang-genug", "neues-langes-passwort",
+                                                "neues-langes-passwort")
+        self.assertTrue(ok, message)
+        self.assertIsNone(self.site.authorized(self._auth()), "das alte Passwort gilt nicht mehr")
+        self.assertEqual(self.site.authorized(self._auth(password="neues-langes-passwort")), "max")
+        # zweimal - der zweite Aufruf kommt aus dem Merker, muss aber dasselbe ergeben
+        self.assertEqual(self.site.authorized(self._auth(password="neues-langes-passwort")), "max")
+        self.assertIsNone(self.site.authorized(self._auth(password="neues-langes-passwor")))
+        record = vf.read_json(self.site.auth_path)
+        self.assertEqual((record["user"], record["changed_by"]), ("max", "max"))
+        self.assertNotIn("neues-langes-passwort", open(self.site.auth_path, encoding="utf-8").read())
+        # ein neuer Server mit derselben Ablage kennt das neue Passwort auch
+        fresh = vf.AcceptanceSite(self.cfg)
+        self.assertEqual(fresh.authorized(self._auth(password="neues-langes-passwort")), "max")
+        self.assertIn("gespeichert in web-auth.json", fresh.admin_page())
+
+    def test_change_password_refuses_bad_input(self):
+        cases = {
+            "stimmt nicht": ("falsch", "neues-langes-passwort", "neues-langes-passwort"),
+            "Wiederholung": ("lang-genug", "neues-langes-passwort", "neues-langes-passwor"),
+            "mindestens": ("lang-genug", "kurz", "kurz"),
+            "Beispielwert": ("lang-genug", "aendere-mich", "aendere-mich"),
+            "das alte": ("lang-genug", "lang-genug", "lang-genug"),
+        }
+        for expected, (current, new, repeat) in cases.items():
+            ok, message = self.site.change_password("max", current, new, repeat)
+            self.assertFalse(ok, message)
+            self.assertIn(expected, message)
+        self.assertFalse(os.path.exists(self.site.auth_path), "nichts darf geschrieben worden sein")
+        self.assertEqual(self.site.authorized(self._auth()), "max")
+
+    def test_stored_password_of_another_user_is_ignored(self):
+        vf.write_json(self.site.auth_path, {"user": "anders", "changed_at": "2026-01-01T00:00:00+00:00",
+                                            "changed_by": "anders", **vf.hash_password("fremd-und-lang")})
+        self.assertEqual(self.site.authorized(self._auth()), "max", "es gilt die Umgebung")
+        self.assertIsNone(self.site.authorized(self._auth(password="fremd-und-lang")))
+        page = self.site.admin_page()
+        self.assertIn("anders", page)
+        self.assertIn("aus der Umgebung", page)
+
+    def test_broken_password_file_falls_back_to_environment(self):
+        with open(self.site.auth_path, "w", encoding="utf-8") as fh:
+            fh.write("{kaputt")
+        self.assertEqual(self.site.authorized(self._auth()), "max")
+        vf.write_json(self.site.auth_path, {"user": "max", "algorithm": "pbkdf2_sha256",
+                                            "iterations": "viele", "salt": "zz", "hash": "zz"})
+        self.assertIsNone(self.site.authorized(self._auth()),
+                          "eine unlesbare Datei fuer diesen Benutzer sperrt, statt die Umgebung zu oeffnen")
+
+    def test_admin_page_shows_source_and_form(self):
+        page = self.site.admin_page()
+        self.assertIn("Benutzer: max", page)
+        self.assertIn("aus der Umgebung", page)
+        self.assertIn('action="/admin/password"', page)
+        self.assertIn(self.site.form_token, page)
+        self.assertIn("SECFEED_ACCEPT_DAYS", page)
+        error = self.site.admin_page("<b>Fehler</b>", error=True)
+        self.assertIn('class="error"', error)
+        self.assertNotIn("<b>Fehler</b>", error)
+        self.assertIn("Verwaltung", self.site.page(), "die Hauptseite verweist auf die Verwaltung")
+
+
     def test_page_escapes_content(self):
         vf.save_findings(self.cfg.findings_path,
                          [entry(title="<script>alert(1)</script>", local=True,
@@ -2124,6 +2189,21 @@ class TestAcceptanceSite(unittest.TestCase):
         self.assertNotIn("<script>", page)
         self.assertNotIn("<img src=x>", page)
         self.assertIn("&lt;script&gt;", page)
+
+
+class TestPasswordHash(unittest.TestCase):
+    def test_roundtrip(self):
+        record = vf.hash_password("ein-langes-passwort", iterations=2000)
+        self.assertTrue(vf.verify_password("ein-langes-passwort", record))
+        self.assertFalse(vf.verify_password("ein-langes-passwor", record))
+        self.assertNotEqual(record["salt"], vf.hash_password("ein-langes-passwort", 2000)["salt"])
+        self.assertNotIn("ein-langes-passwort", json.dumps(record))
+
+    def test_broken_records_are_rejected_not_raised(self):
+        good = vf.hash_password("x" * 12, iterations=2000)
+        for broken in ({}, {"hash": "00"}, {**good, "salt": "kein-hex"},
+                       {**good, "iterations": 1}, {**good, "algorithm": "md5"}):
+            self.assertFalse(vf.verify_password("x" * 12, broken))
 
 
 class TestClientLabel(unittest.TestCase):
@@ -2167,10 +2247,11 @@ class TestWebServer(unittest.TestCase):
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.token = self.server.site.form_token
 
-    def _request(self, path: str, data: dict | None = None, auth: bool = True):
+    def _request(self, path: str, data: dict | None = None, auth: bool = True,
+                 password: str = "lang-genug"):
         headers = {}
         if auth:
-            headers["Authorization"] = "Basic " + base64.b64encode(b"max:lang-genug").decode()
+            headers["Authorization"] = "Basic " + base64.b64encode(f"max:{password}".encode()).decode()
         body = urllib.parse.urlencode(data).encode() if data is not None else None
         request = urllib.request.Request(self.base + path, data=body, headers=headers,
                                          method="POST" if data is not None else "GET")
@@ -2219,6 +2300,37 @@ class TestWebServer(unittest.TestCase):
                                                  "identity": self.finding.identity})
         self.assertEqual(status, 303)
         self.assertEqual(vf.load_decisions(self.cfg.decisions_path), {})
+
+
+    def test_admin_page_requires_login(self):
+        self.assertEqual(self._request("/admin", auth=False)[0], 401)
+        status, body, _ = self._request("/admin")
+        self.assertEqual(status, 200)
+        self.assertIn("Passwort aendern", body)
+
+    def test_change_password_over_http(self):
+        status, body, _ = self._request("/admin/password", {
+            "token": self.token, "current": "lang-genug",
+            "new": "neues-langes-passwort", "repeat": "neues-langes-passwort",
+        })
+        self.assertEqual(status, 200, "direkt beantwortet, keine Umleitung")
+        self.assertIn("Passwort geaendert", body)
+        self.assertEqual(self._request("/")[0], 401, "das alte Passwort ist weg")
+        self.assertEqual(self._request("/", password="neues-langes-passwort")[0], 200)
+        self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "web-auth.json")))
+
+    def test_change_password_needs_token_and_old_password(self):
+        status, _, _ = self._request("/admin/password", {
+            "current": "lang-genug", "new": "neues-langes-passwort", "repeat": "neues-langes-passwort",
+        })
+        self.assertEqual(status, 403)
+        status, body, _ = self._request("/admin/password", {
+            "token": self.token, "current": "geraten",
+            "new": "neues-langes-passwort", "repeat": "neues-langes-passwort",
+        })
+        self.assertEqual(status, 200)
+        self.assertIn('class="error"', body)
+        self.assertEqual(self._request("/")[0], 200, "das Passwort ist unveraendert")
 
     def test_post_without_login_is_rejected_before_anything_else(self):
         status, _, _ = self._request("/accept", {"token": self.token,

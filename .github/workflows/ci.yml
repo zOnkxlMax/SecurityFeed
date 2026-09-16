@@ -101,6 +101,43 @@ jobs:
           grep -q '"by": "ci"' /tmp/sf-state/decisions.json
           curl -fs -u ci:ci-geheim-123 http://127.0.0.1:8099/ | grep -q 'Offene Funde (0)'
 
+          # Verwaltung: nur angemeldet, Passwortwechsel braucht Token und altes Passwort
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/admin)" = "401"
+          curl -fs -u ci:ci-geheim-123 http://127.0.0.1:8099/admin > /tmp/admin.html
+          grep -q 'Passwort aendern' /tmp/admin.html
+          grep -q 'aus der Umgebung' /tmp/admin.html
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u ci:ci-geheim-123 -X POST \
+                 --data-urlencode 'current=ci-geheim-123' \
+                 --data-urlencode 'new=ci-neu-und-lang-456' --data-urlencode 'repeat=ci-neu-und-lang-456' \
+                 http://127.0.0.1:8099/admin/password)" = "403"
+          curl -s -u ci:ci-geheim-123 -X POST \
+                 --data-urlencode "token=$token" --data-urlencode 'current=geraten' \
+                 --data-urlencode 'new=ci-neu-und-lang-456' --data-urlencode 'repeat=ci-neu-und-lang-456' \
+                 http://127.0.0.1:8099/admin/password | grep -q 'class="error"'
+          test ! -f /tmp/sf-state/web-auth.json
+
+          # Echter Wechsel: altes Passwort sperrt, neues oeffnet, Klartext liegt nirgends
+          curl -s -u ci:ci-geheim-123 -X POST \
+                 --data-urlencode "token=$token" --data-urlencode 'current=ci-geheim-123' \
+                 --data-urlencode 'new=ci-neu-und-lang-456' --data-urlencode 'repeat=ci-neu-und-lang-456' \
+                 http://127.0.0.1:8099/admin/password | grep -q 'Passwort geaendert'
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u ci:ci-geheim-123 http://127.0.0.1:8099/)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u ci:ci-neu-und-lang-456 http://127.0.0.1:8099/)" = "200"
+          test -f /tmp/sf-state/web-auth.json
+          ! grep -q 'ci-neu-und-lang-456' /tmp/sf-state/web-auth.json
+          grep -q '"user": "ci"' /tmp/sf-state/web-auth.json
+          grep -q 'pbkdf2_sha256' /tmp/sf-state/web-auth.json
+          curl -fs -u ci:ci-neu-und-lang-456 http://127.0.0.1:8099/admin | grep -q 'gespeichert in web-auth.json'
+
+          # Ein neu gestarteter Server mit derselben Ablage kennt nur das neue Passwort -
+          # das aus der Umgebung ist ab jetzt nur noch der Startwert.
+          SECFEED_WEB_USER=ci SECFEED_WEB_PASSWORD=ci-geheim-123 \
+            python vulnfeed.py --serve 127.0.0.1:8097 --state /tmp/sf-state/seen.json &
+          for i in $(seq 1 30); do curl -fs http://127.0.0.1:8097/health >/dev/null && break; sleep 0.5; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u ci:ci-geheim-123 http://127.0.0.1:8097/)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u ci:ci-neu-und-lang-456 http://127.0.0.1:8097/)" = "200"
+          kill %2
+
           # Beispielpasswort wird abgewiesen
           set +e
           SECFEED_WEB_USER=ci SECFEED_WEB_PASSWORD=aendere-mich python vulnfeed.py --serve 127.0.0.1:8098

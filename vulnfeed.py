@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import hashlib
 import hmac
 import html
 import http.client
@@ -1858,7 +1859,16 @@ def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
 
 FINDINGS_FILE = "findings.json"
 DECISIONS_FILE = "decisions.json"
+# Ein ueber die Seite geaendertes Passwort. Liegt die Datei vor, gilt sie
+# statt SECFEED_WEB_PASSWORD - die Umgebung ist nur noch der Startwert.
+WEB_AUTH_FILE = "web-auth.json"
 ACCEPT_DAYS_DEFAULT = 90
+PASSWORD_MIN_LENGTH = 12
+# PBKDF2-SHA256 aus der Standardbibliothek, ohne Abhaengigkeit. Die Zahl
+# folgt der OWASP-Empfehlung; auf dem Pi kostet ein Abgleich damit einen
+# Sekundenbruchteil, und die Seite merkt sich ein bestaetigtes Passwort, damit
+# nicht jede Anfrage neu rechnet.
+PBKDF2_ITERATIONS = 600_000
 
 # Werte aus den Beispieldateien. Ein Passwort, das in einem oeffentlichen
 # Repo steht, ist keins.
@@ -1870,6 +1880,34 @@ PLACEHOLDER_PASSWORDS = frozenset({
 def state_sibling(state_path: str | None, name: str) -> str:
     """Datei im selben Verzeichnis wie seen.json."""
     return os.path.join(os.path.dirname(state_path or default_state_path()), name)
+
+
+def hash_password(password: str, iterations: int = PBKDF2_ITERATIONS) -> dict:
+    """Salz und Hash fuer die Passwortdatei. Das Passwort selbst wird nie
+    gespeichert."""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return {
+        "algorithm": "pbkdf2_sha256",
+        "iterations": iterations,
+        "salt": salt.hex(),
+        "hash": digest.hex(),
+    }
+
+
+def verify_password(password: str, record: dict) -> bool:
+    """Stimmt das Passwort mit dem gespeicherten Hash ueberein? Eine kaputte
+    oder fremde Datei zaehlt als 'nein', nicht als Absturz."""
+    try:
+        iterations = int(record["iterations"])
+        salt = bytes.fromhex(str(record["salt"]))
+        expected = bytes.fromhex(str(record["hash"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if record.get("algorithm") != "pbkdf2_sha256" or not 1_000 <= iterations <= 10_000_000:
+        return False
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return hmac.compare_digest(digest, expected)
 
 
 @dataclass
@@ -1953,6 +1991,7 @@ class WebConfig:
     findings_path: str
     decisions_path: str
     accept_days: int = ACCEPT_DAYS_DEFAULT  # Vorbelegung des Ablaufdatums
+    auth_path: str = ""  # leer = neben decisions.json
 
 
 def web_config_from_env(args: argparse.Namespace, state_path: str | None) -> WebConfig:
@@ -1984,6 +2023,7 @@ def web_config_from_env(args: argparse.Namespace, state_path: str | None) -> Web
         findings_path=state_sibling(state_path, FINDINGS_FILE),
         decisions_path=state_sibling(state_path, DECISIONS_FILE),
         accept_days=days,
+        auth_path=state_sibling(state_path, WEB_AUTH_FILE),
     )
 
 
@@ -1998,6 +2038,12 @@ class AcceptanceSite:
         # Browser bei jeder Anfrage mit - eine fremde Seite im selben Netz
         # koennte ihn sonst Akzeptanzen abschicken lassen.
         self.form_token = secrets.token_urlsafe(24)
+        self.auth_path = cfg.auth_path or os.path.join(
+            os.path.dirname(cfg.decisions_path), WEB_AUTH_FILE)
+        # Zuletzt bestaetigtes Passwort als (Hash aus der Datei, SHA-256 des
+        # Passworts). Basic Auth kommt mit jeder Anfrage - ohne den Merker
+        # wuerde jeder Seitenaufruf die volle PBKDF2-Rechnung kosten.
+        self._verified: tuple[str, bytes] | None = None
 
     # -- Anmeldung -----------------------------------------------------------
 
@@ -2015,8 +2061,78 @@ class AcceptanceSite:
         # Beide Vergleiche immer ausfuehren - sonst verraet die Antwortzeit,
         # ob der Benutzername stimmt.
         user_ok = hmac.compare_digest(user.encode("utf-8"), self.cfg.user.encode("utf-8"))
-        pass_ok = hmac.compare_digest(password.encode("utf-8"), self.cfg.password.encode("utf-8"))
+        pass_ok = self.check_password(password)
         return user if (user_ok and pass_ok) else None
+
+    def stored_credential(self) -> dict | None:
+        """Inhalt der Passwortdatei, falls sie zum konfigurierten Benutzer
+        gehoert. Wurde der Benutzer in der Umgebung umbenannt, zaehlt die Datei
+        nicht mehr - sonst kaeme man mit dem alten Passwort nicht mehr hinein
+        und auch nicht mit dem neuen."""
+        record = read_json(self.auth_path)
+        if not record or record.get("user") != self.cfg.user:
+            return None
+        return record
+
+    def check_password(self, password: str) -> bool:
+        record = self.stored_credential()
+        if record is None:
+            return hmac.compare_digest(password.encode("utf-8"),
+                                       self.cfg.password.encode("utf-8"))
+        fingerprint = hashlib.sha256(password.encode("utf-8")).digest()
+        with self.lock:
+            cached = self._verified
+        if cached and cached[0] == record.get("hash") and hmac.compare_digest(cached[1], fingerprint):
+            return True
+        if not verify_password(password, record):
+            return False
+        with self.lock:
+            self._verified = (str(record.get("hash")), fingerprint)
+        return True
+
+    def password_source(self) -> dict:
+        """Woher das gueltige Passwort kommt - fuer die Verwaltungsseite."""
+        record = read_json(self.auth_path)
+        if not record:
+            return {"source": "env"}
+        if record.get("user") != self.cfg.user:
+            return {"source": "env", "file_user": str(record.get("user", ""))}
+        return {
+            "source": "file",
+            "changed_at": parse_date(record.get("changed_at")),
+            "changed_by": str(record.get("changed_by", "")),
+        }
+
+    def change_password(self, by: str, current: str, new: str, repeat: str) -> tuple[bool, str]:
+        """(gelungen, Meldung). Prueft erst das alte Passwort - wer den Browser
+        eines angemeldeten Benutzers vor sich hat, soll damit nicht das
+        Passwort tauschen koennen."""
+        if not self.check_password(current):
+            return False, "Das aktuelle Passwort stimmt nicht."
+        if new != repeat:
+            return False, "Die Wiederholung stimmt nicht mit dem neuen Passwort ueberein."
+        if new == current:
+            return False, "Das neue Passwort ist das alte."
+        if len(new) < PASSWORD_MIN_LENGTH:
+            return False, f"Das neue Passwort braucht mindestens {PASSWORD_MIN_LENGTH} Zeichen."
+        if new.strip().lower() in PLACEHOLDER_PASSWORDS:
+            return False, "Das ist ein Beispielwert, kein Passwort."
+        record = {
+            "user": self.cfg.user,
+            "changed_at": datetime.now(timezone.utc).isoformat(),
+            "changed_by": by,
+            **hash_password(new),
+        }
+        with self.lock:
+            write_json(self.auth_path, record)
+            try:
+                os.chmod(self.auth_path, 0o600)
+            except OSError:
+                pass  # z.B. Windows - der Hash ist auch so nicht das Passwort
+            self._verified = None
+        log(f"Passwort geaendert durch {by} (Ablage {self.auth_path}).")
+        return True, ("Passwort geaendert. Beim naechsten Aufruf fragt der Browser "
+                      "nach dem neuen Passwort.")
 
     # -- Entscheidungen ------------------------------------------------------
 
@@ -2133,32 +2249,10 @@ class AcceptanceSite:
                     f'gueltig bis {until}{comment}</div>')
 
         parts = [
-            "<!doctype html><html lang=\"de\"><head><meta charset=\"utf-8\">",
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
-            "<title>SecurityFeed</title><style>",
-            "body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;",
-            "max-width:860px;margin:0 auto;padding:16px 20px;color:#1a1a1a;background:#fafafa}",
-            "h1{font-size:22px;margin:0 0 4px} h2{font-size:17px;margin:32px 0 12px;",
-            "border-bottom:1px solid #ddd;padding-bottom:4px}",
-            ".muted{color:#777;font-size:13px} .meta{color:#666;font-size:13px;margin:4px 0}",
-            ".item{background:#fff;border-left:3px solid #c81e1e;padding:10px 14px;",
-            "margin:0 0 14px;border-radius:0 4px 4px 0;box-shadow:0 1px 2px rgba(0,0,0,.06)}",
-            ".item.ok{border-left-color:#9aa} .item.news{border-left-color:#1a4fa0}",
-            ".item a{color:#1a4fa0;text-decoration:none;font-weight:600;font-size:16px}",
-            ".item .title{font-weight:600;font-size:16px}",
-            ".cves{margin:6px 0} .cve{display:inline-block;background:#fde8e8;color:#9b1c1c;",
-            "border-radius:3px;padding:1px 6px;margin:0 4px 4px 0;font-size:12px;font-family:monospace}",
-            ".summary{font-size:14px;line-height:1.5;margin:6px 0}",
-            "form.accept{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;",
-            "margin-top:8px;font-size:13px} form.accept input{margin-left:4px}",
-            "form.accept input[name=comment]{width:260px;max-width:100%}",
-            "button{background:#1a4fa0;color:#fff;border:0;border-radius:3px;padding:6px 12px;",
-            "cursor:pointer} form.revoke button{background:#888}",
-            ".message{background:#e6f4ea;border-left:3px solid #2e7d32;padding:8px 14px;margin:12px 0}",
-            ".warn{background:#fff8e1;border-left:3px solid #f0ad4e;padding:8px 14px;margin:12px 0}",
-            "</style></head><body>",
+            web_head("SecurityFeed"),
             "<h1>SecurityFeed</h1>",
-            f'<div class="muted">Stand: {esc(stand)} &middot; {esc(str(data.get("subtitle", "")))}</div>',
+            f'<div class="muted">Stand: {esc(stand)} &middot; {esc(str(data.get("subtitle", "")))}'
+            ' &middot; <a href="/admin">Verwaltung</a></div>',
         ]
         if message:
             parts.append(f'<div class="message">{esc(message)}</div>')
@@ -2233,6 +2327,109 @@ class AcceptanceSite:
         parts.append("</body></html>")
         return "".join(parts)
 
+    def admin_page(self, message: str = "", error: bool = False) -> str:
+        """Verwaltung: Anmeldung und Passwort. Bewusst schlicht - ein Benutzer,
+        ein Passwort, und die Einstellungen nur zum Nachsehen."""
+        esc = html.escape
+        source = self.password_source()
+        if source["source"] == "file":
+            at = source["changed_at"]
+            when = at.astimezone().strftime("%d.%m.%Y %H:%M") if at else "unbekannt"
+            origin = (f"geaendert am {esc(when)} von {esc(source['changed_by'])}, "
+                      f"gespeichert in {esc(os.path.basename(self.auth_path))}. "
+                      "SECFEED_WEB_PASSWORD aus der Umgebung gilt nicht mehr.")
+        else:
+            origin = "aus der Umgebung (SECFEED_WEB_PASSWORD)."
+
+        parts = [
+            web_head("SecurityFeed - Verwaltung"),
+            "<h1>SecurityFeed &middot; Verwaltung</h1>",
+            '<div class="muted"><a href="/">Zurueck zu den Funden</a></div>',
+        ]
+        if message:
+            parts.append(f'<div class="{"error" if error else "message"}">{esc(message)}</div>')
+        if source.get("file_user"):
+            parts.append('<div class="warn"><strong>Hinweis:</strong> Die Passwortdatei gehoert zu '
+                         f'Benutzer &bdquo;{esc(source["file_user"])}&ldquo;, angemeldet wird aber '
+                         f'&bdquo;{esc(self.cfg.user)}&ldquo; aus der Umgebung. Es gilt deshalb das '
+                         'Passwort aus der Umgebung; eine Aenderung hier ersetzt die Datei.</div>')
+
+        parts.append("<h2>Anmeldung</h2>")
+        parts.append(
+            '<div class="item ok">'
+            f'<div class="title">Benutzer: {esc(self.cfg.user)}</div>'
+            f'<div class="meta">Passwort {origin}</div>'
+            '<form method="post" action="/admin/password" class="password">'
+            f'<input type="hidden" name="token" value="{esc(self.form_token)}">'
+            '<label>Aktuelles Passwort<input type="password" name="current" required '
+            'autocomplete="current-password"></label>'
+            f'<label>Neues Passwort<input type="password" name="new" required '
+            f'minlength="{PASSWORD_MIN_LENGTH}" autocomplete="new-password"></label>'
+            '<label>Neues Passwort wiederholen<input type="password" name="repeat" required '
+            'autocomplete="new-password"></label>'
+            '<div><button type="submit">Passwort aendern</button></div>'
+            '</form>'
+            f'<p class="muted">Mindestens {PASSWORD_MIN_LENGTH} Zeichen. Der Benutzername bleibt '
+            'SECFEED_WEB_USER aus der Umgebung. Nach der Aenderung fragt der Browser beim '
+            'naechsten Aufruf nach dem neuen Passwort. Zuruecksetzen auf das Passwort aus der '
+            f'Umgebung: die Datei {esc(os.path.basename(self.auth_path))} im '
+            'Zustandsverzeichnis loeschen.</p>'
+            '</div>'
+        )
+
+        parts.append("<h2>Einstellungen</h2>")
+        parts.append(
+            '<div class="item ok"><table class="settings">'
+            f'<tr><th>Vorbelegung Ablaufdatum</th><td>{self.cfg.accept_days} Tage '
+            '(SECFEED_ACCEPT_DAYS)</td></tr>'
+            f'<tr><th>Funde</th><td>{esc(self.cfg.findings_path)}</td></tr>'
+            f'<tr><th>Akzeptanzen</th><td>{esc(self.cfg.decisions_path)}</td></tr>'
+            f'<tr><th>Passwortdatei</th><td>{esc(self.auth_path)}</td></tr>'
+            '</table><p class="muted">Aenderungen daran gehen ueber die .env und einen Neustart '
+            'des Containers bzw. Dienstes.</p></div>'
+        )
+        parts.append(f'<p class="muted" style="margin-top:32px">SecurityFeed {__version__}</p>')
+        parts.append("</body></html>")
+        return "".join(parts)
+
+
+def web_head(title: str) -> str:
+    """Kopf samt Stil, gemeinsam fuer alle Seiten."""
+    return "".join([
+        "<!doctype html><html lang=\"de\"><head><meta charset=\"utf-8\">",
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+        f"<title>{html.escape(title)}</title><style>",
+        "body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;",
+        "max-width:860px;margin:0 auto;padding:16px 20px;color:#1a1a1a;background:#fafafa}",
+        "h1{font-size:22px;margin:0 0 4px} h2{font-size:17px;margin:32px 0 12px;",
+        "border-bottom:1px solid #ddd;padding-bottom:4px}",
+        ".muted{color:#777;font-size:13px} .meta{color:#666;font-size:13px;margin:4px 0}",
+        ".muted a{color:#1a4fa0}",
+        ".item{background:#fff;border-left:3px solid #c81e1e;padding:10px 14px;",
+        "margin:0 0 14px;border-radius:0 4px 4px 0;box-shadow:0 1px 2px rgba(0,0,0,.06)}",
+        ".item.ok{border-left-color:#9aa} .item.news{border-left-color:#1a4fa0}",
+        ".item a{color:#1a4fa0;text-decoration:none;font-weight:600;font-size:16px}",
+        ".item .title{font-weight:600;font-size:16px}",
+        ".cves{margin:6px 0} .cve{display:inline-block;background:#fde8e8;color:#9b1c1c;",
+        "border-radius:3px;padding:1px 6px;margin:0 4px 4px 0;font-size:12px;font-family:monospace}",
+        ".summary{font-size:14px;line-height:1.5;margin:6px 0}",
+        "form.accept{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;",
+        "margin-top:8px;font-size:13px} form.accept input{margin-left:4px}",
+        "form.accept input[name=comment]{width:260px;max-width:100%}",
+        "form.password{display:grid;gap:10px;max-width:360px;margin-top:12px;font-size:13px}",
+        "form.password label{display:grid;gap:3px} form.password input{padding:6px;font-size:14px}",
+        "table.settings{border-collapse:collapse;font-size:14px}",
+        "table.settings th{text-align:left;padding:4px 16px 4px 0;font-weight:600;",
+        "vertical-align:top;white-space:nowrap} table.settings td{padding:4px 0;",
+        "font-family:monospace;font-size:13px;word-break:break-all}",
+        "button{background:#1a4fa0;color:#fff;border:0;border-radius:3px;padding:6px 12px;",
+        "cursor:pointer} form.revoke button{background:#888}",
+        ".message{background:#e6f4ea;border-left:3px solid #2e7d32;padding:8px 14px;margin:12px 0}",
+        ".error{background:#fde8e8;border-left:3px solid #c81e1e;padding:8px 14px;margin:12px 0}",
+        ".warn{background:#fff8e1;border-left:3px solid #f0ad4e;padding:8px 14px;margin:12px 0}",
+        "</style></head><body>",
+    ])
+
 
 def client_label(forwarded_for: str | None, peer: str) -> str:
     """Absender fuers Log. Hinter einem Reverse Proxy ist der Peer immer der
@@ -2285,13 +2482,13 @@ class AcceptanceHandler(BaseHTTPRequestHandler):
             # Ohne Anmeldung, damit ein Healthcheck nicht das Passwort braucht.
             self._send(200, "ok", "text/plain; charset=utf-8")
             return
-        if path != "/":
+        if path not in ("/", "/admin"):
             self._send(404, "Nicht gefunden.", "text/plain; charset=utf-8")
             return
         if self._require_user() is None:
             return
         message = urllib.parse.parse_qs(query).get("m", [""])[0]
-        self._send(200, self.site.page(message))
+        self._send(200, self.site.admin_page(message) if path == "/admin" else self.site.page(message))
 
     def do_HEAD(self) -> None:
         self.do_GET()
@@ -2320,6 +2517,14 @@ class AcceptanceHandler(BaseHTTPRequestHandler):
             message = self.site.accept(field("identity"), user, field("comment"), field("until"))
         elif self.path == "/revoke":
             message = self.site.revoke(field("identity"), user)
+        elif self.path == "/admin/password":
+            ok, message = self.site.change_password(user, field("current"), field("new"),
+                                                    field("repeat"))
+            # Direkt antworten statt umleiten: nach dem Wechsel wuerde der
+            # Browser die Umleitung noch mit dem alten Passwort abrufen und
+            # nur ein 401 saehe - die Meldung ginge verloren.
+            self._send(200, self.site.admin_page(message, error=not ok))
+            return
         else:
             self._send(404, "Nicht gefunden.", "text/plain; charset=utf-8")
             return
@@ -2335,8 +2540,11 @@ def start_web(cfg: WebConfig) -> ThreadingHTTPServer:
     server.site = AcceptanceSite(cfg)  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, name="web", daemon=True)
     thread.start()
+    site: AcceptanceSite = server.site  # type: ignore[attr-defined]
+    source = "Passwort aus der Datei" if site.password_source()["source"] == "file" \
+        else "Passwort aus der Umgebung"
     log(f"Webseite: http://{cfg.host}:{server.server_address[1]}/ "
-        f"(Anmeldung als '{cfg.user}', Akzeptanzen in {cfg.decisions_path}).")
+        f"(Anmeldung als '{cfg.user}', {source}, Akzeptanzen in {cfg.decisions_path}).")
     return server
 
 

@@ -89,10 +89,11 @@ Siehe Abschnitt [Paketscan](#paketscan-was-steckt-hier-drin) weiter unten.
 | ------------------- | ------------------------ | -------------------------------------- |
 | `--serve [HOST:PORT]` | `SECFEED_WEB_LISTEN`   | Seite mit den Funden anbieten, auf der sie sich akzeptieren lassen (Default `0.0.0.0:8080`) |
 | `--web-user`        | `SECFEED_WEB_USER`       | Benutzername für die Anmeldung          |
-| —                   | `SECFEED_WEB_PASSWORD`   | Passwort, nur als Umgebungsvariable     |
+| —                   | `SECFEED_WEB_PASSWORD`   | Startpasswort, nur als Umgebungsvariable. Über die Seite geändert, liegt es danach als Hash in `web-auth.json` im Zustandsverzeichnis und die Variable gilt nicht mehr |
 | —                   | `SECFEED_ACCEPT_DAYS`    | Vorbelegung des Ablaufdatums (Default 90) |
 
-Akzeptierte Funde fallen aus Mail und Wiedervorlage, bis ihr Ablaufdatum
+Unter `/admin` liegt die Verwaltung: dort lässt sich das Passwort ändern, ohne
+die `.env` anzufassen. Akzeptierte Funde fallen aus Mail und Wiedervorlage, bis ihr Ablaufdatum
 erreicht ist. Eine Akzeptanz gilt für genau diesen Stand des Funds — kommt eine
 neue Lücke dazu, wird er wieder gemeldet. Die Seite hat Basic Auth, aber selbst
 kein TLS: nur im eigenen Netz betreiben — oder hinter einen Reverse Proxy wie
