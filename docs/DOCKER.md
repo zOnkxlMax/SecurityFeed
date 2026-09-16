@@ -274,18 +274,34 @@ verwundbaren Version vorliegt. Meldungen, die dieses System wirklich betreffen,
 sind in der Mail dann eigens markiert.
 
 Der Container sieht seine eigenen Pakete, nicht die des Pi. Er braucht deshalb
-die Paketliste des Hosts. Zwei Handgriffe:
+die Paketliste des Hosts — und dessen Debian-Version. Zwei Handgriffe:
 
-**1. Paketliste einhängen** — über eine `compose.override.yaml`, damit die
-`compose.yaml` unverändert bleibt und `git pull` konfliktfrei durchläuft.
-Anders als `command` werden Volumes dabei ergänzt, nicht ersetzt:
+**1. Paketliste und Versionsdatei einhängen** — über eine
+`compose.override.yaml`, damit die `compose.yaml` unverändert bleibt und
+`git pull` konfliktfrei durchläuft. Anders als `command` werden Volumes dabei
+ergänzt, nicht ersetzt:
 
 ```yaml
 services:
   securityfeed:
     volumes:
-      - /var/lib/dpkg/status:/host/dpkg-status:ro
+      - /var/lib/dpkg:/host/dpkg:ro
+      - /etc/os-release:/host/os-release:ro
 ```
+
+Zwei Details daran sind Absicht:
+
+- **Das Verzeichnis `/var/lib/dpkg`, nicht nur die Datei `status`.** dpkg
+  ersetzt `status` bei jedem `apt`-Lauf durch eine neue Datei (schreiben,
+  dann umbenennen). Ein Mount nur der Datei bliebe am alten Inode hängen — der
+  Dauerbetriebs-Container würde nach einem `apt upgrade` weiter die Pakete von
+  vor dem Update melden, bis jemand ihn neu erzeugt. Beim Verzeichnis-Mount
+  sieht er die jeweils aktuelle Datei.
+- **`/etc/os-release` des Hosts.** Daraus kommt die Debian-Version, gegen die
+  verglichen wird. Ohne sie bliebe nur die Version des Container-Images, und
+  die ist falsch, sobald der Pi nicht auf derselben Suite läuft wie das Image
+  — dann würden gegen die falschen Fixversionen verglichen, still und ohne
+  Warnung. Fehlt der Mount, verweigert der Scan ausdrücklich, statt zu raten.
 
 **2. In der `.env` einschalten:**
 
@@ -299,14 +315,14 @@ Dann neu starten:
 docker compose up -d
 ```
 
-Die Datei wird **nur lesend** eingehängt, und es ist nur diese eine Datei. Sie
-enthält Name und Version jedes installierten Pakets — genau das, was der
-Abgleich braucht, und nichts weiter.
+Beides wird **nur lesend** eingehängt. `/var/lib/dpkg` enthält Name und Version
+jedes installierten Pakets, `/etc/os-release` die Distributionsversion — genau
+das, was der Abgleich braucht, und nichts weiter.
 
 Vorher ausprobieren, ohne den Dienst anzufassen:
 
 ```bash
-docker compose run --rm -v /var/lib/dpkg/status:/host/dpkg-status:ro securityfeed --once --no-state -s local --since 0
+docker compose run --rm -v /var/lib/dpkg:/host/dpkg:ro -v /etc/os-release:/host/os-release:ro securityfeed --once --no-state -s local --since 0
 ```
 
 Auf einem gepflegten Pi kommt hier wenig bis nichts zurück — das ist das
@@ -321,9 +337,13 @@ Zwei Dinge, die du wissen solltest:
   in der Debian-Datenbank und werden stillschweigend übergangen. Für den Kernel
   bleibt `sudo apt list --upgradable`.
 
-Wenn `SECFEED_LOCAL=1` gesetzt, der Mount aber vergessen wurde, steht in der
-Mail eine Warnung „Lokales System: dpkg-Statusdatei nicht lesbar
-(/host/dpkg-status)" — die übrigen Quellen laufen normal weiter.
+Wenn `SECFEED_LOCAL=1` gesetzt, der Mount aber vergessen wurde, trägt jede Mail
+im Betreff „(Warnung: 1 Quelle(n) nicht erreichbar)" und im Text „Lokales
+System: dpkg-Statusdatei nicht lesbar (/host/dpkg/status) …" — bei jedem Lauf,
+nicht nur einmal, und der Lauf endet mit Exit-Code 3. Das gilt auch dann, wenn
+die Container-Listen daneben einwandfrei geprüft werden: ein ungeprüfter Host
+soll nicht hinter grünen Containern verschwinden. Die übrigen Quellen laufen
+normal weiter.
 
 ### Auch die anderen Container prüfen
 
@@ -358,9 +378,15 @@ sudo systemctl start securityfeed-containers.service && ls -R /var/lib/securityf
 services:
   securityfeed:
     volumes:
-      - /var/lib/dpkg/status:/host/dpkg-status:ro
+      - /var/lib/dpkg:/host/dpkg:ro
+      - /etc/os-release:/host/os-release:ro
       - /var/lib/securityfeed/containers:/host/containers:ro
 ```
+
+Das Ablageverzeichnis gehört dem Benutzer mit UID 10001 — das ist der Benutzer
+im SecurityFeed-Container — und ist für niemanden sonst lesbar (`0750`/`0640`).
+Das Sammelskript setzt das selbst; die Inventarliste aller Container ist nichts,
+was jeder Benutzer auf dem Pi einsehen sollte.
 
 **3. In der `.env` einschalten:**
 

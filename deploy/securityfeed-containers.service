@@ -13,10 +13,16 @@ ExecStart=/opt/securityfeed/dump-container-packages.sh /var/lib/securityfeed/con
 
 TimeoutStartSec=300
 
-# Haertung, soweit es mit Docker-Zugriff geht.
+# Haertung, soweit es mit Docker-Zugriff geht. Schreiben darf das Skript nur
+# in die Ablage - und es muss den Docker-Socket erreichen; der liegt unter
+# /run, das ProtectSystem=strict sonst ebenfalls nur lesend einhaengt. Das
+# "-" laesst den jeweils nicht vorhandenen Pfad still aus.
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/securityfeed -/run/docker.sock -/var/run/docker.sock
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

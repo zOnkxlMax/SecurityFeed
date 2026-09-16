@@ -76,6 +76,7 @@ py -3 vulnfeed.py --cve-only --since 3
 | `--local`           | `SECFEED_LOCAL`          | Scan zusätzlich zu den News laufen lassen |
 | `--dpkg-status`     | `SECFEED_DPKG_STATUS`    | Statusdatei lesen statt `dpkg-query` aufzurufen |
 | `--container-lists` | `SECFEED_CONTAINER_LISTS` | Auch die abgelegten Paketlisten der Container prüfen |
+| `--host-os-release` | `SECFEED_HOST_OS_RELEASE` | `/etc/os-release` des Hosts, wenn dessen Paketliste eingehängt ist — daraus kommt die Debian-Version |
 | `--debian-release`  | `SECFEED_DEBIAN_RELEASE` | Debian-Hauptversion erzwingen, z. B. `12` |
 | `--local-remind N`  | `SECFEED_LOCAL_REMIND`   | Unveränderte Funde nach N Tagen erneut melden (Default 7, `0` = nur einmal) |
 | `--local-unfixed`   | `SECFEED_LOCAL_UNFIXED`  | Auch Lücken ohne verfügbares Update melden |
@@ -223,11 +224,15 @@ aus und muss mit `--local` bzw. `SECFEED_LOCAL=1` eingeschaltet werden.
 
 ### Im Container
 
-Dort gibt es kein `dpkg` des Hosts. Die Statusdatei read-only einhängen und
-darauf zeigen — Details in [docs/DOCKER.md](docs/DOCKER.md):
+Dort gibt es kein `dpkg` des Hosts. Das dpkg-Verzeichnis und die
+`/etc/os-release` des Hosts read-only einhängen und darauf zeigen — das
+Verzeichnis statt nur der Datei, weil dpkg `status` bei jedem Update per
+`rename` ersetzt und ein Datei-Mount am alten Inode hängen bliebe; die
+`os-release`, weil sonst die Version des Container-Images als die des Hosts
+gälte. Details in [docs/DOCKER.md](docs/DOCKER.md):
 
 ```bash
-docker compose run --rm -v /var/lib/dpkg/status:/host/dpkg-status:ro securityfeed --once -s local --dpkg-status /host/dpkg-status --since 0
+docker compose run --rm -v /var/lib/dpkg:/host/dpkg:ro -v /etc/os-release:/host/os-release:ro securityfeed --once -s local --dpkg-status /host/dpkg/status --host-os-release /host/os-release --since 0
 ```
 
 ### Die anderen Container mitprüfen

@@ -9,10 +9,17 @@
 # Container sieht nur noch Textdateien.
 #
 # Aufruf:
-#   sudo ./dump-container-packages.sh [ZIELVERZEICHNIS]
+#   sudo ./dump-container-packages.sh [ZIELVERZEICHNIS] [EIGENTUEMER]
 #
 # Default-Ziel: /var/lib/securityfeed/containers
+# Default-Eigentuemer: der Dienstbenutzer "securityfeed", falls es ihn gibt
+#   (systemd-Variante), sonst 10001:10001 - die UID im SecurityFeed-Container.
 # Geplant laeuft es ueber deploy/securityfeed-containers.timer.
+#
+# Die Ablage ist fuer niemanden sonst lesbar (0750/0640). Sie ist das
+# Paketinventar aller Container samt Versionen - eine fertige Zielliste, die
+# nicht jeder Benutzer auf dem Pi einsehen sollte. Der Leser braucht nur
+# Leserechte.
 #
 # Ablage je Container:
 #   <ziel>/<name>/status       dpkg-Statusdatei aus dem Container
@@ -23,6 +30,22 @@
 set -eu
 
 ZIEL="${1:-/var/lib/securityfeed/containers}"
+EIGENTUEMER="${2:-}"
+if [ -z "$EIGENTUEMER" ]; then
+    if getent passwd securityfeed >/dev/null 2>&1; then
+        EIGENTUEMER="securityfeed:securityfeed"
+    else
+        EIGENTUEMER="10001:10001"
+    fi
+fi
+
+# Datei an ihren endgueltigen Platz schieben und die Rechte setzen. docker cp
+# legt sie als root und 0644 ab - beides wird hier korrigiert.
+ablegen() {
+    mv "$1" "$2"
+    chmod 0640 "$2"
+    chown "$EIGENTUEMER" "$2"
+}
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "docker nicht gefunden - laeuft dieses Skript auf dem richtigen Host?" >&2
@@ -35,7 +58,8 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 mkdir -p "$ZIEL"
-chmod 0755 "$ZIEL"
+chmod 0750 "$ZIEL"
+chown "$EIGENTUEMER" "$ZIEL"
 
 # Das Verzeichnis wird in den SecurityFeed-Container gemountet - es darf hier
 # nicht ersetzt werden, sonst zeigt der Mount ins Leere. Deshalb wird alles an
@@ -46,7 +70,8 @@ LAUFEND=$(docker ps --format '{{.Names}}' | sort)
 for NAME in $LAUFEND; do
     VERZ="$ZIEL/$NAME"
     mkdir -p "$VERZ"
-    chmod 0755 "$VERZ"
+    chmod 0750 "$VERZ"
+    chown "$EIGENTUEMER" "$VERZ"
     rm -f "$VERZ/unsupported"
 
     # docker cp braucht keine Shell im Container und funktioniert deshalb auch
@@ -55,13 +80,11 @@ for NAME in $LAUFEND; do
     if docker cp -L "$NAME:/var/lib/dpkg/status" "$VERZ/status.neu" >/dev/null 2>&1; then
         ART="dpkg"
         rm -f "$VERZ/apk-installed"
-        mv "$VERZ/status.neu" "$VERZ/status"
-        chmod 0644 "$VERZ/status"
+        ablegen "$VERZ/status.neu" "$VERZ/status"
     elif docker cp -L "$NAME:/lib/apk/db/installed" "$VERZ/apk-installed.neu" >/dev/null 2>&1; then
         ART="apk"
         rm -f "$VERZ/status"
-        mv "$VERZ/apk-installed.neu" "$VERZ/apk-installed"
-        chmod 0644 "$VERZ/apk-installed"
+        ablegen "$VERZ/apk-installed.neu" "$VERZ/apk-installed"
     fi
     rm -f "$VERZ/status.neu" "$VERZ/apk-installed.neu"
 
@@ -69,8 +92,7 @@ for NAME in $LAUFEND; do
         # Ohne os-release fehlt die Distributionsversion, und ohne die wird
         # nicht geraten, sondern nicht geprueft.
         if docker cp -L "$NAME:/etc/os-release" "$VERZ/os-release.neu" >/dev/null 2>&1; then
-            mv "$VERZ/os-release.neu" "$VERZ/os-release"
-            chmod 0644 "$VERZ/os-release"
+            ablegen "$VERZ/os-release.neu" "$VERZ/os-release"
         else
             rm -f "$VERZ/os-release.neu" "$VERZ/os-release"
         fi
@@ -83,8 +105,8 @@ for NAME in $LAUFEND; do
         # durchzugehen.
         IMAGE=$(docker inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null || echo "unbekannt")
         printf 'keine Paketliste im Container gefunden, weder dpkg noch apk (Image: %s)\n' \
-            "$IMAGE" > "$VERZ/unsupported"
-        chmod 0644 "$VERZ/unsupported"
+            "$IMAGE" > "$VERZ/unsupported.neu"
+        ablegen "$VERZ/unsupported.neu" "$VERZ/unsupported"
         echo "$NAME: weder dpkg noch apk, als nicht pruefbar vermerkt"
     fi
 done
@@ -104,7 +126,7 @@ done
 
 # Zeitstempel zum Schluss: SecurityFeed warnt, wenn er zu alt wird - ein
 # stehengebliebener Timer darf nicht als "alles ruhig" durchgehen.
-: > "$ZIEL/updated"
-chmod 0644 "$ZIEL/updated"
+: > "$ZIEL/updated.neu"
+ablegen "$ZIEL/updated.neu" "$ZIEL/updated"
 
-echo "Fertig. Ablage: $ZIEL"
+echo "Fertig. Ablage: $ZIEL (Eigentuemer $EIGENTUEMER)"
