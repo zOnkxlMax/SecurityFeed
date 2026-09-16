@@ -1862,6 +1862,12 @@ DECISIONS_FILE = "decisions.json"
 # Ein ueber die Seite geaendertes Passwort. Liegt die Datei vor, gilt sie
 # statt SECFEED_WEB_PASSWORD - die Umgebung ist nur noch der Startwert.
 WEB_AUTH_FILE = "web-auth.json"
+# "Jetzt scannen" von der Seite: sie legt die Anforderung ab, der Scheduler
+# im Scanner holt sie ab und laeuft sofort. Zwei Container, ein Volume -
+# mehr Kopplung braucht es nicht, und die Seite bekommt keinen Scanner.
+SCAN_REQUEST_FILE = "scan-request.json"
+SCAN_STATUS_FILE = "scan-status.json"
+SCAN_POLL_SECONDS = 5
 ACCEPT_DAYS_DEFAULT = 90
 PASSWORD_MIN_LENGTH = 12
 # PBKDF2-SHA256 aus der Standardbibliothek, ohne Abhaengigkeit. Die Zahl
@@ -1880,6 +1886,53 @@ PLACEHOLDER_PASSWORDS = frozenset({
 def state_sibling(state_path: str | None, name: str) -> str:
     """Datei im selben Verzeichnis wie seen.json."""
     return os.path.join(os.path.dirname(state_path or default_state_path()), name)
+
+
+def request_scan(path: str, by: str) -> None:
+    write_json(path, {"by": by, "at": datetime.now(timezone.utc).isoformat()})
+
+
+def take_scan_request(path: str) -> dict | None:
+    """Anforderung abholen und loeschen - wer sie liest, fuehrt sie aus.
+    Geloescht wird vor dem Lauf, damit ein Absturz mittendrin nicht in einer
+    Endlosschleife aus Neustart und erneutem Lauf endet."""
+    request = read_json(path)
+    if not request:
+        return None
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return request
+
+
+def save_scan_status(path: str, state: str, reason: str, code: int | None = None) -> None:
+    """running/done/failed - die Seite zeigt es neben dem Stand an."""
+    write_json(path, {
+        "state": state,
+        "reason": reason,
+        "at": datetime.now(timezone.utc).isoformat(),
+        "code": code,
+    })
+
+
+def wait_for_next(stop: threading.Event, target: datetime,
+                  request_path: str | None) -> dict | None:
+    """Bis zum naechsten Termin schlafen, in Haeppchen: so wird eine
+    Zeitumstellung oder ein korrigierter Systemtakt bald neu bewertet, und
+    eine Anforderung von der Seite wartet nicht bis zur vollen Stunde.
+    Liefert die Anforderung, falls eine kam, sonst None (Termin oder Stop)."""
+    while not stop.is_set():
+        wait = (target - datetime.now().astimezone()).total_seconds()
+        if wait <= 0:
+            return None
+        if request_path:
+            request = take_scan_request(request_path)
+            if request:
+                return request
+        if stop.wait(min(wait, SCAN_POLL_SECONDS)):
+            return None
+    return None
 
 
 def hash_password(password: str, iterations: int = PBKDF2_ITERATIONS) -> dict:
@@ -2038,8 +2091,10 @@ class AcceptanceSite:
         # Browser bei jeder Anfrage mit - eine fremde Seite im selben Netz
         # koennte ihn sonst Akzeptanzen abschicken lassen.
         self.form_token = secrets.token_urlsafe(24)
-        self.auth_path = cfg.auth_path or os.path.join(
-            os.path.dirname(cfg.decisions_path), WEB_AUTH_FILE)
+        state_dir = os.path.dirname(cfg.decisions_path)
+        self.auth_path = cfg.auth_path or os.path.join(state_dir, WEB_AUTH_FILE)
+        self.request_path = os.path.join(state_dir, SCAN_REQUEST_FILE)
+        self.status_path = os.path.join(state_dir, SCAN_STATUS_FILE)
         # Zuletzt bestaetigtes Passwort als (Hash aus der Datei, SHA-256 des
         # Passworts). Basic Auth kommt mit jeder Anfrage - ohne den Merker
         # wuerde jeder Seitenaufruf die volle PBKDF2-Rechnung kosten.
@@ -2173,6 +2228,30 @@ class AcceptanceSite:
     def findings(self) -> dict:
         return read_json(self.cfg.findings_path)
 
+    # -- Scan anstossen ------------------------------------------------------
+
+    def scan_state(self) -> dict:
+        """pending: offene Anforderung oder None; status: letzter Stand des
+        Scanners (running/done/failed) oder {}."""
+        pending = read_json(self.request_path) or None
+        status = read_json(self.status_path)
+        return {"pending": pending, "status": status if status.get("state") else {}}
+
+    def request_scan(self, by: str) -> str:
+        with self.lock:
+            state = self.scan_state()
+            pending = state["pending"]
+            pending_at = parse_date(pending.get("at")) if pending else None
+            # Eine alte Anforderung, die niemand abholt, darf nicht ewig
+            # blockieren - dann laeuft der Scanner nicht, und die neue ersetzt sie.
+            if pending_at and datetime.now(timezone.utc) - pending_at < timedelta(minutes=10):
+                return "Ein Scan ist schon angefordert und wartet auf den Scanner."
+            if state["status"].get("state") == "running":
+                return "Ein Scan laeuft gerade - Seite gleich neu laden."
+            request_scan(self.request_path, by)
+        log(f"Scan angefordert durch {by}.")
+        return "Scan angefordert - der Scanner startet in wenigen Sekunden."
+
     def title_for(self, identity: str) -> str:
         for item in self.findings().get("entries", []):
             if isinstance(item, dict) and item.get("identity") == identity:
@@ -2180,6 +2259,37 @@ class AcceptanceSite:
         return ""
 
     # -- Seite ---------------------------------------------------------------
+
+    def scan_banner(self) -> tuple[str, bool]:
+        """(HTML fuer die Statuszeile, laeuft-gerade). Laeuft etwas, laedt die
+        Seite sich alle paar Sekunden selbst neu."""
+        esc = html.escape
+        state = self.scan_state()
+        pending, status = state["pending"], state["status"]
+        now = datetime.now(timezone.utc)
+        if pending:
+            at = parse_date(pending.get("at"))
+            by = esc(str(pending.get("by", "?")))
+            if at and now - at > timedelta(minutes=10):
+                return (f'<span class="pill warn">Anforderung von {by} um {when(at)} wurde nicht '
+                        'abgeholt &ndash; laeuft der Scanner im Dauerbetrieb?</span>', False)
+            return (f'<span class="pill busy">Scan angefordert von {by}'
+                    f'{" um " + when(at) if at else ""} &ndash; wartet auf den Scanner</span>', True)
+        kind = status.get("state")
+        at = parse_date(status.get("at"))
+        reason = esc(str(status.get("reason", "")))
+        if kind == "running":
+            return (f'<span class="pill busy">Scan laeuft{" seit " + when(at) if at else ""}'
+                    f' ({reason})</span>', True)
+        if kind == "failed":
+            return (f'<span class="pill warn">Letzter Lauf abgebrochen'
+                    f'{" um " + when(at) if at else ""} ({reason})</span>', False)
+        if kind == "done":
+            code = status.get("code")
+            note = "" if code in (0, None) else f", Exit-Code {esc(str(code))}"
+            return (f'<span class="pill quiet">Letzter Lauf: {reason}'
+                    f'{" um " + when(at) if at else ""}{note}</span>', False)
+        return "", False
 
     def page(self, message: str = "") -> str:
         esc = html.escape
@@ -2205,55 +2315,70 @@ class AcceptanceSite:
                    if identity in present and not acc.active(now)]
 
         updated = parse_date(data.get("updated"))
-        stand = updated.astimezone().strftime("%d.%m.%Y %H:%M") if updated else "noch kein Lauf"
+        stand = when(updated, with_date=True) if updated else "noch kein Lauf"
         default_until = (datetime.now() + timedelta(days=self.cfg.accept_days)).strftime("%Y-%m-%d")
+        token = esc(self.form_token)
 
         def cves_of(item: dict) -> str:
             cves = [c for c in item.get("cves", []) if isinstance(c, str)]
             shown = cves[:CVE_DISPLAY_CAP]
             tags = "".join(f'<span class="cve">{esc(c)}</span>' for c in shown)
             if len(cves) > len(shown):
-                tags += f'<span class="muted">+{len(cves) - len(shown)} weitere</span>'
+                tags += f'<span class="cve more">+{len(cves) - len(shown)} weitere</span>'
             return f'<div class="cves">{tags}</div>' if tags else ""
 
         def headline(item: dict) -> str:
             title, link = esc(str(item.get("title", ""))), str(item.get("link") or "")
-            return f'<a href="{esc(link)}">{title}</a>' if link else title
+            if link:
+                return f'<a class="title" href="{esc(link)}" rel="noopener">{title}</a>'
+            return f'<div class="title">{title}</div>'
+
+        def source_of(item: dict) -> str:
+            return f'<span class="pill src">{esc(str(item.get("source", "")))}</span>'
 
         def accept_form(item: dict) -> str:
             return (
                 '<form method="post" action="/accept" class="accept">'
-                f'<input type="hidden" name="token" value="{esc(self.form_token)}">'
+                f'<input type="hidden" name="token" value="{token}">'
                 f'<input type="hidden" name="identity" value="{esc(str(item.get("identity")))}">'
-                '<label>Grund <input name="comment" maxlength="500" '
+                '<label><span>Grund</span><input name="comment" maxlength="500" '
                 'placeholder="z.B. Dienst nicht von aussen erreichbar"></label>'
-                f'<label>Bis <input type="date" name="until" value="{default_until}"></label>'
-                '<button type="submit">Akzeptieren</button>'
-                '<span class="muted">Ablaufdatum leer lassen = unbefristet</span>'
+                f'<label><span>Bis</span><input type="date" name="until" value="{default_until}"></label>'
+                '<button type="submit" class="primary">Akzeptieren</button>'
+                '<span class="hint">Datum leer lassen = unbefristet</span>'
                 '</form>'
             )
 
-        def revoke_form(identity: str) -> str:
+        def revoke_form(identity: str, label: str = "Widerrufen") -> str:
             return (
                 '<form method="post" action="/revoke" class="revoke">'
-                f'<input type="hidden" name="token" value="{esc(self.form_token)}">'
+                f'<input type="hidden" name="token" value="{token}">'
                 f'<input type="hidden" name="identity" value="{esc(identity)}">'
-                '<button type="submit">Widerrufen</button></form>'
+                f'<button type="submit" class="ghost">{label}</button></form>'
             )
 
         def acceptance_meta(acc: Acceptance) -> str:
-            until = acc.until.astimezone().strftime("%d.%m.%Y") if acc.until else "unbefristet"
-            at = acc.at.astimezone().strftime("%d.%m.%Y %H:%M")
-            comment = f" &middot; {esc(acc.comment)}" if acc.comment else ""
-            return (f'<div class="meta">akzeptiert von {esc(acc.by)} am {at}, '
-                    f'gueltig bis {until}{comment}</div>')
+            until = when(acc.until, with_date=True) if acc.until else "unbefristet"
+            comment = f' &middot; &bdquo;{esc(acc.comment)}&ldquo;' if acc.comment else ""
+            return (f'<div class="meta">Akzeptiert von <b>{esc(acc.by)}</b> am '
+                    f'{when(acc.at, with_date=True)}, gueltig bis {until}{comment}</div>')
+
+        banner, busy = self.scan_banner()
+        scan_button = ('<button type="submit" class="primary" disabled>Scan laeuft &hellip;</button>'
+                       if busy else '<button type="submit" class="primary">Jetzt scannen</button>')
 
         parts = [
-            web_head("SecurityFeed"),
-            "<h1>SecurityFeed</h1>",
-            f'<div class="muted">Stand: {esc(stand)} &middot; {esc(str(data.get("subtitle", "")))}'
-            ' &middot; <a href="/admin">Verwaltung</a></div>',
+            web_head("SecurityFeed", refresh=10 if busy else None),
+            page_header("findings"),
+            '<div class="toolbar">',
+            f'<div class="stand">Stand <b>{esc(stand)}</b>'
+            f'{" &middot; " + esc(str(data.get("subtitle", ""))) if data.get("subtitle") else ""}</div>',
+            f'<form method="post" action="/scan" class="scan">'
+            f'<input type="hidden" name="token" value="{token}">{scan_button}</form>',
+            '</div>',
         ]
+        if banner:
+            parts.append(f'<div class="scanline">{banner}</div>')
         if message:
             parts.append(f'<div class="message">{esc(message)}</div>')
         failed = [f for f in data.get("failed", []) if isinstance(f, str)]
@@ -2262,69 +2387,81 @@ class AcceptanceSite:
                          'beim letzten Lauf nicht erreichbar:<ul>'
                          + "".join(f"<li>{esc(f)}</li>" for f in failed) + "</ul></div>")
 
-        parts.append(f"<h2>Offene Funde ({len(open_findings)})</h2>")
+        total_accepted = len(accepted_findings) + len(orphaned) + len(expired)
+        parts.append(
+            '<div class="stats">'
+            f'<a href="#offen" class="stat {"danger" if open_findings else "calm"}">'
+            f'<b>{len(open_findings)}</b><span>Offene Funde</span></a>'
+            f'<a href="#meldungen" class="stat info"><b>{len(news)}</b><span>Meldungen zum System</span></a>'
+            f'<a href="#akzeptiert" class="stat ok"><b>{total_accepted}</b><span>Akzeptiert</span></a>'
+            f'<div class="stat quiet"><b>{len(notes)}</b><span>Nicht pruefbar</span></div>'
+            '</div>'
+        )
+
+        parts.append(f'<h2 id="offen">Offene Funde ({len(open_findings)})</h2>')
         if not open_findings:
-            parts.append('<p class="muted">Keine offenen Funde.</p>')
+            parts.append('<div class="empty">Keine offenen Funde &ndash; nichts zu tun.</div>')
         for item in open_findings:
             parts.append(
-                '<div class="item">'
-                f'<div class="meta">{esc(str(item.get("source", "")))}</div>'
+                '<article class="card open">'
+                f'<div class="card-head">{source_of(item)}</div>'
                 f'{headline(item)}{cves_of(item)}'
-                f'<div class="summary">{esc(str(item.get("summary", "")))}</div>'
-                f'{accept_form(item)}</div>'
+                f'<p class="summary">{esc(str(item.get("summary", "")))}</p>'
+                f'{accept_form(item)}</article>'
             )
 
         if news:
-            parts.append(f"<h2>Meldungen, die dieses System betreffen ({len(news)})</h2>")
+            parts.append(f'<h2 id="meldungen">Meldungen, die dieses System betreffen ({len(news)})</h2>')
             for item in news:
                 affects = ", ".join(str(a) for a in item.get("affects_local", []))
                 parts.append(
-                    '<div class="item news">'
-                    f'<div class="meta">{esc(str(item.get("source", "")))} &middot; '
-                    f'betrifft: {esc(affects)}</div>'
+                    '<article class="card news">'
+                    f'<div class="card-head">{source_of(item)}'
+                    f'<span class="pill affects">betrifft {esc(affects)}</span></div>'
                     f'{headline(item)}{cves_of(item)}'
-                    f'<div class="summary">{esc(str(item.get("summary", "")))}</div></div>'
+                    f'<p class="summary">{esc(str(item.get("summary", "")))}</p></article>'
                 )
 
         if notes:
-            parts.append("<h2>Hinweise</h2>")
+            parts.append(f"<h2>Hinweise ({len(notes)})</h2>")
             for item in notes:
-                parts.append(f'<div class="item ok"><div class="title">{esc(str(item.get("title", "")))}'
-                             f'</div><div class="summary">{esc(str(item.get("summary", "")))}</div></div>')
+                parts.append('<article class="card note">'
+                             f'<div class="card-head">{source_of(item)}</div>'
+                             f'<div class="title">{esc(str(item.get("title", "")))}</div>'
+                             f'<p class="summary">{esc(str(item.get("summary", "")))}</p></article>')
 
-        total_accepted = len(accepted_findings) + len(orphaned) + len(expired)
-        parts.append(f"<h2>Akzeptiert ({total_accepted})</h2>")
+        parts.append(f'<h2 id="akzeptiert">Akzeptiert ({total_accepted})</h2>')
         if not total_accepted:
-            parts.append('<p class="muted">Nichts akzeptiert.</p>')
+            parts.append('<div class="empty">Nichts akzeptiert.</div>')
         for item in accepted_findings:
             acc = decisions[item["identity"]]
             parts.append(
-                '<div class="item ok">'
-                f'<div class="meta">{esc(str(item.get("source", "")))}</div>'
+                '<article class="card ok">'
+                f'<div class="card-head">{source_of(item)}<span class="pill ok">akzeptiert</span></div>'
                 f'{headline(item)}{cves_of(item)}{acceptance_meta(acc)}'
-                f'{revoke_form(acc.identity)}</div>'
+                f'{revoke_form(acc.identity)}</article>'
             )
         for acc in expired:
             parts.append(
-                '<div class="item">'
+                '<article class="card expired">'
+                f'<div class="card-head"><span class="pill warn">Abgelaufen</span></div>'
                 f'<div class="title">{esc(acc.title or acc.identity)}</div>'
-                f'{acceptance_meta(acc)}<div class="meta"><strong>Abgelaufen</strong> - '
-                'der Fund wird wieder gemeldet. Erneut akzeptieren oben, oder hier entfernen.</div>'
-                f'{revoke_form(acc.identity)}</div>'
+                f'{acceptance_meta(acc)}<div class="meta">Der Fund wird wieder gemeldet. '
+                'Erneut akzeptieren oben unter den offenen Funden, oder den Eintrag hier entfernen.</div>'
+                f'{revoke_form(acc.identity, "Entfernen")}</article>'
             )
         for acc in orphaned:
             parts.append(
-                '<div class="item ok">'
+                '<article class="card ok">'
+                f'<div class="card-head"><span class="pill quiet">nicht mehr gemeldet</span></div>'
                 f'<div class="title">{esc(acc.title or acc.identity)}</div>'
-                f'{acceptance_meta(acc)}<div class="meta">Derzeit nicht mehr gemeldet - '
+                f'{acceptance_meta(acc)}<div class="meta">Derzeit nicht mehr gemeldet &ndash; '
                 'gepatcht, oder der Stand hat sich geaendert.</div>'
-                f'{revoke_form(acc.identity)}</div>'
+                f'{revoke_form(acc.identity, "Entfernen")}</article>'
             )
 
-        parts.append(f'<p class="muted" style="margin-top:32px">SecurityFeed {__version__} '
-                     '&middot; Eine Akzeptanz gilt fuer genau diesen Stand des Funds. '
-                     'Kommt eine neue Luecke dazu, wird er wieder gemeldet.</p>')
-        parts.append("</body></html>")
+        parts.append(page_footer("Eine Akzeptanz gilt fuer genau diesen Stand des Funds. "
+                                 "Kommt eine neue Luecke dazu, wird er wieder gemeldet."))
         return "".join(parts)
 
     def admin_page(self, message: str = "", error: bool = False) -> str:
@@ -2332,20 +2469,18 @@ class AcceptanceSite:
         ein Passwort, und die Einstellungen nur zum Nachsehen."""
         esc = html.escape
         source = self.password_source()
+        auth_name = esc(os.path.basename(self.auth_path))
         if source["source"] == "file":
             at = source["changed_at"]
-            when = at.astimezone().strftime("%d.%m.%Y %H:%M") if at else "unbekannt"
-            origin = (f"geaendert am {esc(when)} von {esc(source['changed_by'])}, "
-                      f"gespeichert in {esc(os.path.basename(self.auth_path))}. "
-                      "SECFEED_WEB_PASSWORD aus der Umgebung gilt nicht mehr.")
+            origin = (f'<span class="pill ok">eigenes Passwort</span> geaendert am '
+                      f'{when(at, with_date=True) if at else "unbekannt"} von '
+                      f'<b>{esc(source["changed_by"])}</b>, gespeichert in {auth_name}. '
+                      'SECFEED_WEB_PASSWORD aus der Umgebung gilt nicht mehr.')
         else:
-            origin = "aus der Umgebung (SECFEED_WEB_PASSWORD)."
+            origin = ('<span class="pill quiet">Startpasswort</span> aus der Umgebung '
+                      '(SECFEED_WEB_PASSWORD).')
 
-        parts = [
-            web_head("SecurityFeed - Verwaltung"),
-            "<h1>SecurityFeed &middot; Verwaltung</h1>",
-            '<div class="muted"><a href="/">Zurueck zu den Funden</a></div>',
-        ]
+        parts = [web_head("SecurityFeed - Verwaltung"), page_header("admin")]
         if message:
             parts.append(f'<div class="{"error" if error else "message"}">{esc(message)}</div>')
         if source.get("file_user"):
@@ -2356,79 +2491,155 @@ class AcceptanceSite:
 
         parts.append("<h2>Anmeldung</h2>")
         parts.append(
-            '<div class="item ok">'
+            '<section class="card plain">'
             f'<div class="title">Benutzer: {esc(self.cfg.user)}</div>'
-            f'<div class="meta">Passwort {origin}</div>'
+            f'<div class="meta">Passwort: {origin}</div>'
             '<form method="post" action="/admin/password" class="password">'
             f'<input type="hidden" name="token" value="{esc(self.form_token)}">'
-            '<label>Aktuelles Passwort<input type="password" name="current" required '
+            '<label><span>Aktuelles Passwort</span><input type="password" name="current" required '
             'autocomplete="current-password"></label>'
-            f'<label>Neues Passwort<input type="password" name="new" required '
+            f'<label><span>Neues Passwort</span><input type="password" name="new" required '
             f'minlength="{PASSWORD_MIN_LENGTH}" autocomplete="new-password"></label>'
-            '<label>Neues Passwort wiederholen<input type="password" name="repeat" required '
-            'autocomplete="new-password"></label>'
-            '<div><button type="submit">Passwort aendern</button></div>'
+            '<label><span>Neues Passwort wiederholen</span><input type="password" name="repeat" '
+            'required autocomplete="new-password"></label>'
+            '<div><button type="submit" class="primary">Passwort aendern</button></div>'
             '</form>'
-            f'<p class="muted">Mindestens {PASSWORD_MIN_LENGTH} Zeichen. Der Benutzername bleibt '
+            f'<p class="hint">Mindestens {PASSWORD_MIN_LENGTH} Zeichen. Der Benutzername bleibt '
             'SECFEED_WEB_USER aus der Umgebung. Nach der Aenderung fragt der Browser beim '
             'naechsten Aufruf nach dem neuen Passwort. Zuruecksetzen auf das Passwort aus der '
-            f'Umgebung: die Datei {esc(os.path.basename(self.auth_path))} im '
-            'Zustandsverzeichnis loeschen.</p>'
-            '</div>'
+            f'Umgebung: die Datei {auth_name} im Zustandsverzeichnis loeschen.</p>'
+            '</section>'
         )
 
         parts.append("<h2>Einstellungen</h2>")
         parts.append(
-            '<div class="item ok"><table class="settings">'
+            '<section class="card plain"><table class="settings">'
             f'<tr><th>Vorbelegung Ablaufdatum</th><td>{self.cfg.accept_days} Tage '
-            '(SECFEED_ACCEPT_DAYS)</td></tr>'
-            f'<tr><th>Funde</th><td>{esc(self.cfg.findings_path)}</td></tr>'
-            f'<tr><th>Akzeptanzen</th><td>{esc(self.cfg.decisions_path)}</td></tr>'
-            f'<tr><th>Passwortdatei</th><td>{esc(self.auth_path)}</td></tr>'
-            '</table><p class="muted">Aenderungen daran gehen ueber die .env und einen Neustart '
-            'des Containers bzw. Dienstes.</p></div>'
+            '<span class="hint">(SECFEED_ACCEPT_DAYS)</span></td></tr>'
+            f'<tr><th>Funde</th><td><code>{esc(self.cfg.findings_path)}</code></td></tr>'
+            f'<tr><th>Akzeptanzen</th><td><code>{esc(self.cfg.decisions_path)}</code></td></tr>'
+            f'<tr><th>Passwortdatei</th><td><code>{esc(self.auth_path)}</code></td></tr>'
+            f'<tr><th>Scan-Anforderung</th><td><code>{esc(self.request_path)}</code></td></tr>'
+            '</table><p class="hint">Aenderungen daran gehen ueber die .env und einen Neustart '
+            'des Containers bzw. Dienstes.</p></section>'
         )
-        parts.append(f'<p class="muted" style="margin-top:32px">SecurityFeed {__version__}</p>')
-        parts.append("</body></html>")
+        parts.append(page_footer(""))
         return "".join(parts)
 
 
-def web_head(title: str) -> str:
-    """Kopf samt Stil, gemeinsam fuer alle Seiten."""
-    return "".join([
-        "<!doctype html><html lang=\"de\"><head><meta charset=\"utf-8\">",
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
-        f"<title>{html.escape(title)}</title><style>",
-        "body{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;",
-        "max-width:860px;margin:0 auto;padding:16px 20px;color:#1a1a1a;background:#fafafa}",
-        "h1{font-size:22px;margin:0 0 4px} h2{font-size:17px;margin:32px 0 12px;",
-        "border-bottom:1px solid #ddd;padding-bottom:4px}",
-        ".muted{color:#777;font-size:13px} .meta{color:#666;font-size:13px;margin:4px 0}",
-        ".muted a{color:#1a4fa0}",
-        ".item{background:#fff;border-left:3px solid #c81e1e;padding:10px 14px;",
-        "margin:0 0 14px;border-radius:0 4px 4px 0;box-shadow:0 1px 2px rgba(0,0,0,.06)}",
-        ".item.ok{border-left-color:#9aa} .item.news{border-left-color:#1a4fa0}",
-        ".item a{color:#1a4fa0;text-decoration:none;font-weight:600;font-size:16px}",
-        ".item .title{font-weight:600;font-size:16px}",
-        ".cves{margin:6px 0} .cve{display:inline-block;background:#fde8e8;color:#9b1c1c;",
-        "border-radius:3px;padding:1px 6px;margin:0 4px 4px 0;font-size:12px;font-family:monospace}",
-        ".summary{font-size:14px;line-height:1.5;margin:6px 0}",
-        "form.accept{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;",
-        "margin-top:8px;font-size:13px} form.accept input{margin-left:4px}",
-        "form.accept input[name=comment]{width:260px;max-width:100%}",
-        "form.password{display:grid;gap:10px;max-width:360px;margin-top:12px;font-size:13px}",
-        "form.password label{display:grid;gap:3px} form.password input{padding:6px;font-size:14px}",
-        "table.settings{border-collapse:collapse;font-size:14px}",
-        "table.settings th{text-align:left;padding:4px 16px 4px 0;font-weight:600;",
-        "vertical-align:top;white-space:nowrap} table.settings td{padding:4px 0;",
-        "font-family:monospace;font-size:13px;word-break:break-all}",
-        "button{background:#1a4fa0;color:#fff;border:0;border-radius:3px;padding:6px 12px;",
-        "cursor:pointer} form.revoke button{background:#888}",
-        ".message{background:#e6f4ea;border-left:3px solid #2e7d32;padding:8px 14px;margin:12px 0}",
-        ".error{background:#fde8e8;border-left:3px solid #c81e1e;padding:8px 14px;margin:12px 0}",
-        ".warn{background:#fff8e1;border-left:3px solid #f0ad4e;padding:8px 14px;margin:12px 0}",
-        "</style></head><body>",
-    ])
+def when(moment: datetime | None, with_date: bool = False) -> str:
+    """Zeitpunkt in lokaler Zeit, kurz. Ohne Datum, wenn es heute ist."""
+    if moment is None:
+        return "unbekannt"
+    local = moment.astimezone()
+    if with_date or local.date() != datetime.now().astimezone().date():
+        return local.strftime("%d.%m.%Y %H:%M")
+    return local.strftime("%H:%M")
+
+
+WEB_CSS = """
+:root{--bg:#f4f6f9;--card:#fff;--text:#1c2430;--muted:#66717f;--line:#e2e6ec;
+--accent:#1f5fbf;--accent-ink:#fff;--danger:#c62828;--ok:#2e7d32;--warn:#b26a00;--info:#1f5fbf;
+--chip-bg:#fdecec;--chip-fg:#a11b1b;--soft:#eef2f7;--shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08)}
+@media(prefers-color-scheme:dark){:root{--bg:#11161d;--card:#1a2129;--text:#e6ebf1;--muted:#98a3b1;
+--line:#2a333e;--accent:#6aa0f0;--accent-ink:#0b1220;--danger:#ef6b6b;--ok:#6fc47a;--warn:#e6b45a;--info:#6aa0f0;
+--chip-bg:#3a1f1f;--chip-fg:#ffb3b3;--soft:#222b35;--shadow:0 1px 2px rgba(0,0,0,.4)}}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+font-size:15px;line-height:1.5;color:var(--text);background:var(--bg)}
+a{color:var(--accent)}
+.wrap{max-width:900px;margin:0 auto;padding:0 20px 48px}
+header.top{display:flex;align-items:center;justify-content:space-between;gap:16px;
+padding:14px 0;border-bottom:1px solid var(--line);margin-bottom:18px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:19px;color:var(--text);text-decoration:none}
+.brand svg{color:var(--accent)}
+nav a{color:var(--muted);text-decoration:none;font-weight:600;font-size:14px;padding:6px 10px;border-radius:6px}
+nav a:hover{background:var(--soft);color:var(--text)} nav a.active{background:var(--soft);color:var(--text)}
+.toolbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;margin:0 0 10px}
+.stand{color:var(--muted);font-size:14px} .stand b{color:var(--text);font-weight:600}
+.scanline{margin:0 0 12px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:14px 0 6px}
+.stat{display:flex;flex-direction:column;gap:2px;padding:12px 14px;background:var(--card);border-radius:10px;
+box-shadow:var(--shadow);text-decoration:none;color:var(--text);border-top:3px solid var(--line)}
+.stat b{font-size:26px;line-height:1.1;font-weight:700} .stat span{font-size:13px;color:var(--muted)}
+.stat.danger{border-top-color:var(--danger)} .stat.danger b{color:var(--danger)}
+.stat.ok{border-top-color:var(--ok)} .stat.info{border-top-color:var(--info)} .stat.calm{border-top-color:var(--ok)}
+h1{font-size:22px;margin:0 0 4px}
+h2{font-size:15px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:30px 0 10px;
+padding-bottom:6px;border-bottom:1px solid var(--line)}
+.card{background:var(--card);border-radius:10px;box-shadow:var(--shadow);padding:14px 16px;margin:0 0 12px;
+border-left:4px solid var(--line)}
+.card.open{border-left-color:var(--danger)} .card.news{border-left-color:var(--info)}
+.card.ok{border-left-color:var(--ok)} .card.expired{border-left-color:var(--warn)} .card.note{border-left-color:var(--muted)}
+.card.plain{border-left-color:var(--accent)}
+.card-head{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+.title{display:block;font-weight:600;font-size:16px;color:var(--text);text-decoration:none;line-height:1.35}
+a.title:hover{color:var(--accent)}
+.pill{display:inline-block;font-size:12px;font-weight:600;padding:2px 9px;border-radius:999px;background:var(--soft);color:var(--muted)}
+.pill.src{background:var(--soft);color:var(--text)} .pill.ok{background:#e4f3e6;color:var(--ok)}
+.pill.warn{background:#fff3df;color:var(--warn)} .pill.busy{background:#e3edfb;color:var(--info)}
+.pill.affects{background:#e3edfb;color:var(--info)} .pill.quiet{color:var(--muted)}
+@media(prefers-color-scheme:dark){.pill.ok{background:#1f3a24}.pill.warn{background:#3d2f12}.pill.busy,.pill.affects{background:#1e2f4a}}
+.cves{display:flex;flex-wrap:wrap;gap:5px;margin:8px 0 4px}
+.cve{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;padding:2px 7px;
+border-radius:5px;background:var(--chip-bg);color:var(--chip-fg)} .cve.more{background:var(--soft);color:var(--muted);font-family:inherit}
+.summary{margin:6px 0 4px;font-size:14px;color:var(--text)}
+.meta{font-size:13px;color:var(--muted);margin:4px 0} .meta b{color:var(--text)}
+.hint{font-size:12.5px;color:var(--muted)}
+form.accept{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 14px;margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)}
+form.accept label{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--muted)}
+form.accept input[name=comment]{width:280px;max-width:100%}
+input,button{font:inherit}
+input{padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--card);color:var(--text)}
+input:focus{outline:2px solid var(--accent);outline-offset:1px;border-color:var(--accent)}
+button{border:0;border-radius:7px;padding:8px 14px;cursor:pointer;font-weight:600;background:var(--soft);color:var(--text)}
+button.primary{background:var(--accent);color:var(--accent-ink)} button.primary:hover{filter:brightness(1.08)}
+button.ghost{background:transparent;color:var(--muted);border:1px solid var(--line)} button.ghost:hover{color:var(--danger);border-color:var(--danger)}
+button[disabled]{opacity:.55;cursor:default;filter:none}
+form.revoke{margin-top:8px} form.scan{margin:0}
+form.password{display:grid;gap:12px;max-width:380px;margin-top:14px}
+form.password label{display:grid;gap:4px;font-size:13px;color:var(--muted)}
+table.settings{border-collapse:collapse;font-size:14px;width:100%}
+table.settings th{text-align:left;padding:6px 16px 6px 0;font-weight:600;vertical-align:top;white-space:nowrap;color:var(--muted)}
+table.settings td{padding:6px 0} code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;word-break:break-all}
+.message,.error,.warn,.empty{padding:10px 14px;border-radius:8px;margin:12px 0;font-size:14px}
+.message{background:#e4f3e6;color:#1f5f26;border-left:4px solid var(--ok)}
+.error{background:#fdecec;color:#8a1b1b;border-left:4px solid var(--danger)}
+.warn{background:#fff3df;color:#6e4200;border-left:4px solid var(--warn)} .warn ul{margin:6px 0 0 18px}
+.empty{background:var(--card);color:var(--muted);box-shadow:var(--shadow)}
+@media(prefers-color-scheme:dark){.message{background:#1f3a24;color:#cdeed2}.error{background:#3a1f1f;color:#ffc9c9}.warn{background:#3d2f12;color:#ffe2b0}}
+footer{margin-top:36px;padding-top:12px;border-top:1px solid var(--line);font-size:12.5px;color:var(--muted)}
+@media(max-width:560px){header.top{flex-direction:column;align-items:flex-start;gap:8px}.wrap{padding:0 14px 40px}
+form.accept input[name=comment]{width:100%}}
+"""
+
+SHIELD_SVG = ('<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">'
+              '<path d="M12 2 4 5v6c0 5 3.4 9.7 8 11 4.6-1.3 8-6 8-11V5l-8-3z" fill="currentColor"/></svg>')
+
+
+def web_head(title: str, refresh: int | None = None) -> str:
+    """Kopf samt Stil, gemeinsam fuer alle Seiten. refresh: Sekunden, nach
+    denen der Browser die Seite selbst neu laedt - waehrend ein Scan laeuft."""
+    meta = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ""
+    return ("<!doctype html><html lang=\"de\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            f"{meta}<title>{html.escape(title)}</title><style>{WEB_CSS}</style></head>"
+            "<body><div class=\"wrap\">")
+
+
+def page_header(active: str) -> str:
+    def link(target: str, href: str, label: str) -> str:
+        cls = ' class="active"' if target == active else ""
+        return f'<a href="{href}"{cls}>{label}</a>'
+    return ('<header class="top">'
+            f'<a class="brand" href="/">{SHIELD_SVG}SecurityFeed</a>'
+            f'<nav>{link("findings", "/", "Funde")}{link("admin", "/admin", "Verwaltung")}</nav>'
+            '</header>')
+
+
+def page_footer(note: str) -> str:
+    extra = f" &middot; {html.escape(note)}" if note else ""
+    return f"<footer>SecurityFeed {__version__}{extra}</footer></div></body></html>"
 
 
 def client_label(forwarded_for: str | None, peer: str) -> str:
@@ -2517,6 +2728,8 @@ class AcceptanceHandler(BaseHTTPRequestHandler):
             message = self.site.accept(field("identity"), user, field("comment"), field("until"))
         elif self.path == "/revoke":
             message = self.site.revoke(field("identity"), user)
+        elif self.path == "/scan":
+            message = self.site.request_scan(user)
         elif self.path == "/admin/password":
             ok, message = self.site.change_password(user, field("current"), field("new"),
                                                     field("repeat"))
@@ -2621,14 +2834,30 @@ def run_scheduler(args: argparse.Namespace, mail_cfg: MailConfig | None,
     log(f"SecurityFeed {__version__} im Dauerbetrieb. Zeiten: {pretty} "
         f"(Zeitzone {datetime.now().astimezone().tzname()})")
 
+    # Ohne Zustandsverzeichnis gibt es keine Anforderungen von der Seite -
+    # und auch keine Seite, die sie stellen koennte.
+    request_path = state_sibling(state_path, SCAN_REQUEST_FILE) if state_path else None
+    status_path = state_sibling(state_path, SCAN_STATUS_FILE) if state_path else None
+
+    def note(state: str, reason: str, code: int | None = None) -> None:
+        if not status_path:
+            return
+        try:
+            save_scan_status(status_path, state, reason, code)
+        except OSError as exc:  # nur Anzeige - der Lauf haengt nicht daran
+            log(f"Scan-Status nicht speicherbar: {exc}")
+
     def execute(reason: str) -> None:
         log(f"Lauf gestartet ({reason}).")
+        note("running", reason)
         try:
             code = run_once(args, mail_cfg, state_path)
         except Exception as exc:  # ein Fehlschlag darf den Dienst nicht beenden
             log(f"Lauf abgebrochen: {type(exc).__name__}: {exc}")
+            note("failed", reason)
             return
         log(f"Lauf beendet, Exit-Code {code}.")
+        note("done", reason, code)
 
     if args.run_at_start:
         execute("Start")
@@ -2638,14 +2867,12 @@ def run_scheduler(args: argparse.Namespace, mail_cfg: MailConfig | None,
         wait = (target - datetime.now().astimezone()).total_seconds()
         log(f"Naechster Lauf {target.strftime('%Y-%m-%d %H:%M:%S %Z')} "
             f"(in {int(wait // 3600)}h {int(wait % 3600 // 60)}min).")
-        # Warten in Haeppchen: so wird eine Zeitumstellung oder ein korrigierter
-        # Systemtakt spaetestens nach einer Minute neu bewertet.
-        while wait > 0 and not stop.is_set():
-            if stop.wait(min(wait, 60)):
-                break
-            wait = (target - datetime.now().astimezone()).total_seconds()
+        request = wait_for_next(stop, target, request_path)
         if stop.is_set():
             break
+        if request:
+            execute(f"Anforderung von {str(request.get('by', '?'))[:64]}")
+            continue
         execute("Zeitplan")
 
     log("Beendet.")

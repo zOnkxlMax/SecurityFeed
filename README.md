@@ -93,7 +93,8 @@ Siehe Abschnitt [Paketscan](#paketscan-was-steckt-hier-drin) weiter unten.
 | —                   | `SECFEED_ACCEPT_DAYS`    | Vorbelegung des Ablaufdatums (Default 90) |
 
 Unter `/admin` liegt die Verwaltung: dort lässt sich das Passwort ändern, ohne
-die `.env` anzufassen. Akzeptierte Funde fallen aus Mail und Wiedervorlage, bis ihr Ablaufdatum
+die `.env` anzufassen. *Jetzt scannen* stößt einen Lauf sofort an — im
+Dauerbetrieb (`--schedule`), der die Anforderung binnen Sekunden abholt. Akzeptierte Funde fallen aus Mail und Wiedervorlage, bis ihr Ablaufdatum
 erreicht ist. Eine Akzeptanz gilt für genau diesen Stand des Funds — kommt eine
 neue Lücke dazu, wird er wieder gemeldet. Die Seite hat Basic Auth, aber selbst
 kein TLS: nur im eigenen Netz betreiben — oder hinter einen Reverse Proxy wie

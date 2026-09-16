@@ -101,6 +101,13 @@ jobs:
           grep -q '"by": "ci"' /tmp/sf-state/decisions.json
           curl -fs -u ci:ci-geheim-123 http://127.0.0.1:8099/ | grep -q 'Offene Funde (0)'
 
+          # "Jetzt scannen" legt eine Anforderung ab, die der Scheduler abholt
+          test "$(curl -s -o /dev/null -w '%{http_code}' -u ci:ci-geheim-123 -X POST \
+                 --data-urlencode "token=$token" http://127.0.0.1:8099/scan)" = "303"
+          grep -q '"by": "ci"' /tmp/sf-state/scan-request.json
+          curl -fs -u ci:ci-geheim-123 http://127.0.0.1:8099/ | grep -q 'wartet auf den Scanner'
+          rm /tmp/sf-state/scan-request.json
+
           # Verwaltung: nur angemeldet, Passwortwechsel braucht Token und altes Passwort
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/admin)" = "401"
           curl -fs -u ci:ci-geheim-123 http://127.0.0.1:8099/admin > /tmp/admin.html
