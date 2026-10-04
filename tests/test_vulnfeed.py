@@ -549,7 +549,7 @@ class TestNoticeMail(unittest.TestCase):
             entry(title="Container x: nicht pruefbar", source="Container x", local=True, link=""),
         ]
 
-    def test_counts_and_link_but_no_details(self):
+    def test_scan_as_counts_news_in_full(self):
         msg = vf.build_message(self._cfg(), self._entries(), "Lauf vom 04.10.2026 07:00")
         self.assertIn("Updates noetig", msg["Subject"])
         self.assertIn("2 Paket(e) mit Schwachstellen", msg["Subject"])
@@ -559,11 +559,26 @@ class TestNoticeMail(unittest.TestCase):
             self.assertIn(self.URL, part)
             self.assertIn("auf diesem System", part)
             self.assertIn("in Containern", part)
-            self.assertIn("weitere Sicherheitsmeldung", part)
             self.assertIn("Hinweis(e) zum Paketscan", part)
-            for detail in ("CVE-2026-1111", "openssl 3.0.11", "Routern", "https://t/news1"):
-                self.assertNotIn(detail, part, "Details gehoeren auf die Seite, nicht in die Mail")
+            # Paketfunde nur als Zahl - Name, CVEs und Tracker-Link stehen auf der Seite
+            for detail in ("openssl 3.0.11", "perl 5.40", "CVE-2026-2222", "CVE-2026-3333",
+                           "https://t/openssl", "Container x: nicht pruefbar"):
+                self.assertNotIn(detail, part, "Paketfunde gehoeren auf die Seite, nicht in die Mail")
+            # Nachrichten vollstaendig, was das System betrifft zuerst
+            self.assertIn("Neue Sicherheitsmeldungen (2)", part)
+            self.assertIn("OpenSSL-Luecke in den Nachrichten", part)
+            self.assertIn("Irgendwas mit Routern", part)
+            self.assertLess(part.index("OpenSSL-Luecke"), part.index("Routern"))
         self.assertIn(f'href="{self.URL}"', body)
+        self.assertIn('href="https://t/news1"', body)
+        self.assertIn("CVE-2026-1111", body)
+        self.assertIn("Betrifft dieses System: openssl", body)
+
+    def test_no_news_no_news_section(self):
+        scan_only = [e for e in self._entries() if e.local]
+        text, body = self._parts(vf.build_message(self._cfg(), scan_only, "Untertitel"))
+        self.assertNotIn("Neue Sicherheitsmeldungen", text)
+        self.assertNotIn("Neue Sicherheitsmeldungen", body)
 
     def test_only_news_says_system_is_not_affected(self):
         msg = vf.build_message(self._cfg(), [entry(title="A"), entry(title="B", link="https://t/b")],

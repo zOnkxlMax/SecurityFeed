@@ -120,7 +120,7 @@ Proxy-Manager-Rezept) bzw.
 | `--mail-to`         | `SECFEED_MAIL_TO`          | Empfänger, mehrere per Komma           |
 | `--subject-prefix`  | `SECFEED_SUBJECT_PREFIX`   | Default `[SecurityFeed]`               |
 | `--send-empty`      | `SECFEED_SEND_EMPTY`       | Auch mailen, wenn nichts Neues da ist — als Lebenszeichen |
-| `--web-url URL`     | `SECFEED_WEB_URL`          | Adresse der Webseite. Gesetzt, ist die Mail nur ein Hinweis: wie viele Funde und Meldungen es gibt, plus Link. Details, Newsfeed und Akzeptieren stehen auf der Seite |
+| `--web-url URL`     | `SECFEED_WEB_URL`          | Adresse der Webseite. Gesetzt, nennt die Mail Funde des Paketscans nur als Zahl mit Link zur Seite; die Nachrichten stehen weiter vollständig drin |
 | `--dry-run`         | —                          | Mail ausgeben statt verschicken        |
 
 ### Dauerbetrieb

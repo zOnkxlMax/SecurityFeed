@@ -497,11 +497,13 @@ Seite in der `.env` wird sie zum Hinweis:
 SECFEED_WEB_URL=https://securityfeed.example.org/
 ```
 
-Die Mail sagt dann nur noch, *dass* es etwas gibt und wie viel: Pakete mit
-Schwachstellen auf dem Host und in Containern, Meldungen, die dieses System
-betreffen, weitere Meldungen und Hinweise des Paketscans — plus einen Knopf zur
-Seite. Keine Paketnamen, keine CVEs. Der Betreff unterscheidet „Updates nötig"
-von „neue Meldungen, dieses System ist nicht betroffen", damit sich das schon im
+Die Funde des Paketscans stehen dann nur noch als Zahl in der Mail: Pakete mit
+Schwachstellen auf dem Host und in Containern sowie Hinweise des Scans — plus
+ein Knopf zur Seite. Keine Paketnamen, keine CVE-Listen; die stehen auf der
+Seite, die immer den aktuellen Stand zeigt. Die Nachrichten bleiben dagegen
+vollständig in der Mail, mit Titel, Link und CVEs — was dieses System betrifft,
+steht zuerst und ist markiert. Der Betreff unterscheidet „Updates nötig" von
+„neue Meldungen, dieses System ist nicht betroffen", damit sich das schon im
 Posteingang auseinanderhalten lässt. Wann eine Mail kommt, ändert sich nicht.
 
 Die Details stehen auf der Seite: Funde unter `/`, alle Meldungen im Newsfeed

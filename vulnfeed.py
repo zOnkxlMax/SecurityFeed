@@ -1261,6 +1261,16 @@ def render_html(entries: list[Entry], subtitle: str,
     if not entries:
         return head + '<p>Keine neuen Meldungen.</p></div>'
 
+    footer = (
+        f'<p style="color:#888;font-size:12px;border-top:1px solid #e0e0e0;padding-top:10px">'
+        f'{len(entries)} Meldung(en) &middot; SecurityFeed {__version__}</p>'
+    )
+    return head + render_entry_blocks(entries) + footer + "</div>"
+
+
+def render_entry_blocks(entries: list[Entry]) -> str:
+    """Ein Block je Meldung, mail-tauglich mit Inline-Styles."""
+    esc = html.escape
     blocks = []
     for entry in entries:
         stamp = entry.published.astimezone().strftime("%d.%m.%Y %H:%M") if entry.published else "?"
@@ -1301,11 +1311,7 @@ def render_html(entries: list[Entry], subtitle: str,
             f'<div style="color:#777;font-size:12px">{meta}</div>'
             f'{headline}{affected}{cves}{summary}</div>'
         )
-    footer = (
-        f'<p style="color:#888;font-size:12px;border-top:1px solid #e0e0e0;padding-top:10px">'
-        f'{len(entries)} Meldung(en) &middot; SecurityFeed {__version__}</p>'
-    )
-    return head + "".join(blocks) + footer + "</div>"
+    return "".join(blocks)
 
 
 # --------------------------------------------------------------------------
@@ -1493,32 +1499,37 @@ def mail_skeleton(cfg: MailConfig, subject: str) -> EmailMessage:
 
 
 def notice_counts(entries: list[Entry]) -> list[tuple[int, str]]:
-    """Was in der Kurz-Mail gezaehlt wird, in der Reihenfolge der Wichtigkeit.
+    """Was die Kurz-Mail vom Paketscan nur zaehlt, statt es aufzulisten.
     Nur Zeilen mit Treffern."""
     findings = [e for e in entries if e.local and e.cves]
     host = [e for e in findings if not e.source.startswith("Container ")]
     containers = [e for e in findings if e.source.startswith("Container ")]
-    affecting = [e for e in entries if not e.local and e.affects_local]
-    other = [e for e in entries if not e.local and not e.affects_local]
     notes = [e for e in entries if e.local and not e.cves]
     rows = [
         (len(host), "Paket(e) mit bekannten Schwachstellen auf diesem System"),
         (len(containers), "Paket(e) mit bekannten Schwachstellen in Containern"),
-        (len(affecting), "Sicherheitsmeldung(en), die dieses System betreffen"),
-        (len(other), "weitere Sicherheitsmeldung(en)"),
         (len(notes), "Hinweis(e) zum Paketscan, z.B. nicht pruefbare Container"),
     ]
     return [(n, label) for n, label in rows if n]
 
 
+def notice_news(entries: list[Entry]) -> list[Entry]:
+    """Die Meldungen fuer die Kurz-Mail: was dieses System betrifft zuerst,
+    sonst in der Reihenfolge des Laufs (neueste zuerst)."""
+    news = [e for e in entries if not e.local]
+    return [e for e in news if e.affects_local] + [e for e in news if not e.affects_local]
+
+
 def build_notice(cfg: MailConfig, entries: list[Entry], subtitle: str,
                  failed: list[str]) -> EmailMessage:
-    """Kurz-Mail: nur dass es etwas gibt, wie viel davon, und wo es steht.
-    Keine Paketnamen, keine CVEs - das Postfach ist nicht der Ort dafuer,
-    und die Seite zeigt den aktuellen Stand statt einer Momentaufnahme."""
+    """Kurz-Mail: Funde des Paketscans nur als Zahl mit Link - Paketnamen und
+    ihre CVE-Listen gehoeren auf die Seite, die den aktuellen Stand zeigt
+    statt einer Momentaufnahme. Die Nachrichten dagegen vollstaendig: sie
+    sind zum Lesen da, und das Postfach ist dafuer der richtige Ort."""
     esc = html.escape
     url = cfg.web_url or ""
     rows = notice_counts(entries)
+    news_items = notice_news(entries)
     findings = sum(1 for e in entries if e.local and e.cves)
     affecting = sum(1 for e in entries if not e.local and e.affects_local)
     news = sum(1 for e in entries if not e.local)
@@ -1552,6 +1563,8 @@ def build_notice(cfg: MailConfig, entries: list[Entry], subtitle: str,
         text += ["", "WARNUNG - diese Quellen waren nicht erreichbar:"]
         text.extend(f"  - {item}" for item in failed)
     text += ["", "Details, Akzeptieren, Newsfeed und Jetzt scannen:", url]
+    if news_items:
+        text += ["", f"Neue Sicherheitsmeldungen ({len(news_items)}):", "", render_table(news_items)]
 
     alert = findings or affecting
     items = "".join(
@@ -1584,7 +1597,10 @@ def build_notice(cfg: MailConfig, entries: list[Entry], subtitle: str,
         'padding:10px 18px;border-radius:7px">Details ansehen</a></p>'
         f'<p style="margin:10px 0 0;font-size:12px;color:#66717f">{esc(url)}</p>'
         '</div>'
-        f'<p style="font-size:12px;color:#8a94a1;margin:10px 4px 0">{esc(subtitle)} '
+        + (f'<h3 style="font-size:15px;margin:28px 4px 14px">Neue Sicherheitsmeldungen '
+           f'({len(news_items)})</h3><div style="margin:0 4px">{render_entry_blocks(news_items)}</div>'
+           if news_items else "")
+        + f'<p style="font-size:12px;color:#8a94a1;margin:10px 4px 0">{esc(subtitle)} '
         f'&middot; SecurityFeed {__version__}</p></div>'
     )
 
