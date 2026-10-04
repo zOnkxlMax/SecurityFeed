@@ -1261,6 +1261,16 @@ def render_html(entries: list[Entry], subtitle: str,
     if not entries:
         return head + '<p>Keine neuen Meldungen.</p></div>'
 
+    footer = (
+        f'<p style="color:#888;font-size:12px;border-top:1px solid #e0e0e0;padding-top:10px">'
+        f'{len(entries)} Meldung(en) &middot; SecurityFeed {__version__}</p>'
+    )
+    return head + render_entry_blocks(entries) + footer + "</div>"
+
+
+def render_entry_blocks(entries: list[Entry]) -> str:
+    """Ein Block je Meldung, mail-tauglich mit Inline-Styles."""
+    esc = html.escape
     blocks = []
     for entry in entries:
         stamp = entry.published.astimezone().strftime("%d.%m.%Y %H:%M") if entry.published else "?"
@@ -1301,11 +1311,7 @@ def render_html(entries: list[Entry], subtitle: str,
             f'<div style="color:#777;font-size:12px">{meta}</div>'
             f'{headline}{affected}{cves}{summary}</div>'
         )
-    footer = (
-        f'<p style="color:#888;font-size:12px;border-top:1px solid #e0e0e0;padding-top:10px">'
-        f'{len(entries)} Meldung(en) &middot; SecurityFeed {__version__}</p>'
-    )
-    return head + "".join(blocks) + footer + "</div>"
+    return "".join(blocks)
 
 
 # --------------------------------------------------------------------------
@@ -1387,6 +1393,10 @@ class MailConfig:
     password: str | None = None
     subject_prefix: str = "[SecurityFeed]"
     timeout: float = 30.0
+    # Gesetzt: die Mail ist nur noch ein Hinweis mit Zahlen und einem Link
+    # auf die Webseite, die Details stehen dort. Leer: die volle Liste wie
+    # bisher.
+    web_url: str | None = None
 
 
 TRUTHY = frozenset({"1", "true", "yes", "y", "on", "ja"})
@@ -1457,6 +1467,13 @@ def mail_config_from_env(args: argparse.Namespace) -> MailConfig:
     except ValueError:
         raise ConfigError(f"Ungueltiger SMTP-Port: {port_raw}") from None
 
+    web_url = (pick(args.web_url, "SECFEED_WEB_URL") or "").strip() or None
+    if web_url and not re.match(r"https?://[^\s/]+", web_url):
+        raise ConfigError(
+            f"SECFEED_WEB_URL muss eine http(s)-Adresse sein, z.B. "
+            f"https://securityfeed.example.org/ (steht dort: {web_url!r})."
+        )
+
     return MailConfig(
         host=host,
         port=port,
@@ -1467,12 +1484,137 @@ def mail_config_from_env(args: argparse.Namespace) -> MailConfig:
         password=env("SECFEED_SMTP_PASSWORD"),
         subject_prefix=pick(args.subject_prefix, "SECFEED_SUBJECT_PREFIX", "[SecurityFeed]"),
         timeout=args.timeout,
+        web_url=web_url,
     )
+
+
+def mail_skeleton(cfg: MailConfig, subject: str) -> EmailMessage:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = cfg.sender
+    msg["To"] = ", ".join(cfg.recipients)
+    msg["Date"] = format_datetime(datetime.now(timezone.utc))
+    msg["Message-ID"] = make_msgid(domain=cfg.sender.split("@")[-1] or None)
+    return msg
+
+
+def notice_counts(entries: list[Entry]) -> list[tuple[int, str]]:
+    """Was die Kurz-Mail vom Paketscan nur zaehlt, statt es aufzulisten.
+    Nur Zeilen mit Treffern."""
+    findings = [e for e in entries if e.local and e.cves]
+    host = [e for e in findings if not e.source.startswith("Container ")]
+    containers = [e for e in findings if e.source.startswith("Container ")]
+    notes = [e for e in entries if e.local and not e.cves]
+    rows = [
+        (len(host), "Paket(e) mit bekannten Schwachstellen auf diesem System"),
+        (len(containers), "Paket(e) mit bekannten Schwachstellen in Containern"),
+        (len(notes), "Hinweis(e) zum Paketscan, z.B. nicht pruefbare Container"),
+    ]
+    return [(n, label) for n, label in rows if n]
+
+
+def notice_news(entries: list[Entry]) -> list[Entry]:
+    """Die Meldungen fuer die Kurz-Mail: was dieses System betrifft zuerst,
+    sonst in der Reihenfolge des Laufs (neueste zuerst)."""
+    news = [e for e in entries if not e.local]
+    return [e for e in news if e.affects_local] + [e for e in news if not e.affects_local]
+
+
+def build_notice(cfg: MailConfig, entries: list[Entry], subtitle: str,
+                 failed: list[str]) -> EmailMessage:
+    """Kurz-Mail: Funde des Paketscans nur als Zahl mit Link - Paketnamen und
+    ihre CVE-Listen gehoeren auf die Seite, die den aktuellen Stand zeigt
+    statt einer Momentaufnahme. Die Nachrichten dagegen vollstaendig: sie
+    sind zum Lesen da, und das Postfach ist dafuer der richtige Ort."""
+    esc = html.escape
+    url = cfg.web_url or ""
+    rows = notice_counts(entries)
+    news_items = notice_news(entries)
+    findings = sum(1 for e in entries if e.local and e.cves)
+    affecting = sum(1 for e in entries if not e.local and e.affects_local)
+    news = sum(1 for e in entries if not e.local)
+    notes = sum(1 for e in entries if e.local and not e.cves)
+
+    if findings or affecting:
+        parts = []
+        if findings:
+            parts.append(f"{findings} Paket(e) mit Schwachstellen")
+        if affecting:
+            parts.append(f"{affecting} Meldung(en) betreffen dieses System")
+        subject = f"{cfg.subject_prefix} Updates noetig: {', '.join(parts)}"
+        lead = "Es gibt neue Schwachstellen bzw. Updates fuer dieses System."
+    elif news:
+        subject = f"{cfg.subject_prefix} {news} neue Sicherheitsmeldung(en), dieses System ist nicht betroffen"
+        lead = "Es gibt neue Sicherheitsmeldungen. Dieses System ist laut Paketscan nicht betroffen."
+    elif notes:
+        subject = f"{cfg.subject_prefix} {notes} Hinweis(e) zum Paketscan"
+        lead = "Keine neuen Schwachstellen, aber Hinweise zum Paketscan."
+    else:
+        subject = f"{cfg.subject_prefix} keine neuen Meldungen"
+        lead = "Nichts Neues seit der letzten Mail."
+    if failed:
+        subject += f" (Warnung: {len(failed)} Quelle(n) nicht erreichbar)"
+
+    text = [subtitle, "", lead]
+    if rows:
+        text.append("")
+        text.extend(f"  - {n} {label}" for n, label in rows)
+    if failed:
+        text += ["", "WARNUNG - diese Quellen waren nicht erreichbar:"]
+        text.extend(f"  - {item}" for item in failed)
+    text += ["", "Details, Akzeptieren, Newsfeed und Jetzt scannen:", url]
+    if news_items:
+        text += ["", f"Neue Sicherheitsmeldungen ({len(news_items)}):", "", render_table(news_items)]
+
+    alert = findings or affecting
+    items = "".join(
+        f'<tr><td style="padding:3px 12px 3px 0;font-size:20px;font-weight:700;text-align:right;'
+        f'color:{"#c62828" if ("Schwachstellen" in label or "betreffen" in label) else "#1c2430"}">{n}</td>'
+        f'<td style="padding:3px 0;font-size:14px">{esc(label)}</td></tr>'
+        for n, label in rows
+    )
+    warn = ""
+    if failed:
+        warn = (
+            '<div style="background:#fff3df;border-left:4px solid #b26a00;padding:10px 14px;'
+            'margin:16px 0 0;font-size:13px;color:#6e4200"><strong>Warnung:</strong> Diese Quellen '
+            'waren nicht erreichbar, die Zahlen sind daher moeglicherweise unvollstaendig.'
+            '<ul style="margin:6px 0 0;padding-left:20px">'
+            + "".join(f"<li>{esc(item)}</li>" for item in failed) + "</ul></div>"
+        )
+    accent = "#c62828" if alert else "#1f5fbf"
+    body = (
+        '<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;'
+        'max-width:560px;margin:0 auto;color:#1c2430">'
+        f'<div style="border-top:4px solid {accent};background:#ffffff;border-radius:8px;'
+        'padding:20px 22px;box-shadow:0 1px 3px rgba(16,24,40,.12)">'
+        '<div style="font-size:13px;color:#66717f;margin:0 0 6px">SecurityFeed</div>'
+        f'<div style="font-size:18px;font-weight:700;margin:0 0 12px">{esc(lead)}</div>'
+        + (f'<table style="border-collapse:collapse;margin:0 0 6px">{items}</table>' if items else "")
+        + warn
+        + f'<p style="margin:20px 0 0"><a href="{esc(url)}" style="display:inline-block;'
+        f'background:{accent};color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;'
+        'padding:10px 18px;border-radius:7px">Details ansehen</a></p>'
+        f'<p style="margin:10px 0 0;font-size:12px;color:#66717f">{esc(url)}</p>'
+        '</div>'
+        + (f'<h3 style="font-size:15px;margin:28px 4px 14px">Neue Sicherheitsmeldungen '
+           f'({len(news_items)})</h3><div style="margin:0 4px">{render_entry_blocks(news_items)}</div>'
+           if news_items else "")
+        + f'<p style="font-size:12px;color:#8a94a1;margin:10px 4px 0">{esc(subtitle)} '
+        f'&middot; SecurityFeed {__version__}</p></div>'
+    )
+
+    msg = mail_skeleton(cfg, subject)
+    msg.set_content("\n".join(text))
+    msg.add_alternative(body, subtype="html")
+    return msg
 
 
 def build_message(cfg: MailConfig, entries: list[Entry], subtitle: str,
                   failed: list[str] | None = None) -> EmailMessage:
     failed = failed or []
+    if cfg.web_url:
+        return build_notice(cfg, entries, subtitle, failed)
     count = len(entries)
     # Was dieses System betrifft, gehoert in den Betreff - sonst geht es
     # zwischen zwanzig allgemeinen Meldungen unter. Hinweise des Scans ohne
@@ -1501,12 +1643,7 @@ def build_message(cfg: MailConfig, entries: list[Entry], subtitle: str,
         text.append("")
     text.append(render_table(entries))
 
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = cfg.sender
-    msg["To"] = ", ".join(cfg.recipients)
-    msg["Date"] = format_datetime(datetime.now(timezone.utc))
-    msg["Message-ID"] = make_msgid(domain=cfg.sender.split("@")[-1] or None)
+    msg = mail_skeleton(cfg, subject)
     msg.set_content("\n".join(text))
     msg.add_alternative(render_html(entries, subtitle, failed), subtype="html")
     return msg
@@ -1659,6 +1796,10 @@ def build_parser() -> argparse.ArgumentParser:
     mail.add_argument("--mail-from", help="Absenderadresse (SECFEED_MAIL_FROM).")
     mail.add_argument("--mail-to", help="Empfaenger, mehrere per Komma (SECFEED_MAIL_TO).")
     mail.add_argument("--subject-prefix", help="Betreff-Prefix. Default '[SecurityFeed]'.")
+    mail.add_argument("--web-url", metavar="URL",
+                      help="Adresse der Webseite (SECFEED_WEB_URL). Gesetzt, enthaelt die Mail "
+                           "nur noch, wie viele Funde und Meldungen es gibt, und einen Link "
+                           "dorthin - die Details stehen auf der Seite.")
     mail.add_argument("--send-empty", action="store_true",
                       help="Auch mailen, wenn es nichts Neues gibt - als Lebenszeichen "
                            "(SECFEED_SEND_EMPTY=1).")
@@ -1833,13 +1974,15 @@ def run_once(args: argparse.Namespace, mail_cfg: MailConfig | None,
             print(f"Zustand nicht speicherbar ({state_path}): {exc}", file=sys.stderr)
             return 1
         # Der Ist-Zustand fuer die Webseite: alle Scan-Funde dieses Laufs -
-        # auch akzeptierte und schon gemeldete - plus die Nachrichten, die
-        # dieses System betreffen. Nicht kritisch: scheitert das, ist die
-        # Mail trotzdem raus.
+        # auch akzeptierte und schon gemeldete - plus alle Nachrichten, die
+        # neuen und die der letzten Tage. Nicht kritisch: scheitert das, ist
+        # die Mail trotzdem raus.
         try:
-            save_findings(state_sibling(state_path, FINDINGS_FILE),
-                          scan_all + [e for e in fresh if e.affects_local and not e.local],
-                          subtitle, failed)
+            findings_path = state_sibling(state_path, FINDINGS_FILE)
+            news_now = [e for e in fresh if not e.local]
+            carried = carry_over_news(read_json(findings_path), news_now,
+                                      datetime.now(timezone.utc))
+            save_findings(findings_path, scan_all + news_now, subtitle, failed, carried)
         except OSError as exc:
             print(f"Ist-Zustand fuer die Webseite nicht speicherbar: {exc}", file=sys.stderr)
 
@@ -2026,13 +2169,40 @@ def apply_acceptances(entries: list[Entry], decisions: dict[str, Acceptance],
 
 
 def save_findings(path: str, entries: list[Entry], subtitle: str,
-                  failed: list[str]) -> None:
+                  failed: list[str], carried: list[dict] | None = None) -> None:
     write_json(path, {
         "updated": datetime.now(timezone.utc).isoformat(),
         "subtitle": subtitle,
         "failed": list(failed),
-        "entries": [entry.as_dict() for entry in entries],
+        "entries": [entry.as_dict() for entry in entries] + list(carried or []),
     })
+
+
+# Wie lange Meldungen aus frueheren Laeufen auf der Seite bleiben. Jede
+# Meldung wird nur einmal gemailt - steht in der Mail nur noch ein Link, ist
+# die Seite der einzige Ort, an dem sie sich nachlesen laesst.
+NEWS_KEEP_DAYS = 7
+NEWS_KEEP_MAX = 300
+
+
+def carry_over_news(previous: dict, fresh: list[Entry], now: datetime) -> list[dict]:
+    """Meldungen aus dem letzten Stand, die noch nicht zu alt sind und in
+    diesem Lauf nicht erneut vorkommen. Funde des Paketscans werden nie
+    uebertragen - die stehen in jedem Lauf vollstaendig neu fest."""
+    cutoff = now - timedelta(days=NEWS_KEEP_DAYS)
+    taken = {e.link or e.title for e in fresh if not e.local}
+    kept: list[dict] = []
+    for item in previous.get("entries", []):
+        if not isinstance(item, dict) or item.get("local"):
+            continue
+        key = item.get("link") or item.get("title")
+        published = parse_date(item.get("published"))
+        if not key or key in taken or published is None or published < cutoff:
+            continue
+        taken.add(key)
+        kept.append(item)
+    kept.sort(key=lambda i: i.get("published") or "", reverse=True)
+    return kept[:NEWS_KEEP_MAX]
 
 
 @dataclass
@@ -2298,11 +2468,11 @@ class AcceptanceSite:
         decisions = load_decisions(self.cfg.decisions_path)
         entries = [e for e in data.get("entries", []) if isinstance(e, dict)]
 
-        open_findings, accepted_findings, notes, news = [], [], [], []
+        open_findings, accepted_findings, notes, news, other_news = [], [], [], [], []
         for item in entries:
             identity = item.get("identity")
             if not item.get("local"):
-                news.append(item)
+                (news if item.get("affects_local") else other_news).append(item)
             elif not identity:
                 notes.append(item)
             elif identity in decisions and decisions[identity].active(now):
@@ -2335,6 +2505,10 @@ class AcceptanceSite:
 
         def source_of(item: dict) -> str:
             return f'<span class="pill src">{esc(str(item.get("source", "")))}</span>'
+
+        def published_of(item: dict) -> str:
+            published = parse_date(item.get("published"))
+            return f'<span class="pill quiet">{when(published)}</span>' if published else ""
 
         def accept_form(item: dict) -> str:
             return (
@@ -2394,7 +2568,7 @@ class AcceptanceSite:
             f'<b>{len(open_findings)}</b><span>Offene Funde</span></a>'
             f'<a href="#meldungen" class="stat info"><b>{len(news)}</b><span>Meldungen zum System</span></a>'
             f'<a href="#akzeptiert" class="stat ok"><b>{total_accepted}</b><span>Akzeptiert</span></a>'
-            f'<div class="stat quiet"><b>{len(notes)}</b><span>Nicht pruefbar</span></div>'
+            f'<a href="/news" class="stat quiet"><b>{len(news) + len(other_news)}</b><span>Newsfeed, {NEWS_KEEP_DAYS} Tage</span></a>'
             '</div>'
         )
 
@@ -2411,12 +2585,13 @@ class AcceptanceSite:
             )
 
         if news:
-            parts.append(f'<h2 id="meldungen">Meldungen, die dieses System betreffen ({len(news)})</h2>')
+            parts.append(f'<h2 id="meldungen">Meldungen, die dieses System betreffen ({len(news)})</h2>'
+                         '<p class="hint">Alle Meldungen stehen im <a href="/news">Newsfeed</a>.</p>')
             for item in news:
                 affects = ", ".join(str(a) for a in item.get("affects_local", []))
                 parts.append(
                     '<article class="card news">'
-                    f'<div class="card-head">{source_of(item)}'
+                    f'<div class="card-head">{source_of(item)}{published_of(item)}'
                     f'<span class="pill affects">betrifft {esc(affects)}</span></div>'
                     f'{headline(item)}{cves_of(item)}'
                     f'<p class="summary">{esc(str(item.get("summary", "")))}</p></article>'
@@ -2462,6 +2637,89 @@ class AcceptanceSite:
 
         parts.append(page_footer("Eine Akzeptanz gilt fuer genau diesen Stand des Funds. "
                                  "Kommt eine neue Luecke dazu, wird er wieder gemeldet."))
+        return "".join(parts)
+
+    def news_page(self, source: str = "", affects_only: bool = False) -> str:
+        """Alle Meldungen der letzten Tage, neueste zuerst, nach Tagen
+        gruppiert. Filter ueber die Adresse, damit sie sich verlinken lassen."""
+        esc = html.escape
+        data = self.findings()
+        items = [e for e in data.get("entries", [])
+                 if isinstance(e, dict) and not e.get("local")]
+        items.sort(key=lambda i: i.get("published") or "", reverse=True)
+        sources = sorted({str(i.get("source", "")) for i in items if i.get("source")})
+        affecting = sum(1 for i in items if i.get("affects_local"))
+        shown = [i for i in items
+                 if (not source or i.get("source") == source)
+                 and (not affects_only or i.get("affects_local"))]
+
+        def chip(label: str, href: str, active: bool, count: int) -> str:
+            cls = "chip active" if active else "chip"
+            return f'<a class="{cls}" href="{esc(href)}">{esc(label)} <b>{count}</b></a>'
+
+        def query(**params: str) -> str:
+            params = {k: v for k, v in params.items() if v}
+            return "/news" + ("?" + urllib.parse.urlencode(params) if params else "")
+
+        filters = [chip("Alle", "/news", not source and not affects_only, len(items))]
+        if affecting:
+            filters.append(chip("Betrifft dieses System", query(betrifft="1"),
+                                affects_only and not source, affecting))
+        for name in sources:
+            count = sum(1 for i in items if i.get("source") == name)
+            filters.append(chip(name, query(quelle=name), source == name, count))
+
+        parts = [
+            web_head("SecurityFeed - Newsfeed"),
+            page_header("news"),
+            '<div class="toolbar"><div class="stand">Sicherheitsmeldungen der letzten '
+            f'<b>{NEWS_KEEP_DAYS} Tage</b> aus allen Quellen &middot; Stand '
+            f'<b>{esc(when(parse_date(data.get("updated")), with_date=True)) if data.get("updated") else "noch kein Lauf"}</b>'
+            '</div></div>',
+            f'<nav class="filters">{"".join(filters)}</nav>',
+        ]
+        if not shown:
+            parts.append('<div class="empty">Keine Meldungen'
+                         + (" fuer diesen Filter." if (source or affects_only) else
+                            " &ndash; der naechste Lauf fuellt den Newsfeed.") + '</div>')
+
+        today = datetime.now().astimezone().date()
+        current_day: object = "start"  # nie ein echter Tag - die erste Meldung bekommt immer eine Ueberschrift
+        for item in shown:
+            published = parse_date(item.get("published"))
+            day = published.astimezone().date() if published else None
+            if day != current_day:
+                current_day = day
+                if day is None:
+                    label = "Ohne Datum"
+                elif day == today:
+                    label = "Heute"
+                elif day == today - timedelta(days=1):
+                    label = "Gestern"
+                else:
+                    label = WEEKDAYS[day.weekday()] + ", " + day.strftime("%d.%m.%Y")
+                parts.append(f'<h2 class="day">{label}</h2>')
+            title, link = esc(str(item.get("title", ""))), str(item.get("link") or "")
+            headline = (f'<a class="title" href="{esc(link)}" rel="noopener">{title}</a>'
+                        if link else f'<div class="title">{title}</div>')
+            cves = [c for c in item.get("cves", []) if isinstance(c, str)]
+            chips = "".join(f'<span class="cve">{esc(c)}</span>' for c in cves[:CVE_DISPLAY_CAP])
+            if len(cves) > CVE_DISPLAY_CAP:
+                chips += f'<span class="cve more">+{len(cves) - CVE_DISPLAY_CAP} weitere</span>'
+            affects = ", ".join(str(a) for a in item.get("affects_local", []))
+            parts.append(
+                f'<article class="card {"news" if affects else "other"} feed">'
+                '<div class="card-head">'
+                f'<span class="pill src">{esc(str(item.get("source", "")))}</span>'
+                + (f'<span class="pill quiet">{published.astimezone().strftime("%H:%M")}</span>'
+                   if published else "")
+                + (f'<span class="pill affects">betrifft {esc(affects)}</span>' if affects else "")
+                + f'</div>{headline}'
+                + (f'<div class="cves">{chips}</div>' if chips else "")
+                + f'<p class="summary">{esc(str(item.get("summary", "")))}</p></article>'
+            )
+        parts.append(page_footer("Jede Meldung wird einmal gemailt und bleibt "
+                                 f"{NEWS_KEEP_DAYS} Tage hier stehen."))
         return "".join(parts)
 
     def admin_page(self, message: str = "", error: bool = False) -> str:
@@ -2527,6 +2785,9 @@ class AcceptanceSite:
         return "".join(parts)
 
 
+WEEKDAYS = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
+
+
 def when(moment: datetime | None, with_date: bool = False) -> str:
     """Zeitpunkt in lokaler Zeit, kurz. Ohne Datum, wenn es heute ist."""
     if moment is None:
@@ -2571,7 +2832,14 @@ padding-bottom:6px;border-bottom:1px solid var(--line)}
 border-left:4px solid var(--line)}
 .card.open{border-left-color:var(--danger)} .card.news{border-left-color:var(--info)}
 .card.ok{border-left-color:var(--ok)} .card.expired{border-left-color:var(--warn)} .card.note{border-left-color:var(--muted)}
-.card.plain{border-left-color:var(--accent)}
+.card.plain{border-left-color:var(--accent)} .card.other{border-left-color:var(--line)}
+.card.feed{padding:12px 16px} .card.feed .summary{color:var(--muted)}
+nav.filters{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 8px}
+.chip{display:inline-flex;gap:6px;align-items:center;font-size:13px;font-weight:600;padding:5px 11px;
+border-radius:999px;background:var(--card);color:var(--muted);text-decoration:none;box-shadow:var(--shadow)}
+.chip b{font-weight:700;color:var(--text)} .chip:hover{color:var(--text)}
+.chip.active{background:var(--accent);color:var(--accent-ink)} .chip.active b{color:var(--accent-ink)}
+h2.day{text-transform:none;letter-spacing:0;font-size:14px;color:var(--text);margin:22px 0 8px}
 .card-head{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
 .title{display:block;font-weight:600;font-size:16px;color:var(--text);text-decoration:none;line-height:1.35}
 a.title:hover{color:var(--accent)}
@@ -2633,7 +2901,8 @@ def page_header(active: str) -> str:
         return f'<a href="{href}"{cls}>{label}</a>'
     return ('<header class="top">'
             f'<a class="brand" href="/">{SHIELD_SVG}SecurityFeed</a>'
-            f'<nav>{link("findings", "/", "Funde")}{link("admin", "/admin", "Verwaltung")}</nav>'
+            f'<nav>{link("findings", "/", "Funde")}{link("news", "/news", "Newsfeed")}'
+            f'{link("admin", "/admin", "Verwaltung")}</nav>'
             '</header>')
 
 
@@ -2693,13 +2962,20 @@ class AcceptanceHandler(BaseHTTPRequestHandler):
             # Ohne Anmeldung, damit ein Healthcheck nicht das Passwort braucht.
             self._send(200, "ok", "text/plain; charset=utf-8")
             return
-        if path not in ("/", "/admin"):
+        if path not in ("/", "/admin", "/news"):
             self._send(404, "Nicht gefunden.", "text/plain; charset=utf-8")
             return
         if self._require_user() is None:
             return
-        message = urllib.parse.parse_qs(query).get("m", [""])[0]
-        self._send(200, self.site.admin_page(message) if path == "/admin" else self.site.page(message))
+        params = urllib.parse.parse_qs(query)
+        message = params.get("m", [""])[0]
+        if path == "/news":
+            self._send(200, self.site.news_page(params.get("quelle", [""])[0][:200],
+                                                params.get("betrifft", [""])[0] == "1"))
+        elif path == "/admin":
+            self._send(200, self.site.admin_page(message))
+        else:
+            self._send(200, self.site.page(message))
 
     def do_HEAD(self) -> None:
         self.do_GET()

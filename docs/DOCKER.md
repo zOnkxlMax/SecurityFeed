@@ -488,6 +488,29 @@ Jede Entscheidung trägt den Benutzernamen und den Zeitpunkt. Die Markierung
 „Betrifft dieses System" an Nachrichten bleibt auch für akzeptierte Pakete —
 das ist eine Tatsache, keine Mahnung.
 
+### Kurz-Mail mit Link statt voller Liste
+
+Läuft die Seite, muss die Mail nicht mehr alles enthalten. Mit der Adresse der
+Seite in der `.env` wird sie zum Hinweis:
+
+```bash
+SECFEED_WEB_URL=https://securityfeed.example.org/
+```
+
+Die Funde des Paketscans stehen dann nur noch als Zahl in der Mail: Pakete mit
+Schwachstellen auf dem Host und in Containern sowie Hinweise des Scans — plus
+ein Knopf zur Seite. Keine Paketnamen, keine CVE-Listen; die stehen auf der
+Seite, die immer den aktuellen Stand zeigt. Die Nachrichten bleiben dagegen
+vollständig in der Mail, mit Titel, Link und CVEs — was dieses System betrifft,
+steht zuerst und ist markiert. Der Betreff unterscheidet „Updates nötig" von
+„neue Meldungen, dieses System ist nicht betroffen", damit sich das schon im
+Posteingang auseinanderhalten lässt. Wann eine Mail kommt, ändert sich nicht.
+
+Die Details stehen auf der Seite: Funde unter `/`, alle Meldungen im Newsfeed
+unter `/news`. Jede Meldung wird nur einmal gemailt, deshalb behält die Seite
+die Meldungen der letzten sieben Tage, statt nur die des letzten Laufs zu
+zeigen. Ohne `SECFEED_WEB_URL` bleibt die Mail die volle Liste wie bisher.
+
 ### Jetzt scannen
 
 Oben auf der Seite steht *Jetzt scannen*. Der Knopf startet keinen Scan im

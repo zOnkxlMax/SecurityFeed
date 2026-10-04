@@ -50,6 +50,19 @@ jobs:
           echo "Exit-Code: $code"
           test "$code" -eq 2
 
+      - name: Ungültige Webseiten-Adresse ergibt Exit-Code 2
+        # Eine Kurz-Mail mit kaputtem Link waere schlimmer als gar keine -
+        # das muss beim Start auffallen, nicht erst im Postfach.
+        run: |
+          set +e
+          SECFEED_SMTP_HOST=relay.ci.invalid SECFEED_MAIL_FROM=ci@ci.invalid \
+            SECFEED_MAIL_TO=ci@ci.invalid SECFEED_WEB_URL=securityfeed.ci.invalid \
+            python vulnfeed.py --email --once
+          code=$?
+          set -e
+          echo "Exit-Code: $code"
+          test "$code" -eq 2
+
       - name: Ungültiger Zeitplan ergibt Exit-Code 2
         run: |
           set +e
@@ -107,6 +120,10 @@ jobs:
           grep -q '"by": "ci"' /tmp/sf-state/scan-request.json
           curl -fs -u ci:ci-geheim-123 http://127.0.0.1:8099/ | grep -q 'wartet auf den Scanner'
           rm /tmp/sf-state/scan-request.json
+
+          # Newsfeed: nur angemeldet, zeigt die Seite mit Filterleiste
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/news)" = "401"
+          curl -fs -u ci:ci-geheim-123 http://127.0.0.1:8099/news | grep -q 'class="filters"'
 
           # Verwaltung: nur angemeldet, Passwortwechsel braucht Token und altes Passwort
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/admin)" = "401"

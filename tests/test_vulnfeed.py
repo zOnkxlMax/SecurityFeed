@@ -501,6 +501,137 @@ class TestRendering(unittest.TestCase):
         self.assertIn("Keine neuen Meldungen", vf.render_html([], "Untertitel"))
 
 
+class TestWebUrlConfig(unittest.TestCase):
+    setUp = TestMailConfig.setUp
+    _restore = TestMailConfig._restore
+    _args = TestMailConfig._args
+
+    BASE = ("--email", "--smtp-host", "relay.test", "--mail-from", "a@test.invalid",
+            "--mail-to", "b@test.invalid")
+
+    def test_web_url_from_environment_and_cli(self):
+        self.assertIsNone(vf.mail_config_from_env(self._args(*self.BASE)).web_url)
+        os.environ["SECFEED_WEB_URL"] = "https://securityfeed.example.org/"
+        self.assertEqual(vf.mail_config_from_env(self._args(*self.BASE)).web_url,
+                         "https://securityfeed.example.org/")
+        cfg = vf.mail_config_from_env(self._args(*self.BASE, "--web-url", "http://pi:8080/"))
+        self.assertEqual(cfg.web_url, "http://pi:8080/")
+
+    def test_web_url_must_be_http(self):
+        for bad in ("securityfeed.example.org", "ftp://x.example.org", "https://"):
+            with self.subTest(bad=bad), self.assertRaises(vf.ConfigError):
+                vf.mail_config_from_env(self._args(*self.BASE, "--web-url", bad))
+
+
+class TestNoticeMail(unittest.TestCase):
+    """Mit SECFEED_WEB_URL: nur Zahlen und ein Link, keine Details."""
+
+    URL = "https://securityfeed.example.org/"
+
+    def _cfg(self, **kwargs):
+        defaults = dict(host="h", port=25, sender="from@test.invalid",
+                        recipients=["to@test.invalid"], security="none", web_url=self.URL)
+        defaults.update(kwargs)
+        return vf.MailConfig(**defaults)
+
+    def _parts(self, msg):
+        return (msg.get_body(("plain",)).get_content(), msg.get_body(("html",)).get_content())
+
+    def _entries(self):
+        return [
+            entry(title="openssl 3.0.11: 2 Luecke(n) mit verfuegbarem Fix", source="Lokales System",
+                  local=True, cves=["CVE-2026-1111", "CVE-2026-2222"], link="https://t/openssl"),
+            entry(title="perl 5.40: 1 Luecke(n)", source="Container npm", local=True,
+                  cves=["CVE-2026-3333"], link="https://t/perl"),
+            entry(title="OpenSSL-Luecke in den Nachrichten", affects_local=["openssl"],
+                  cves=["CVE-2026-1111"], link="https://t/news1"),
+            entry(title="Irgendwas mit Routern", link="https://t/news2"),
+            entry(title="Container x: nicht pruefbar", source="Container x", local=True, link=""),
+        ]
+
+    def test_scan_as_counts_news_in_full(self):
+        msg = vf.build_message(self._cfg(), self._entries(), "Lauf vom 04.10.2026 07:00")
+        self.assertIn("Updates noetig", msg["Subject"])
+        self.assertIn("2 Paket(e) mit Schwachstellen", msg["Subject"])
+        self.assertIn("1 Meldung(en) betreffen dieses System", msg["Subject"])
+        text, body = self._parts(msg)
+        for part in (text, body):
+            self.assertIn(self.URL, part)
+            self.assertIn("auf diesem System", part)
+            self.assertIn("in Containern", part)
+            self.assertIn("Hinweis(e) zum Paketscan", part)
+            # Paketfunde nur als Zahl - Name, CVEs und Tracker-Link stehen auf der Seite
+            for detail in ("openssl 3.0.11", "perl 5.40", "CVE-2026-2222", "CVE-2026-3333",
+                           "https://t/openssl", "Container x: nicht pruefbar"):
+                self.assertNotIn(detail, part, "Paketfunde gehoeren auf die Seite, nicht in die Mail")
+            # Nachrichten vollstaendig, was das System betrifft zuerst
+            self.assertIn("Neue Sicherheitsmeldungen (2)", part)
+            self.assertIn("OpenSSL-Luecke in den Nachrichten", part)
+            self.assertIn("Irgendwas mit Routern", part)
+            self.assertLess(part.index("OpenSSL-Luecke"), part.index("Routern"))
+        self.assertIn(f'href="{self.URL}"', body)
+        self.assertIn('href="https://t/news1"', body)
+        self.assertIn("CVE-2026-1111", body)
+        self.assertIn("Betrifft dieses System: openssl", body)
+
+    def test_no_news_no_news_section(self):
+        scan_only = [e for e in self._entries() if e.local]
+        text, body = self._parts(vf.build_message(self._cfg(), scan_only, "Untertitel"))
+        self.assertNotIn("Neue Sicherheitsmeldungen", text)
+        self.assertNotIn("Neue Sicherheitsmeldungen", body)
+
+    def test_only_news_says_system_is_not_affected(self):
+        msg = vf.build_message(self._cfg(), [entry(title="A"), entry(title="B", link="https://t/b")],
+                               "Untertitel")
+        self.assertIn("2 neue Sicherheitsmeldung(en)", msg["Subject"])
+        self.assertIn("nicht betroffen", msg["Subject"])
+        self.assertNotIn("Updates noetig", msg["Subject"])
+
+    def test_empty_run_and_failed_sources(self):
+        msg = vf.build_message(self._cfg(), [], "Untertitel", ["heise Security: Netzwerkfehler"])
+        self.assertIn("keine neuen Meldungen", msg["Subject"])
+        self.assertIn("Warnung: 1 Quelle(n)", msg["Subject"])
+        text, body = self._parts(msg)
+        self.assertIn("Nichts Neues", text)
+        self.assertIn("heise Security: Netzwerkfehler", body)
+        self.assertIn(self.URL, text)
+
+    def test_markup_in_values_is_escaped(self):
+        msg = vf.build_message(self._cfg(web_url='https://x.example.org/"><script>'), [],
+                               "<b>Untertitel</b>")
+        _, body = self._parts(msg)
+        self.assertNotIn("<script>", body)
+        self.assertNotIn("<b>Untertitel</b>", body)
+
+    def test_without_web_url_the_full_list_stays(self):
+        msg = vf.build_message(self._cfg(web_url=None), self._entries(), "Untertitel")
+        _, body = self._parts(msg)
+        self.assertIn("CVE-2026-1111", body)
+        self.assertIn("Irgendwas mit Routern", body)
+
+
+class TestCarryOverNews(unittest.TestCase):
+    def test_keeps_recent_news_and_drops_scan_old_and_duplicates(self):
+        now = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
+        recent = entry(title="Gestern", link="https://t/1", published=now - timedelta(days=1)).as_dict()
+        old = entry(title="Alt", link="https://t/2", published=now - timedelta(days=30)).as_dict()
+        undated = entry(title="Ohne Datum", link="https://t/3", published=None).as_dict()
+        again = entry(title="Wieder da", link="https://t/4", published=now - timedelta(hours=2)).as_dict()
+        scan = entry(title="openssl", link="https://t/5", local=True, published=now).as_dict()
+        previous = {"entries": [recent, old, undated, again, scan, "kaputt"]}
+        fresh = [entry(title="Wieder da, neu", link="https://t/4")]
+        kept = vf.carry_over_news(previous, fresh, now)
+        self.assertEqual([i["title"] for i in kept], ["Gestern"])
+
+    def test_cap_and_order(self):
+        now = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
+        items = [entry(title=f"M{i}", link=f"https://t/{i}",
+                       published=now - timedelta(minutes=i)).as_dict() for i in range(400)]
+        kept = vf.carry_over_news({"entries": list(reversed(items))}, [], now)
+        self.assertEqual(len(kept), vf.NEWS_KEEP_MAX)
+        self.assertEqual(kept[0]["title"], "M0", "neueste zuerst")
+
+
 class TestMessageBuilding(unittest.TestCase):
     def _cfg(self, **kwargs):
         defaults = dict(host="h", port=25, sender="from@test.invalid",
@@ -2216,6 +2347,42 @@ class TestAcceptanceSite(unittest.TestCase):
         vf.save_scan_status(self.site.status_path, "failed", "Zeitplan")
         self.assertIn("abgebrochen", self.site.page())
 
+    def test_newsfeed_lists_all_news_with_filters(self):
+        now = datetime.now(timezone.utc)
+        other = entry(title="Router-Luecke", source="BleepingComputer", link="https://t/r",
+                      published=now - timedelta(days=1))
+        vf.save_findings(self.cfg.findings_path, [self.finding], "Lauf 2", [],
+                         [entry(title="OpenSSL-Luecke in den Nachrichten", source="heise Security",
+                                cves=["CVE-2024-1001"], affects_local=["openssl"],
+                                published=now).as_dict(), other.as_dict()])
+        page = self.site.news_page()
+        self.assertIn("Router-Luecke", page)
+        self.assertIn("OpenSSL-Luecke in den Nachrichten", page)
+        self.assertNotIn("openssl 3.0.11-1", page, "Funde des Paketscans gehoeren nicht in den Newsfeed")
+        self.assertLess(page.index("OpenSSL-Luecke"), page.index("Router-Luecke"), "neueste zuerst")
+        self.assertIn("Heute", page)
+        self.assertIn("Gestern", page)
+        self.assertIn("betrifft openssl", page)
+        self.assertIn("quelle=BleepingComputer", page)
+
+        only = self.site.news_page(source="BleepingComputer")
+        self.assertIn("Router-Luecke", only)
+        self.assertNotIn("OpenSSL-Luecke in den Nachrichten", only)
+        affecting = self.site.news_page(affects_only=True)
+        self.assertNotIn("Router-Luecke", affecting)
+        self.assertIn("fuer diesen Filter", self.site.news_page(source="gibtsnicht"))
+
+        main = self.site.page()
+        self.assertNotIn("Router-Luecke", main, "allgemeine Meldungen stehen nur im Newsfeed")
+        self.assertIn('href="/news"', main)
+
+    def test_newsfeed_escapes_content(self):
+        vf.save_findings(self.cfg.findings_path, [], "Lauf", [],
+                         [entry(title="<script>x</script>", source="<b>Quelle</b>").as_dict()])
+        page = self.site.news_page(source="<b>Quelle</b>")
+        self.assertNotIn("<script>x</script>", page)
+        self.assertNotIn("<b>Quelle</b>", page)
+
     def test_page_escapes_content(self):
         vf.save_findings(self.cfg.findings_path,
                          [entry(title="<script>alert(1)</script>", local=True,
@@ -2416,6 +2583,12 @@ class TestWebServer(unittest.TestCase):
         request = vf.read_json(os.path.join(self.tmp.name, "scan-request.json"))
         self.assertEqual(request["by"], "max")
         self.assertEqual(self._request("/scan", {})[0], 403, "ohne Token nichts")
+
+    def test_newsfeed_over_http(self):
+        self.assertEqual(self._request("/news", auth=False)[0], 401)
+        status, body, _ = self._request("/news?quelle=" + urllib.parse.quote("heise Security"))
+        self.assertEqual(status, 200)
+        self.assertIn("Newsfeed", body)
 
     def test_post_without_login_is_rejected_before_anything_else(self):
         status, _, _ = self._request("/accept", {"token": self.token,

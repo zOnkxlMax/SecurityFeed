@@ -92,7 +92,9 @@ Siehe Abschnitt [Paketscan](#paketscan-was-steckt-hier-drin) weiter unten.
 | —                   | `SECFEED_WEB_PASSWORD`   | Startpasswort, nur als Umgebungsvariable. Über die Seite geändert, liegt es danach als Hash in `web-auth.json` im Zustandsverzeichnis und die Variable gilt nicht mehr |
 | —                   | `SECFEED_ACCEPT_DAYS`    | Vorbelegung des Ablaufdatums (Default 90) |
 
-Unter `/admin` liegt die Verwaltung: dort lässt sich das Passwort ändern, ohne
+Unter `/news` steht der Newsfeed: alle Sicherheitsmeldungen der letzten sieben
+Tage aus allen Quellen, nach Tagen gruppiert und nach Quelle filterbar — auch
+die, die dieses System nicht betreffen. Unter `/admin` liegt die Verwaltung: dort lässt sich das Passwort ändern, ohne
 die `.env` anzufassen. *Jetzt scannen* stößt einen Lauf sofort an — im
 Dauerbetrieb (`--schedule`), der die Anforderung binnen Sekunden abholt. Akzeptierte Funde fallen aus Mail und Wiedervorlage, bis ihr Ablaufdatum
 erreicht ist. Eine Akzeptanz gilt für genau diesen Stand des Funds — kommt eine
@@ -118,6 +120,7 @@ Proxy-Manager-Rezept) bzw.
 | `--mail-to`         | `SECFEED_MAIL_TO`          | Empfänger, mehrere per Komma           |
 | `--subject-prefix`  | `SECFEED_SUBJECT_PREFIX`   | Default `[SecurityFeed]`               |
 | `--send-empty`      | `SECFEED_SEND_EMPTY`       | Auch mailen, wenn nichts Neues da ist — als Lebenszeichen |
+| `--web-url URL`     | `SECFEED_WEB_URL`          | Adresse der Webseite. Gesetzt, nennt die Mail Funde des Paketscans nur als Zahl mit Link zur Seite; die Nachrichten stehen weiter vollständig drin |
 | `--dry-run`         | —                          | Mail ausgeben statt verschicken        |
 
 ### Dauerbetrieb
