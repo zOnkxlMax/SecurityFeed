@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2016,6 +2017,7 @@ class TestWebConfig(unittest.TestCase):
         self.assertEqual(cfg.accept_days, 90)
         self.assertEqual(cfg.decisions_path, os.path.join("/state", "decisions.json"))
         self.assertEqual(cfg.findings_path, os.path.join("/state", "findings.json"))
+        self.assertEqual(cfg.auth_path, os.path.join("/state", "web-auth.json"))
 
     def test_address_from_cli_beats_environment(self):
         cfg = self._cfg("--serve", "127.0.0.1:9000", SECFEED_WEB_LISTEN="0.0.0.0:1",
@@ -2116,6 +2118,104 @@ class TestAcceptanceSite(unittest.TestCase):
         self.assertIn("nicht mehr gemeldet", page)
         self.assertIn("weg 1.0", page)
 
+
+    def test_change_password_switches_the_login(self):
+        ok, message = self.site.change_password("max", "lang-genug", "neues-langes-passwort",
+                                                "neues-langes-passwort")
+        self.assertTrue(ok, message)
+        self.assertIsNone(self.site.authorized(self._auth()), "das alte Passwort gilt nicht mehr")
+        self.assertEqual(self.site.authorized(self._auth(password="neues-langes-passwort")), "max")
+        # zweimal - der zweite Aufruf kommt aus dem Merker, muss aber dasselbe ergeben
+        self.assertEqual(self.site.authorized(self._auth(password="neues-langes-passwort")), "max")
+        self.assertIsNone(self.site.authorized(self._auth(password="neues-langes-passwor")))
+        record = vf.read_json(self.site.auth_path)
+        self.assertEqual((record["user"], record["changed_by"]), ("max", "max"))
+        self.assertNotIn("neues-langes-passwort", open(self.site.auth_path, encoding="utf-8").read())
+        # ein neuer Server mit derselben Ablage kennt das neue Passwort auch
+        fresh = vf.AcceptanceSite(self.cfg)
+        self.assertEqual(fresh.authorized(self._auth(password="neues-langes-passwort")), "max")
+        self.assertIn("gespeichert in web-auth.json", fresh.admin_page())
+
+    def test_change_password_refuses_bad_input(self):
+        cases = {
+            "stimmt nicht": ("falsch", "neues-langes-passwort", "neues-langes-passwort"),
+            "Wiederholung": ("lang-genug", "neues-langes-passwort", "neues-langes-passwor"),
+            "mindestens": ("lang-genug", "kurz", "kurz"),
+            "Beispielwert": ("lang-genug", "aendere-mich", "aendere-mich"),
+            "das alte": ("lang-genug", "lang-genug", "lang-genug"),
+        }
+        for expected, (current, new, repeat) in cases.items():
+            ok, message = self.site.change_password("max", current, new, repeat)
+            self.assertFalse(ok, message)
+            self.assertIn(expected, message)
+        self.assertFalse(os.path.exists(self.site.auth_path), "nichts darf geschrieben worden sein")
+        self.assertEqual(self.site.authorized(self._auth()), "max")
+
+    def test_stored_password_of_another_user_is_ignored(self):
+        vf.write_json(self.site.auth_path, {"user": "anders", "changed_at": "2026-01-01T00:00:00+00:00",
+                                            "changed_by": "anders", **vf.hash_password("fremd-und-lang")})
+        self.assertEqual(self.site.authorized(self._auth()), "max", "es gilt die Umgebung")
+        self.assertIsNone(self.site.authorized(self._auth(password="fremd-und-lang")))
+        page = self.site.admin_page()
+        self.assertIn("anders", page)
+        self.assertIn("aus der Umgebung", page)
+
+    def test_broken_password_file_falls_back_to_environment(self):
+        with open(self.site.auth_path, "w", encoding="utf-8") as fh:
+            fh.write("{kaputt")
+        self.assertEqual(self.site.authorized(self._auth()), "max")
+        vf.write_json(self.site.auth_path, {"user": "max", "algorithm": "pbkdf2_sha256",
+                                            "iterations": "viele", "salt": "zz", "hash": "zz"})
+        self.assertIsNone(self.site.authorized(self._auth()),
+                          "eine unlesbare Datei fuer diesen Benutzer sperrt, statt die Umgebung zu oeffnen")
+
+    def test_admin_page_shows_source_and_form(self):
+        page = self.site.admin_page()
+        self.assertIn("Benutzer: max", page)
+        self.assertIn("aus der Umgebung", page)
+        self.assertIn('action="/admin/password"', page)
+        self.assertIn(self.site.form_token, page)
+        self.assertIn("SECFEED_ACCEPT_DAYS", page)
+        error = self.site.admin_page("<b>Fehler</b>", error=True)
+        self.assertIn('class="error"', error)
+        self.assertNotIn("<b>Fehler</b>", error)
+        self.assertIn("Verwaltung", self.site.page(), "die Hauptseite verweist auf die Verwaltung")
+
+
+    def test_request_scan_writes_one_request_and_shows_it(self):
+        message = self.site.request_scan("max")
+        self.assertIn("angefordert", message)
+        request = vf.read_json(self.site.request_path)
+        self.assertEqual(request["by"], "max")
+        self.assertIn("schon angefordert", self.site.request_scan("max"),
+                      "eine zweite Anforderung ersetzt die offene nicht")
+        page = self.site.page()
+        self.assertIn("wartet auf den Scanner", page)
+        self.assertIn("Scan laeuft", page, "der Knopf ist waehrenddessen gesperrt")
+        self.assertIn('http-equiv="refresh"', page, "die Seite laedt sich neu, bis der Lauf durch ist")
+
+    def test_stale_request_is_replaced_and_flagged(self):
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        vf.write_json(self.site.request_path, {"by": "max", "at": stale})
+        self.assertIn("nicht abgeholt", self.site.page())
+        self.assertIn("angefordert -", self.site.request_scan("max"))
+        self.assertGreater(vf.parse_date(vf.read_json(self.site.request_path)["at"]),
+                           vf.parse_date(stale))
+
+    def test_scan_status_is_shown(self):
+        vf.save_scan_status(self.site.status_path, "running", "Anforderung von max")
+        page = self.site.page()
+        self.assertIn("Scan laeuft", page)
+        self.assertIn("Anforderung von max", page)
+        self.assertIn("laeuft gerade", self.site.request_scan("max"))
+        vf.save_scan_status(self.site.status_path, "done", "Zeitplan", 0)
+        page = self.site.page()
+        self.assertIn("Letzter Lauf: Zeitplan", page)
+        self.assertIn("Jetzt scannen", page)
+        self.assertNotIn('http-equiv="refresh"', page)
+        vf.save_scan_status(self.site.status_path, "failed", "Zeitplan")
+        self.assertIn("abgebrochen", self.site.page())
+
     def test_page_escapes_content(self):
         vf.save_findings(self.cfg.findings_path,
                          [entry(title="<script>alert(1)</script>", local=True,
@@ -2124,6 +2224,63 @@ class TestAcceptanceSite(unittest.TestCase):
         self.assertNotIn("<script>", page)
         self.assertNotIn("<img src=x>", page)
         self.assertIn("&lt;script&gt;", page)
+
+
+class TestScanRequests(unittest.TestCase):
+    """Die Seite legt eine Anforderung ab, der Scheduler holt sie in seiner
+    Warteschleife ab - ohne bis zum naechsten Termin zu warten."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "scan-request.json")
+
+    def test_take_removes_the_request(self):
+        self.assertIsNone(vf.take_scan_request(self.path))
+        vf.request_scan(self.path, "max")
+        self.assertEqual(vf.take_scan_request(self.path)["by"], "max")
+        self.assertFalse(os.path.exists(self.path), "abgeholt heisst geloescht")
+        self.assertIsNone(vf.take_scan_request(self.path))
+
+    def test_wait_returns_early_on_a_request(self):
+        stop = threading.Event()
+        target = datetime.now().astimezone() + timedelta(hours=1)
+        threading.Timer(0.2, vf.request_scan, (self.path, "max")).start()
+        with unittest.mock.patch.object(vf, "SCAN_POLL_SECONDS", 0.05):
+            started = datetime.now()
+            request = vf.wait_for_next(stop, target, self.path)
+        self.assertEqual(request["by"], "max")
+        self.assertLess((datetime.now() - started).total_seconds(), 5)
+
+    def test_wait_ends_at_target_or_stop_without_request(self):
+        stop = threading.Event()
+        past = datetime.now().astimezone() - timedelta(seconds=1)
+        self.assertIsNone(vf.wait_for_next(stop, past, self.path))
+        stop.set()
+        far = datetime.now().astimezone() + timedelta(hours=1)
+        self.assertIsNone(vf.wait_for_next(stop, far, self.path))
+        # ohne Zustandsverzeichnis wird gar nicht erst nachgesehen
+        vf.request_scan(self.path, "max")
+        with unittest.mock.patch.object(vf, "SCAN_POLL_SECONDS", 0.05):
+            stop = threading.Event()
+            threading.Timer(0.2, stop.set).start()
+            self.assertIsNone(vf.wait_for_next(stop, far, None))
+        self.assertTrue(os.path.exists(self.path))
+
+
+class TestPasswordHash(unittest.TestCase):
+    def test_roundtrip(self):
+        record = vf.hash_password("ein-langes-passwort", iterations=2000)
+        self.assertTrue(vf.verify_password("ein-langes-passwort", record))
+        self.assertFalse(vf.verify_password("ein-langes-passwor", record))
+        self.assertNotEqual(record["salt"], vf.hash_password("ein-langes-passwort", 2000)["salt"])
+        self.assertNotIn("ein-langes-passwort", json.dumps(record))
+
+    def test_broken_records_are_rejected_not_raised(self):
+        good = vf.hash_password("x" * 12, iterations=2000)
+        for broken in ({}, {"hash": "00"}, {**good, "salt": "kein-hex"},
+                       {**good, "iterations": 1}, {**good, "algorithm": "md5"}):
+            self.assertFalse(vf.verify_password("x" * 12, broken))
 
 
 class TestClientLabel(unittest.TestCase):
@@ -2167,10 +2324,11 @@ class TestWebServer(unittest.TestCase):
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.token = self.server.site.form_token
 
-    def _request(self, path: str, data: dict | None = None, auth: bool = True):
+    def _request(self, path: str, data: dict | None = None, auth: bool = True,
+                 password: str = "lang-genug"):
         headers = {}
         if auth:
-            headers["Authorization"] = "Basic " + base64.b64encode(b"max:lang-genug").decode()
+            headers["Authorization"] = "Basic " + base64.b64encode(f"max:{password}".encode()).decode()
         body = urllib.parse.urlencode(data).encode() if data is not None else None
         request = urllib.request.Request(self.base + path, data=body, headers=headers,
                                          method="POST" if data is not None else "GET")
@@ -2219,6 +2377,45 @@ class TestWebServer(unittest.TestCase):
                                                  "identity": self.finding.identity})
         self.assertEqual(status, 303)
         self.assertEqual(vf.load_decisions(self.cfg.decisions_path), {})
+
+
+    def test_admin_page_requires_login(self):
+        self.assertEqual(self._request("/admin", auth=False)[0], 401)
+        status, body, _ = self._request("/admin")
+        self.assertEqual(status, 200)
+        self.assertIn("Passwort aendern", body)
+
+    def test_change_password_over_http(self):
+        status, body, _ = self._request("/admin/password", {
+            "token": self.token, "current": "lang-genug",
+            "new": "neues-langes-passwort", "repeat": "neues-langes-passwort",
+        })
+        self.assertEqual(status, 200, "direkt beantwortet, keine Umleitung")
+        self.assertIn("Passwort geaendert", body)
+        self.assertEqual(self._request("/")[0], 401, "das alte Passwort ist weg")
+        self.assertEqual(self._request("/", password="neues-langes-passwort")[0], 200)
+        self.assertTrue(os.path.exists(os.path.join(self.tmp.name, "web-auth.json")))
+
+    def test_change_password_needs_token_and_old_password(self):
+        status, _, _ = self._request("/admin/password", {
+            "current": "lang-genug", "new": "neues-langes-passwort", "repeat": "neues-langes-passwort",
+        })
+        self.assertEqual(status, 403)
+        status, body, _ = self._request("/admin/password", {
+            "token": self.token, "current": "geraten",
+            "new": "neues-langes-passwort", "repeat": "neues-langes-passwort",
+        })
+        self.assertEqual(status, 200)
+        self.assertIn('class="error"', body)
+        self.assertEqual(self._request("/")[0], 200, "das Passwort ist unveraendert")
+
+    def test_scan_request_over_http(self):
+        status, _, headers = self._request("/scan", {"token": self.token})
+        self.assertEqual(status, 303)
+        self.assertIn("angefordert", urllib.parse.unquote_plus(headers.get("Location", "")))
+        request = vf.read_json(os.path.join(self.tmp.name, "scan-request.json"))
+        self.assertEqual(request["by"], "max")
+        self.assertEqual(self._request("/scan", {})[0], 403, "ohne Token nichts")
 
     def test_post_without_login_is_rejected_before_anything_else(self):
         status, _, _ = self._request("/accept", {"token": self.token,
