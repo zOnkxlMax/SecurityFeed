@@ -409,8 +409,14 @@ Container falsch bewertet.
 
 Zwei Dinge, die das Verfahren bewusst anders macht als ein stiller Scanner:
 
-- **Container ohne Paketdatenbank** (distroless, scratch) erscheinen als
-  „Container xy: nicht prüfbar" samt Imagename. Sie fehlen nicht einfach — sonst
+- **Container ohne Paketdatenbank** (distroless, scratch, oder eine Basis wie
+  Oracle Linux, für die es keine Schwachstellendaten gibt) erscheinen als
+  „Container xy: nicht prüfbar" samt Imagename. Für sie gleicht das
+  Sammelskript wenigstens das Image mit der Registry ab, höchstens alle sechs
+  Stunden: Gibt es dort ein neueres, heißt der Eintrag „nicht prüfbar,
+  neueres Image verfügbar" und nennt beide Versionen — ein neues Image bringt
+  in der Regel auch die Sicherheitsupdates seiner Basis mit. Ein als „nicht
+  prüfbar" akzeptierter Container meldet sich dann trotzdem wieder. Sie fehlen nicht einfach — sonst
   sähe ein ungeprüfter Container aus wie ein unauffälliger. Debian- und
   Alpine-Container werden dagegen beide normal geprüft, jeder gegen seine
   eigene Distributionsversion.
@@ -470,6 +476,12 @@ services:
 
 Dann `docker compose up -d`. Die Seite ist unter `http://<pi>:8080/` erreichbar,
 der Browser fragt nach Benutzer und Passwort.
+
+Der Web-Container liest dieselbe `.env` wie der Scanner, plant aber trotz
+`SECFEED_SCHEDULE` keine eigenen Läufe: `--serve` startet den Zeitplan nur, wenn
+`--schedule` ausdrücklich dabeisteht. Bis Version 1.0.0 lief dort ein zweiter
+Scanner ohne Paketlisten und ohne Mailversand mit — er überschrieb den Stand der
+Seite und schnappte sich „Jetzt scannen".
 
 ### Was „akzeptieren" bedeutet
 
@@ -692,8 +704,13 @@ abends mit.
 ## Aktualisieren
 
 ```bash
-cd ~/securityfeed && git pull && docker compose up -d --build
+cd ~/securityfeed && git pull && docker compose build --pull --no-cache && docker compose up -d
 ```
+
+`--pull` holt das neueste Python-Basis-Image, `--no-cache` sorgt dafür, dass
+das `apt-get upgrade` im Dockerfile wirklich neu läuft und Debian-Sicherheitsupdates
+mitnimmt, die das Basis-Image noch nicht enthält. So taucht der Scanner nicht
+selbst in seiner Liste auf.
 
 Deine `.env` und eine etwaige `compose.override.yaml` bleiben unangetastet, beide
 sind per `.gitignore` ausgeschlossen. Das State-Volume bleibt ebenfalls erhalten,

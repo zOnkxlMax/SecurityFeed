@@ -880,13 +880,20 @@ class TestScheduleActivation(unittest.TestCase):
             os.environ["SECFEED_SCHEDULE"] = self.previous
 
     def _resolve(self, *argv) -> list[tuple[int, int]] | None:
-        """Bildet die Entscheidung aus main() nach: Dauerbetrieb oder Einzellauf?"""
-        args = vf.build_parser().parse_args(list(argv))
-        if args.once or args.dry_run:
-            spec = None
-        else:
-            spec = args.schedule or os.environ.get("SECFEED_SCHEDULE")
+        """Die Entscheidung aus main(): Dauerbetrieb oder Einzellauf?"""
+        spec = vf.resolve_schedule_spec(vf.build_parser().parse_args(list(argv)))
         return vf.parse_schedule(spec) if spec else None
+
+    def test_web_page_ignores_schedule_from_environment(self):
+        # Webseite und Scanner teilen sich die .env - die Seite darf daraus
+        # keinen zweiten Scanner machen.
+        os.environ["SECFEED_SCHEDULE"] = "07:00,18:00"
+        self.assertIsNone(self._resolve("--serve", "0.0.0.0:8080"))
+        self.assertIsNone(self._resolve("--serve"))
+
+    def test_web_page_schedules_only_with_explicit_flag(self):
+        os.environ["SECFEED_SCHEDULE"] = "07:00,18:00"
+        self.assertEqual(self._resolve("--serve", "--schedule", "06:30"), [(6, 30)])
 
     def test_environment_alone_activates_scheduler(self):
         os.environ["SECFEED_SCHEDULE"] = "07:00,18:00"
@@ -2433,6 +2440,78 @@ class TestScanRequests(unittest.TestCase):
             threading.Timer(0.2, stop.set).start()
             self.assertIsNone(vf.wait_for_next(stop, far, None))
         self.assertTrue(os.path.exists(self.path))
+
+
+class TestImageStatus(unittest.TestCase):
+    """Nicht pruefbare Container: wenigstens sagen, ob es ein neueres Image gibt."""
+
+    NOW = datetime(2026, 10, 17, 9, 0, tzinfo=timezone.utc)
+
+    def _status(self, **kw) -> vf.ImageStatus:
+        base = dict(image="mysql:8.4", local="sha256:aaa", remote="sha256:aaa",
+                    local_version="8.4.11", remote_version="8.4.11",
+                    checked=self.NOW - timedelta(hours=1))
+        base.update(kw)
+        return vf.ImageStatus(**base)
+
+    def test_parse_and_state(self):
+        st = vf.ImageStatus.parse("image=mysql:8.4\nlocal=sha256:a\nremote=sha256:b\n"
+                                  "local_version=8.4.11-1.el9\nremote_version=8.4.12-1.el9\n"
+                                  "checked=2026-10-17T07:42:32Z\n")
+        self.assertEqual((st.image, st.local_version, st.remote_version),
+                         ("mysql:8.4", "8.4.11-1.el9", "8.4.12-1.el9"))
+        self.assertEqual(st.state(self.NOW), "newer")
+        self.assertEqual(self._status().state(self.NOW), "current")
+        self.assertEqual(self._status(error="Registry nicht erreichbar").state(self.NOW), "unknown")
+        self.assertEqual(self._status(remote="").state(self.NOW), "unknown")
+        self.assertEqual(self._status(checked=self.NOW - timedelta(days=3)).state(self.NOW), "unknown",
+                         "ein alter Abgleich sagt nichts ueber heute")
+
+    def test_entry_for_newer_current_and_unknown(self):
+        base = vf.unscanned_entry(vf.SkippedTarget("mysql", "keine Paketliste"), self.NOW)
+        newer = vf.unscanned_entry(vf.SkippedTarget(
+            "mysql", "keine Paketliste", self._status(remote="sha256:bbb", remote_version="8.4.12")), self.NOW)
+        self.assertTrue(newer.title.endswith(vf.NEWER_IMAGE_SUFFIX))
+        self.assertIn("Version 8.4.12", newer.summary)
+        self.assertIn("installiert ist Version 8.4.11", newer.summary)
+        self.assertIn("docker compose pull", newer.summary)
+        self.assertNotEqual(newer.identity, base.identity,
+                            "ein neues Image ist eine neue Lage, auch wenn 'nicht pruefbar' akzeptiert ist")
+        self.assertFalse(newer.cves)
+
+        current = vf.unscanned_entry(vf.SkippedTarget("mysql", "keine Paketliste", self._status()), self.NOW)
+        self.assertIn("Image ist aktuell", current.title)
+        self.assertEqual(current.identity, base.identity, "bestehende Akzeptanzen gelten weiter")
+
+        unknown = vf.unscanned_entry(vf.SkippedTarget(
+            "mysql", "keine Paketliste", self._status(error="lokal gebautes Image ohne Registry-Digest")), self.NOW)
+        self.assertEqual(unknown.title, "Container mysql: nicht pruefbar")
+        self.assertIn("lokal gebautes Image", unknown.summary)
+
+    def test_digest_when_no_version(self):
+        st = self._status(remote="sha256:0123456789abcdef0123", remote_version="", local_version="")
+        self.assertEqual(vf.describe_image(st, remote=True), "Digest 0123456789ab")
+
+    def test_read_from_container_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "mysql"))
+            with open(os.path.join(tmp, "mysql", "unsupported"), "w") as fh:
+                fh.write("keine Paketliste im Container gefunden\n")
+            result = vf.read_container_list(tmp, "mysql")
+            self.assertIsNone(result.image)
+            with open(os.path.join(tmp, "mysql", "image-status"), "w") as fh:
+                fh.write("image=mysql:8.4\nlocal=sha256:a\nremote=sha256:b\nchecked=2026-10-17T07:00:00Z\n")
+            result = vf.read_container_list(tmp, "mysql")
+            self.assertEqual(result.reason, "keine Paketliste im Container gefunden")
+            self.assertEqual(result.image.remote, "sha256:b")
+
+    def test_notice_counts_newer_images_separately(self):
+        newer = vf.unscanned_entry(vf.SkippedTarget(
+            "mysql", "x", self._status(remote="sha256:bbb")), self.NOW)
+        plain = vf.unscanned_entry(vf.SkippedTarget("other", "x"), self.NOW)
+        rows = dict((label, n) for n, label in vf.notice_counts([newer, plain]))
+        self.assertEqual(rows["nicht pruefbare(r) Container mit neuerem Image in der Registry"], 1)
+        self.assertEqual(rows["Hinweis(e) zum Paketscan, z.B. nicht pruefbare Container"], 1)
 
 
 class TestPasswordHash(unittest.TestCase):

@@ -327,6 +327,18 @@ jobs:
           test -s /tmp/ci-container-lists/ci-busybox/unsupported
           grep -q "busybox" /tmp/ci-container-lists/ci-busybox/unsupported
 
+          # Fuer nicht pruefbare Container der Abgleich mit der Registry. busybox
+          # ist eben erst gezogen, lokal und Registry muessen also uebereinstimmen.
+          cat /tmp/ci-container-lists/ci-busybox/image-status
+          grep -q "^image=busybox:latest$" /tmp/ci-container-lists/ci-busybox/image-status
+          local_digest=$(sed -n 's/^local=//p' /tmp/ci-container-lists/ci-busybox/image-status)
+          remote_digest=$(sed -n 's/^remote=//p' /tmp/ci-container-lists/ci-busybox/image-status)
+          case "$local_digest" in sha256:*) ;; *) echo "kein lokaler Digest"; exit 1 ;; esac
+          test "$local_digest" = "$remote_digest"
+          test "$(stat -c %a /tmp/ci-container-lists/ci-busybox/image-status)" = "640"
+          # Pruefbare Container bekommen keinen Abgleich - sie haben echte Befunde.
+          test ! -f /tmp/ci-container-lists/ci-alpine/image-status
+
           # Zeitstempel, an dem SecurityFeed veraltete Listen erkennt.
           test -f /tmp/ci-container-lists/updated
 

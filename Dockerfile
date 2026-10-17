@@ -7,7 +7,12 @@ FROM python:3.13-slim-bookworm
 # tzdata ist in den slim-Images nicht enthalten. Ohne die Datenbank kann
 # TZ=Europe/Berlin nicht aufgeloest werden und der Zeitplan liefe in UTC.
 # ca-certificates braucht urllib fuer die HTTPS-Feeds.
+# Das upgrade holt Debian-Sicherheitsupdates, die das Python-Basis-Image noch
+# nicht enthaelt - ausgerechnet der Scanner soll nicht selbst in der Liste
+# stehen. Damit es greift, mit --no-cache bauen:
+#   docker compose build --pull --no-cache
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends tzdata ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

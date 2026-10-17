@@ -87,7 +87,7 @@ Siehe Abschnitt [Paketscan](#paketscan-was-steckt-hier-drin) weiter unten.
 
 | Option              | Umgebungsvariable        | Bedeutung                              |
 | ------------------- | ------------------------ | -------------------------------------- |
-| `--serve [HOST:PORT]` | `SECFEED_WEB_LISTEN`   | Seite mit den Funden anbieten, auf der sie sich akzeptieren lassen (Default `0.0.0.0:8080`) |
+| `--serve [HOST:PORT]` | `SECFEED_WEB_LISTEN`   | Seite mit den Funden anbieten, auf der sie sich akzeptieren lassen (Default `0.0.0.0:8080`). Plant nur mit ausdrücklichem `--schedule` auch Läufe, `SECFEED_SCHEDULE` aus der Umgebung allein reicht dafür nicht |
 | `--web-user`        | `SECFEED_WEB_USER`       | Benutzername für die Anmeldung          |
 | —                   | `SECFEED_WEB_PASSWORD`   | Startpasswort, nur als Umgebungsvariable. Über die Seite geändert, liegt es danach als Hash in `web-auth.json` im Zustandsverzeichnis und die Variable gilt nicht mehr |
 | —                   | `SECFEED_ACCEPT_DAYS`    | Vorbelegung des Ablaufdatums (Default 90) |
