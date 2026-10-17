@@ -25,6 +25,8 @@
 #   <ziel>/<name>/status       dpkg-Statusdatei aus dem Container
 #   <ziel>/<name>/os-release   /etc/os-release, fuer die Debian-Version
 #   <ziel>/<name>/unsupported  Grund, falls keine Paketliste zu holen war
+#   <ziel>/<name>/image-status nur bei "unsupported": lokales Image gegen die
+#                              Registry (Digest, Version, Zeitpunkt)
 #   <ziel>/updated             Zeitstempel dieses Laufs
 
 set -eu
@@ -45,6 +47,85 @@ ablegen() {
     mv "$1" "$2"
     chmod 0640 "$2"
     chown "$EIGENTUEMER" "$2"
+}
+
+# Abgleich lokales Image gegen Registry, fuer Container ohne Paketliste. Was
+# sich nicht pruefen laesst, soll wenigstens sagen koennen, ob es ein neueres
+# Image gibt. Hoechstens alle 6 Stunden je Image - der Timer laeuft stuendlich,
+# und Docker Hub zaehlt Manifest-Abrufe gegen ein Limit.
+IMAGE_CHECK_MAX_AGE=21600
+
+# Version aus Image-Konfiguration (JSON): erst das OCI-Label, sonst eine
+# Umgebungsvariable <NAME>_VERSION, wie sie die offiziellen Images setzen
+# (MYSQL_VERSION, PG_VERSION ...).
+version_aus() {
+    v=$(printf '%s' "$1" | grep -o '"org.opencontainers.image.version":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+    if [ -z "$v" ]; then
+        v=$(printf '%s' "$1" | grep -o "\"$2=[^\"]*\"" | head -n 1 | cut -d= -f2- | tr -d '"')
+    fi
+    printf '%s' "$v"
+}
+
+pruefe_image() {
+    NAME="$1"; VERZ="$2"
+    DATEI="$VERZ/image-status"
+    IMAGE=$(docker inspect -f '{{.Config.Image}}' "$NAME" 2>/dev/null) || return 0
+    REPO=${IMAGE%@*}
+    # Der Tag steht hinter dem letzten "/" - davor kann ein Registry-Port sein.
+    case "${REPO##*/}" in *:*) REPO=${REPO%:*} ;; esac
+
+    # Lokaler Digest: steht im Namen (image@sha256:...) oder in RepoDigests.
+    case "$IMAGE" in
+        *@*) LOKAL=${IMAGE#*@} ;;
+        *)   LOKAL=$(docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE" 2>/dev/null \
+                       | grep -F "$REPO@" | head -n 1 | sed 's/.*@//') ;;
+    esac
+
+    # Frisch genug und dasselbe lokale Image: nicht erneut fragen.
+    if [ -n "$LOKAL" ] && [ -f "$DATEI" ] && grep -qx "local=$LOKAL" "$DATEI"; then
+        ALTER=$(( $(date +%s) - $(stat -c %Y "$DATEI") ))
+        [ "$ALTER" -lt "$IMAGE_CHECK_MAX_AGE" ] && return 0
+    fi
+
+    ENV_NAME=$(basename "$REPO" | tr '[:lower:]-.' '[:upper:]__')_VERSION
+    REMOTE=""; LV=""; RV=""; FEHLER=""
+    if [ -z "$LOKAL" ]; then
+        FEHLER="lokal gebautes Image ohne Registry-Digest"
+    else
+        LV=$(version_aus "$(docker image inspect -f '{{json .Config}}' "$IMAGE" 2>/dev/null)" "$ENV_NAME")
+        # Eigenes, leeres Docker-Config-Verzeichnis: unter systemd ist /root
+        # nicht erreichbar (ProtectHome), und fuer oeffentliche Images genuegt
+        # anonymer Zugriff.
+        CFG=$(mktemp -d)
+        if REMOTE=$(DOCKER_CONFIG="$CFG" timeout 60 docker buildx imagetools inspect "$IMAGE" \
+                      --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"') && [ -n "$REMOTE" ]; then
+            RV=$(version_aus "$(DOCKER_CONFIG="$CFG" timeout 60 docker buildx imagetools inspect "$IMAGE" \
+                      --format '{{json .Image}}' 2>/dev/null)" "$ENV_NAME")
+        else
+            REMOTE=""
+            FEHLER="Registry nicht erreichbar oder Image dort unbekannt"
+        fi
+        rm -rf "$CFG"
+    fi
+
+    {
+        echo "image=$IMAGE"
+        echo "local=$LOKAL"
+        echo "remote=$REMOTE"
+        echo "local_version=$LV"
+        echo "remote_version=$RV"
+        echo "checked=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if [ -n "$FEHLER" ]; then echo "error=$FEHLER"; fi
+    } > "$DATEI.neu"
+    ablegen "$DATEI.neu" "$DATEI"
+
+    if [ -n "$FEHLER" ]; then
+        echo "$NAME: Image-Abgleich nicht moeglich ($FEHLER)"
+    elif [ "$LOKAL" = "$REMOTE" ]; then
+        echo "$NAME: Image ist aktuell${LV:+ ($LV)}"
+    else
+        echo "$NAME: neueres Image verfuegbar${RV:+ ($RV)}"
+    fi
 }
 
 if ! command -v docker >/dev/null 2>&1; then
@@ -89,6 +170,7 @@ for NAME in $LAUFEND; do
     rm -f "$VERZ/status.neu" "$VERZ/apk-installed.neu"
 
     if [ -n "$ART" ]; then
+        rm -f "$VERZ/image-status"
         # Ohne os-release fehlt die Distributionsversion, und ohne die wird
         # nicht geraten, sondern nicht geprueft.
         if docker cp -L "$NAME:/etc/os-release" "$VERZ/os-release.neu" >/dev/null 2>&1; then
@@ -108,6 +190,9 @@ for NAME in $LAUFEND; do
             "$IMAGE" > "$VERZ/unsupported.neu"
         ablegen "$VERZ/unsupported.neu" "$VERZ/unsupported"
         echo "$NAME: weder dpkg noch apk, als nicht pruefbar vermerkt"
+        # Ein Fehlschlag hier darf den Lauf nicht abbrechen - die Paketlisten
+        # der anderen Container sind wichtiger als dieser Zusatz.
+        pruefe_image "$NAME" "$VERZ" || echo "$NAME: Image-Abgleich fehlgeschlagen"
     fi
 done
 

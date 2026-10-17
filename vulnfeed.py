@@ -131,6 +131,13 @@ CONTAINER_STATUS_FILE = "status"          # dpkg, also Debian und Verwandte
 CONTAINER_APK_FILE = "apk-installed"      # apk, also Alpine
 CONTAINER_OS_RELEASE_FILE = "os-release"
 CONTAINER_UNSUPPORTED_FILE = "unsupported"  # Grund, falls keine Liste lesbar
+# Fuer Container ohne Paketliste: lokales Image gegen die Registry, siehe
+# deploy/dump-container-packages.sh. Was sich nicht pruefen laesst, soll
+# wenigstens sagen koennen, ob es ein neueres Image gibt.
+CONTAINER_IMAGE_STATUS_FILE = "image-status"
+# Aelter, und der Abgleich sagt nichts mehr ueber den heutigen Stand.
+IMAGE_STATUS_MAX_AGE = timedelta(hours=48)
+NEWER_IMAGE_SUFFIX = "neueres Image verfuegbar"
 CONTAINER_STAMP_FILE = "updated"            # mtime = letzter Lauf des Skripts
 
 # Aelter als das, und die Listen beschreiben womoeglich Container, die es so
@@ -432,12 +439,41 @@ class ScanTarget:
 
 
 @dataclass(frozen=True)
+class ImageStatus:
+    """Abgleich des lokalen Images mit der Registry, vom Dump-Skript abgelegt."""
+    image: str = ""
+    local: str = ""            # Digest des lokalen Images
+    remote: str = ""           # Digest desselben Tags in der Registry
+    local_version: str = ""
+    remote_version: str = ""
+    checked: datetime | None = None
+    error: str = ""
+
+    def state(self, now: datetime) -> str:
+        """newer | current | unknown"""
+        if self.error or not self.local or not self.remote or self.checked is None:
+            return "unknown"
+        if now - self.checked > IMAGE_STATUS_MAX_AGE:
+            return "unknown"
+        return "current" if self.local == self.remote else "newer"
+
+    @classmethod
+    def parse(cls, text: str) -> "ImageStatus":
+        f = parse_key_values(text)
+        return cls(image=f.get("image", ""), local=f.get("local", ""),
+                   remote=f.get("remote", ""), local_version=f.get("local_version", ""),
+                   remote_version=f.get("remote_version", ""),
+                   checked=parse_date(f.get("checked")), error=f.get("error", ""))
+
+
+@dataclass(frozen=True)
 class SkippedTarget:
     """Ein System, das sich nicht pruefen liess. Kommt ausdruecklich in die
     Mail: stillschweigend uebergangene Container waeren die schlechtere
     Variante von 'keine Befunde'."""
     name: str
     reason: str
+    image: ImageStatus | None = None
 
 
 # ${source:Version} faellt automatisch auf die Binaerversion zurueck, wenn das
@@ -702,9 +738,17 @@ def read_container_list(directory: str, name: str) -> ScanTarget | SkippedTarget
     try:
         with open(os.path.join(base, CONTAINER_UNSUPPORTED_FILE),
                   "r", encoding="utf-8", errors="replace") as fh:
-            return SkippedTarget(name, fh.read().strip() or "keine Paketliste vorhanden")
+            reason = fh.read().strip() or "keine Paketliste vorhanden"
     except OSError:
         pass
+    else:
+        try:
+            with open(os.path.join(base, CONTAINER_IMAGE_STATUS_FILE),
+                      "r", encoding="utf-8", errors="replace") as fh:
+                image = ImageStatus.parse(fh.read())
+        except OSError:
+            image = None
+        return SkippedTarget(name, reason, image)
 
     # Je nachdem, was das Sammelskript vorgefunden hat: dpkg oder apk.
     packages: list[Package] = []
@@ -922,19 +966,50 @@ def unscanned_entry(skipped: SkippedTarget, now: datetime,
     # dieselbe Wiedervorlage wie bei den Funden. Und er laesst sich akzeptieren:
     # ein distroless-Container ohne Paketdatenbank ist eine bewusste Wahl.
     identity = f"local:{skipped.name or 'host'}:ungeprueft:{skipped.reason}"
+    title = f"{what}: nicht pruefbar"
+    summary = (f"{skipped.reason}. Dieses System steckt in keiner der obigen "
+               "Bewertungen - es wurde nicht geprueft, nicht fuer unauffaellig "
+               "befunden.")
+    image = skipped.image
+    state = image.state(now) if image else None
+    if image and state == "newer":
+        # Ein neues Image in der Registry ist eine neue Lage: eigene Identitaet,
+        # also wieder in der Mail - auch wenn der Container selbst als "nicht
+        # pruefbar" akzeptiert ist.
+        identity += f":image:{image.remote}"
+        title = f"{what}: nicht pruefbar, {NEWER_IMAGE_SUFFIX}"
+        summary += (f" In der Registry gibt es ein neueres Image ({describe_image(image, remote=True)},"
+                    f" installiert ist {describe_image(image, remote=False)}). Ein neues Image"
+                    " bringt in der Regel auch die Sicherheitsupdates seiner Basis mit."
+                    " Aktualisieren im Projektordner des Containers: docker compose pull &&"
+                    " docker compose up -d")
+    elif image and state == "current":
+        title = f"{what}: nicht pruefbar, Image ist aktuell"
+        summary += (f" Das Image entspricht aber dem neuesten in der Registry"
+                    f" ({describe_image(image, remote=True)}, abgeglichen"
+                    f" {image.checked.astimezone().strftime('%d.%m.%Y %H:%M')}).")
+    elif image:
+        why = image.error or "Abgleich zu alt oder unvollstaendig"
+        summary += f" Ob es ein neueres Image gibt, liess sich nicht feststellen: {why}."
     return Entry(
         source=what,
-        title=f"{what}: nicht pruefbar",
+        title=title,
         link="",
         published=now,
-        summary=f"{skipped.reason}. Dieses System steckt in keiner der obigen "
-                "Bewertungen - es wurde nicht geprueft, nicht fuer unauffaellig "
-                "befunden.",
+        summary=summary,
         advisory=True,
         local=True,
         key=f"{identity}:{window}",
         identity=identity,
     )
+
+
+def describe_image(image: ImageStatus, remote: bool) -> str:
+    """Version, falls das Image eine nennt, sonst der gekuerzte Digest."""
+    version = image.remote_version if remote else image.local_version
+    digest = image.remote if remote else image.local
+    short = digest.split(":", 1)[-1][:12] if digest else "?"
+    return f"Version {version}" if version else f"Digest {short}"
 
 
 def stale_lists_entry(age: timedelta | None, directory: str, now: datetime) -> Entry:
@@ -1505,10 +1580,12 @@ def notice_counts(entries: list[Entry]) -> list[tuple[int, str]]:
     host = [e for e in findings if not e.source.startswith("Container ")]
     containers = [e for e in findings if e.source.startswith("Container ")]
     notes = [e for e in entries if e.local and not e.cves]
+    newer = [e for e in notes if e.title.endswith(NEWER_IMAGE_SUFFIX)]
     rows = [
         (len(host), "Paket(e) mit bekannten Schwachstellen auf diesem System"),
         (len(containers), "Paket(e) mit bekannten Schwachstellen in Containern"),
-        (len(notes), "Hinweis(e) zum Paketscan, z.B. nicht pruefbare Container"),
+        (len(newer), "nicht pruefbare(r) Container mit neuerem Image in der Registry"),
+        (len(notes) - len(newer), "Hinweis(e) zum Paketscan, z.B. nicht pruefbare Container"),
     ]
     return [(n, label) for n, label in rows if n]
 
@@ -3095,6 +3172,25 @@ def log(message: str) -> None:
     print(f"[{stamp}] {message}", flush=True)
 
 
+def resolve_schedule_spec(args: argparse.Namespace) -> str | None:
+    """Zeitplan fuer den Dauerbetrieb, oder None fuer einen Einzellauf bzw.
+    nur die Webseite."""
+    # SECFEED_SCHEDULE steckt im Container in der Service-Umgebung und wird
+    # daher auch an "docker compose run" durchgereicht. Ohne diese Ausnahme
+    # wuerde ein dortiger Einzelaufruf den Scheduler starten und haengen.
+    if args.once or args.dry_run:
+        return None
+    # Die Webseite plant nur dann eigene Laeufe, wenn --schedule ausdruecklich
+    # dabei steht. Aus der Umgebung allein nicht: Webseite und Scanner teilen
+    # sich im Compose-Betrieb dieselbe .env - und ein zweiter Scanner im
+    # Web-Container, ohne Paketlisten und ohne Mailversand, ueberschrieb dann
+    # den Stand der Seite, schnappte sich "Jetzt scannen" und markierte neue
+    # Meldungen als gemeldet, ohne sie zu mailen.
+    if args.serve is not None:
+        return args.schedule
+    return args.schedule or os.environ.get("SECFEED_SCHEDULE")
+
+
 def run_scheduler(args: argparse.Namespace, mail_cfg: MailConfig | None,
                   state_path: str | None, times: list[tuple[int, int]]) -> int:
     stop = threading.Event()
@@ -3182,13 +3278,7 @@ def main(argv: list[str] | None = None) -> int:
         # Nur zur Pruefung - im Dauerbetrieb soll ein Zahlendreher in der
         # Umgebung sofort auffallen und nicht erst beim ersten Lauf.
         local_options(args)
-        # SECFEED_SCHEDULE steckt im Container in der Service-Umgebung und wird
-        # daher auch an "docker compose run" durchgereicht. Ohne diese Ausnahme
-        # wuerde ein dortiger Einzelaufruf den Scheduler starten und haengen.
-        if args.once or args.dry_run:
-            schedule_spec = None
-        else:
-            schedule_spec = args.schedule or os.environ.get("SECFEED_SCHEDULE")
+        schedule_spec = resolve_schedule_spec(args)
         times = parse_schedule(schedule_spec) if schedule_spec else None
     except ConfigError as exc:
         print(exc, file=sys.stderr)

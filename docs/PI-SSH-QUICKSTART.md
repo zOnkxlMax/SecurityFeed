@@ -307,7 +307,7 @@ Neue Programmversion einspielen — holt den aktuellen Stand aus GitHub, baut ne
 und ersetzt den Container:
 
 ```bash
-cd ~/securityfeed && git pull && docker compose up -d --build
+cd ~/securityfeed && git pull && docker compose build --pull --no-cache && docker compose up -d
 ```
 
 Deine `.env` bleibt dabei unangetastet: sie ist per `.gitignore` ausgeschlossen,
