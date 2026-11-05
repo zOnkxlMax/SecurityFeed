@@ -134,6 +134,23 @@ class TestFeedParsing(unittest.TestCase):
         entries = vf.parse_atom(ET.fromstring(feed), "heise")
         self.assertEqual(entries[0].link, "")
 
+    def test_only_http_links_survive(self):
+        self.assertEqual(vf.safe_link(" https://example.test/a "), "https://example.test/a")
+        self.assertEqual(vf.safe_link("HTTP://example.test/"), "HTTP://example.test/")
+        for bad in ("javascript:alert(1)", " JavaScript:alert(1)", "data:text/html,x",
+                    "file:///etc/passwd", "ftp://example.test/", "//example.test", "", None):
+            self.assertEqual(vf.safe_link(bad), "", f"{bad!r} muss verworfen werden")
+
+    def test_feed_with_javascript_link_yields_no_link(self):
+        rss = RSS_FIXTURE.replace("https://example.test/vbulletin-rce/", "javascript:alert(1)")
+        self.assertEqual(vf.parse_rss(ET.fromstring(rss), "Beispiel")[0].link, "")
+        atom = ATOM_FIXTURE.replace("https://example.test/loadmaster", "javascript:alert(1)")
+        self.assertEqual(vf.parse_atom(ET.fromstring(atom), "heise")[0].link, "")
+
+    def test_html_mail_drops_unsafe_link(self):
+        rendered = vf.render_html([entry(link="javascript:alert(1)")], "Lauf")
+        self.assertNotIn("javascript:", rendered)
+
 
 class TestVulnHeuristic(unittest.TestCase):
     def test_advisory_flag_always_counts(self):
@@ -2600,6 +2617,26 @@ class TestWebServer(unittest.TestCase):
 
     def test_unknown_path_is_404(self):
         self.assertEqual(self._request("/gibtsnicht")[0], 404)
+
+    def test_pages_send_a_script_free_csp(self):
+        for path in ("/", "/news", "/admin"):
+            status, body, headers = self._request(path)
+            self.assertEqual(status, 200)
+            csp = headers.get("Content-Security-Policy", "")
+            self.assertIn("default-src 'none'", csp)
+            self.assertIn("frame-ancestors 'none'", csp)
+            self.assertNotIn("unsafe-inline", csp)
+            self.assertNotIn("<script", body)
+            self.assertEqual(headers.get("X-Frame-Options"), "DENY")
+
+    def test_stored_javascript_link_is_not_rendered(self):
+        # findings.json aus der Zeit vor der Link-Pruefung
+        old = entry(title="Alter Eintrag", link="javascript:alert(1)")
+        vf.save_findings(self.cfg.findings_path, [self.finding, old], "Lauf", [])
+        for path in ("/", "/news"):
+            _, body, _ = self._request(path)
+            self.assertNotIn("javascript:", body)
+        self.assertIn("Alter Eintrag", body)  # der Eintrag selbst bleibt sichtbar
 
     def test_accept_needs_the_form_token(self):
         status, _, _ = self._request("/accept", {"identity": self.finding.identity})
