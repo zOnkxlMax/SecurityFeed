@@ -292,6 +292,15 @@ def parse_date(raw: str | None) -> datetime | None:
         return None
 
 
+def safe_link(raw: str | None) -> str:
+    """Nur http(s)-Adressen, sonst leer. Links kommen aus fremden Feeds (bei
+    Hacker News von beliebigen Nutzern) - ein "javascript:" im href waere XSS,
+    und urllib wuerde auch "file:" oder "ftp:" brav oeffnen."""
+    link = (raw or "").strip()
+    scheme = urllib.parse.urlsplit(link).scheme.lower()
+    return link if scheme in ("http", "https") else ""
+
+
 def fetch(url: str, timeout: float) -> bytes:
     req = urllib.request.Request(url, headers=HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -306,7 +315,7 @@ def parse_rss(root: ET.Element, source: str) -> list[Entry]:
         entries.append(Entry(
             source=source,
             title=title,
-            link=(item.findtext("link") or "").strip(),
+            link=safe_link(item.findtext("link")),
             published=parse_date(item.findtext("pubDate")),
             summary=summary,
             cves=find_cves(title, summary),
@@ -323,7 +332,7 @@ def parse_atom(root: ET.Element, source: str) -> list[Entry]:
         entries.append(Entry(
             source=source,
             title=title,
-            link=(link_el.get("href") if link_el is not None else "") or "",
+            link=safe_link(link_el.get("href") if link_el is not None else ""),
             published=parse_date(
                 item.findtext(f"{ATOM}published") or item.findtext(f"{ATOM}updated")
             ),
@@ -352,7 +361,7 @@ def parse_hn(payload: dict, source: Source) -> list[Entry]:
         entries.append(Entry(
             source=source.label,
             title=title,
-            link=hit.get("url") or discussion,
+            link=safe_link(hit.get("url")) or discussion,
             published=parse_date(hit.get("created_at")),
             summary=summary,
             cves=find_cves(title, story_text),
@@ -1376,9 +1385,9 @@ def render_entry_blocks(entries: list[Entry]) -> str:
         )
         border = "#c81e1e" if (entry.local or entry.affects_local) else "#d0d0d0"
         headline = (
-            f'<a href="{esc(entry.link)}" style="font-size:16px;font-weight:600;'
+            f'<a href="{esc(safe_link(entry.link))}" style="font-size:16px;font-weight:600;'
             f'color:#1a4fa0;text-decoration:none">{esc(entry.title)}</a>'
-            if entry.link else
+            if safe_link(entry.link) else
             f'<div style="font-size:16px;font-weight:600">{esc(entry.title)}</div>'
         )
         blocks.append(
@@ -2575,7 +2584,8 @@ class AcceptanceSite:
             return f'<div class="cves">{tags}</div>' if tags else ""
 
         def headline(item: dict) -> str:
-            title, link = esc(str(item.get("title", ""))), str(item.get("link") or "")
+            # findings.json kann noch Eintraege von vor der Link-Pruefung enthalten.
+            title, link = esc(str(item.get("title", ""))), safe_link(str(item.get("link") or ""))
             if link:
                 return f'<a class="title" href="{esc(link)}" rel="noopener">{title}</a>'
             return f'<div class="title">{title}</div>'
@@ -2776,7 +2786,7 @@ class AcceptanceSite:
                 else:
                     label = WEEKDAYS[day.weekday()] + ", " + day.strftime("%d.%m.%Y")
                 parts.append(f'<h2 class="day">{label}</h2>')
-            title, link = esc(str(item.get("title", ""))), str(item.get("link") or "")
+            title, link = esc(str(item.get("title", ""))), safe_link(str(item.get("link") or ""))
             headline = (f'<a class="title" href="{esc(link)}" rel="noopener">{title}</a>'
                         if link else f'<div class="title">{title}</div>')
             cves = [c for c in item.get("cves", []) if isinstance(c, str)]
@@ -2958,6 +2968,18 @@ footer{margin-top:36px;padding-top:12px;border-top:1px solid var(--line);font-si
 form.accept input[name=comment]{width:100%}}
 """
 
+# Die Seiten kommen ohne Skripte aus; der einzige Inline-Block ist WEB_CSS und
+# wird per Hash erlaubt. Selbst ein durchgerutschtes Markup koennte so nichts
+# ausfuehren und keine fremden Ressourcen nachladen.
+WEB_CSP = "; ".join((
+    "default-src 'none'",
+    "style-src 'sha256-%s'" % base64.b64encode(hashlib.sha256(WEB_CSS.encode("utf-8")).digest()).decode(),
+    "img-src 'self' data:",
+    "form-action 'self'",
+    "base-uri 'none'",
+    "frame-ancestors 'none'",
+))
+
 SHIELD_SVG = ('<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">'
               '<path d="M12 2 4 5v6c0 5 3.4 9.7 8 11 4.6-1.3 8-6 8-11V5l-8-3z" fill="currentColor"/></svg>')
 
@@ -3020,6 +3042,8 @@ class AcceptanceHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", WEB_CSP)
+        self.send_header("X-Frame-Options", "DENY")
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
