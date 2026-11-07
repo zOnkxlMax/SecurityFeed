@@ -1,0 +1,22 @@
+[Unit]
+Description=Paketlisten dieses Servers fuer SecurityFeed ablegen
+Documentation=https://github.com/zOnkxlMax/SecurityFeed
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/securityfeed-agent/securityfeed-agent.sh /var/lib/securityfeed-agent securityfeed-agent
+TimeoutStartSec=300
+
+# Haertung, soweit es mit Docker-Zugriff geht - wie beim Sammelskript.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/securityfeed-agent -/run/docker.sock -/var/run/docker.sock
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true

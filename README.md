@@ -76,6 +76,7 @@ py -3 vulnfeed.py --cve-only --since 3
 | `--local`           | `SECFEED_LOCAL`          | Scan zusätzlich zu den News laufen lassen |
 | `--dpkg-status`     | `SECFEED_DPKG_STATUS`    | Statusdatei lesen statt `dpkg-query` aufzurufen |
 | `--container-lists` | `SECFEED_CONTAINER_LISTS` | Auch die abgelegten Paketlisten der Container prüfen |
+| `--agents-dir`      | `SECFEED_AGENTS_DIR`     | Auch die Berichte anderer Server prüfen, abgeholt von `deploy/fetch-agents.sh` — Einrichtung in [docs/DOCKER.md](docs/DOCKER.md#weitere-server-prüfen) |
 | `--host-os-release` | `SECFEED_HOST_OS_RELEASE` | `/etc/os-release` des Hosts, wenn dessen Paketliste eingehängt ist — daraus kommt die Debian-Version |
 | `--debian-release`  | `SECFEED_DEBIAN_RELEASE` | Debian-Hauptversion erzwingen, z. B. `12` |
 | `--local-remind N`  | `SECFEED_LOCAL_REMIND`   | Unveränderte Funde nach N Tagen erneut melden (Default 7, `0` = nur einmal) |

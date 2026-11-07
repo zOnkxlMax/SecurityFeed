@@ -1,0 +1,23 @@
+[Unit]
+Description=Berichte der SecurityFeed-Agenten auf anderen Servern abholen
+Documentation=https://github.com/zOnkxlMax/SecurityFeed
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/securityfeed/fetch-agents.sh /var/lib/securityfeed/agents
+TimeoutStartSec=300
+
+# Braucht nur das Netz, den Schluessel unter /etc/securityfeed und die Ablage.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/securityfeed
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true

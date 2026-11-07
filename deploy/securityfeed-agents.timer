@@ -1,0 +1,14 @@
+[Unit]
+Description=Berichte der SecurityFeed-Agenten regelmaessig abholen
+Documentation=https://github.com/zOnkxlMax/SecurityFeed
+
+[Timer]
+# Die Agenten erneuern ihren Bericht stuendlich - versetzt abholen, damit
+# meist ein frischer bereitliegt.
+OnCalendar=*-*-* *:30:00
+Persistent=true
+OnBootSec=10min
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

@@ -2531,6 +2531,94 @@ class TestImageStatus(unittest.TestCase):
         self.assertEqual(rows["Hinweis(e) zum Paketscan, z.B. nicht pruefbare Container"], 1)
 
 
+class TestAgents(unittest.TestCase):
+    """Berichte anderer Server: eigene Namen, eigene Identitaeten, und ein
+    alter Bericht faellt auf."""
+
+    DPKG = ("Package: openssl\nStatus: install ok installed\nVersion: 3.0.11-1\n\n"
+            "Package: libssl3\nStatus: install ok installed\nSource: openssl\nVersion: 3.0.11-1\n")
+    APK = "P:zlib\nV:1.3.2-r1\no:zlib\n\n"
+
+    def _write(self, path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = os.path.join(self.tmp.name, "netcup")
+        self._write(os.path.join(base, "host", "status"), self.DPKG)
+        self._write(os.path.join(base, "host", "os-release"), 'ID=debian\nVERSION_ID="13"\n')
+        self._write(os.path.join(base, "containers", "web", "apk-installed"), self.APK)
+        self._write(os.path.join(base, "containers", "web", "os-release"), "ID=alpine\nVERSION_ID=3.24.4\n")
+        self._write(os.path.join(base, "containers", "db", "unsupported"), "keine Paketliste\n")
+        self._write(os.path.join(base, "received"), "")
+        # Ein Server, dessen Bericht keine Paketliste hat, und eine halbe Ablage.
+        self._write(os.path.join(self.tmp.name, "kaputt", "host", "os-release"), "ID=debian\n")
+        os.makedirs(os.path.join(self.tmp.name, ".netcup.neu"))
+
+    def test_targets_carry_the_server(self):
+        targets, skipped, ages = vf.agent_targets(self.tmp.name)
+        labels = sorted(t.label for t in targets)
+        self.assertEqual(labels, ["Container web auf netcup", "Server netcup"])
+        host = next(t for t in targets if not t.name)
+        self.assertEqual((host.server, host.ecosystem), ("netcup", "Debian:13"))
+        self.assertEqual(host.packages[0].name, "openssl")
+        self.assertEqual(sorted(vf.system_label(s.name, s.server) for s in skipped),
+                         ["Container db auf netcup", "Server kaputt"])
+        self.assertEqual(set(ages), {"netcup", "kaputt"}, "halbe Ablagen (.name.neu) zaehlen nicht")
+        self.assertIsNotNone(ages["netcup"])
+        self.assertIsNone(ages["kaputt"], "nie abgeholt")
+
+    def test_identity_differs_from_the_local_container(self):
+        package = vf.Package("zlib", "1.3.2-r1")
+        now = datetime(2026, 11, 7, tzinfo=timezone.utc)
+        here = vf.local_entry(vf.ScanTarget("web", (package,), "Alpine:v3.24"), package, ["CVE-1"], 0, now)
+        there = vf.local_entry(vf.ScanTarget("web", (package,), "Alpine:v3.24", "netcup"),
+                               package, ["CVE-1"], 0, now)
+        self.assertNotEqual(here.identity, there.identity)
+        self.assertEqual(there.source, "Container web auf netcup")
+        self.assertEqual(there.affects_local, ["zlib (web@netcup)"])
+        host = vf.local_entry(vf.ScanTarget("", (package,), "Debian:13", "netcup"),
+                              package, ["CVE-1"], 0, now)
+        self.assertEqual(host.source, "Server netcup")
+        self.assertIn("Beheben auf netcup mit: sudo apt", host.summary)
+
+    def test_unscanned_on_a_server(self):
+        entry = vf.unscanned_entry(vf.SkippedTarget("db", "keine Paketliste", server="netcup"),
+                                   datetime(2026, 11, 7, tzinfo=timezone.utc))
+        self.assertEqual(entry.title, "Container db auf netcup: nicht pruefbar")
+        self.assertIn("netcup/db", entry.identity)
+
+    def test_stale_report(self):
+        entry = vf.stale_agent_entry("netcup", None, datetime(2026, 11, 7, tzinfo=timezone.utc))
+        self.assertIn("nie abgeholt", entry.title)
+        self.assertEqual(entry.source, "Server netcup")
+        self.assertFalse(entry.cves)
+
+    def test_missing_directory_is_reported_not_raised(self):
+        targets, skipped, ages = vf.agent_targets(os.path.join(self.tmp.name, "gibtsnicht"))
+        self.assertEqual((targets, ages), ([], {}))
+        self.assertIn("nicht lesbar", skipped[0].reason)
+
+    def test_notice_counts_other_servers(self):
+        package = vf.Package("zlib", "1")
+        now = datetime(2026, 11, 7, tzinfo=timezone.utc)
+        server = vf.local_entry(vf.ScanTarget("", (package,), "Debian:13", "netcup"), package, ["CVE-1"], 0, now)
+        here = vf.local_entry(vf.ScanTarget("", (package,), "Debian:13"), package, ["CVE-2"], 0, now)
+        rows = dict((label, n) for n, label in vf.notice_counts([server, here]))
+        self.assertEqual(rows["Paket(e) mit bekannten Schwachstellen auf anderen Servern"], 1)
+        self.assertEqual(rows["Paket(e) mit bekannten Schwachstellen auf diesem System"], 1)
+
+    def test_option_from_environment(self):
+        saved = os.environ.pop("SECFEED_AGENTS_DIR", None)
+        self.addCleanup(lambda: os.environ.pop("SECFEED_AGENTS_DIR", None) if saved is None
+                        else os.environ.__setitem__("SECFEED_AGENTS_DIR", saved))
+        os.environ["SECFEED_AGENTS_DIR"] = "/host/agents"
+        self.assertEqual(vf.local_options(vf.build_parser().parse_args([])).agents, "/host/agents")
+
+
 class TestPasswordHash(unittest.TestCase):
     def test_roundtrip(self):
         record = vf.hash_password("ein-langes-passwort", iterations=2000)
