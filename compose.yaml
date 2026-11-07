@@ -39,6 +39,11 @@ services:
       # bekommt bewusst keinen Docker-Socket, der waere faktisch root auf dem Pi.
       SECFEED_CONTAINER_LISTS: ${SECFEED_CONTAINER_LISTS:-}
 
+      # Zusaetzlich die Berichte anderer Server pruefen. Leer = aus. Abgeholt
+      # werden sie auf dem Host von deploy/fetch-agents.sh - Rezept in
+      # docs/DOCKER.md, Abschnitt "Weitere Server pruefen".
+      SECFEED_AGENTS_DIR: ${SECFEED_AGENTS_DIR:-}
+
       # Unveraenderte Funde nach so vielen Tagen erneut melden. Ein verwundbares
       # Paket ist ein Zustand, keine Nachricht - ohne Wiedervorlage verschwaende
       # es nach der ersten Mail. 0 = nur einmal melden.

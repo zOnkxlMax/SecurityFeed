@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import format_datetime, make_msgid, parsedate_to_datetime
@@ -144,6 +144,13 @@ CONTAINER_STAMP_FILE = "updated"            # mtime = letzter Lauf des Skripts
 # nicht mehr gibt. Ein stehengebliebener Timer darf nicht als "alles ruhig"
 # durchgehen - das waere die gefaehrlichste Art, falsch zu liegen.
 CONTAINER_STAMP_MAX_AGE = timedelta(hours=48)
+
+# Berichte anderer Server, vom Pi per deploy/fetch-agents.sh abgeholt. Je
+# Server ein Unterverzeichnis mit derselben Ablage wie hier: host/ fuer den
+# Server selbst, containers/ wie vom Dump-Skript.
+AGENT_HOST_DIR = "host"
+AGENT_CONTAINERS_DIR = "containers"
+AGENT_RECEIVED_FILE = "received"   # mtime = letzte erfolgreiche Abholung
 
 # /etc/debian_version nennt nur den Codenamen, OSV will die Nummer.
 CODENAME_RELEASES = {
@@ -413,6 +420,7 @@ class LocalOptions:
     release: str | None = None      # Debian-Hauptversion, z.B. "12"
     unfixed: bool = False           # auch Luecken ohne verfuegbaren Fix melden
     containers: str | None = None   # Verzeichnis mit Container-Paketlisten
+    agents: str | None = None       # Verzeichnis mit Berichten anderer Server
     remind_days: float = LOCAL_REMIND_DAYS  # unveraenderte Funde nach so vielen Tagen erneut
     # /etc/os-release des Hosts, wenn dessen Paketliste eingehaengt ist. Ohne
     # sie kaeme die Version aus dem Container-Image - und ein Vergleich gegen
@@ -429,21 +437,45 @@ class Package:
     binaries: tuple[str, ...] = ()
 
 
+def system_label(name: str, server: str) -> str:
+    """Wie ein System in Mail und Seite heisst."""
+    if server:
+        return f"Container {name} auf {server}" if name else f"Server {server}"
+    return f"Container {name}" if name else "Lokales System"
+
+
+def system_key(name: str, server: str) -> str:
+    """Teil der Identitaet eines Funds. Ein gleichnamiger Container auf einem
+    anderen Server ist ein anderes Problem und darf nicht mit dem hiesigen
+    zusammenfallen - auch nicht in den Akzeptanzen."""
+    base = name or "host"
+    return f"{server}/{base}" if server else base
+
+
 @dataclass(frozen=True)
 class ScanTarget:
-    """Ein zu pruefendes System: der Host oder einer der Container."""
+    """Ein zu pruefendes System: der Host oder einer der Container - hier
+    oder auf einem anderen Server, dessen Bericht abgeholt wurde."""
     name: str  # "" = Host, sonst der Containername
     packages: tuple[Package, ...] = ()
     ecosystem: str = ""  # OSV-Oekosystem, z.B. "Debian:12" oder "Alpine:v3.21"
+    server: str = ""     # "" = dieser Rechner, sonst der Agent-Name
 
     @property
     def label(self) -> str:
         """Was in der Mail als Quelle des Eintrags steht."""
-        return f"Container {self.name}" if self.name else "Lokales System"
+        return system_label(self.name, self.server)
+
+    @property
+    def key(self) -> str:
+        return system_key(self.name, self.server)
 
     def qualify(self, package: str) -> str:
         """Paketname mit Herkunft - 'openssl' steckt auf dem Pi und in drei
         Containern, und das ist nicht dasselbe Problem."""
+        if self.server:
+            where = f"{self.name}@{self.server}" if self.name else self.server
+            return f"{package} ({where})"
         return f"{package} ({self.name})" if self.name else package
 
 
@@ -483,6 +515,7 @@ class SkippedTarget:
     name: str
     reason: str
     image: ImageStatus | None = None
+    server: str = ""
 
 
 # ${source:Version} faellt automatisch auf die Binaerversion zurueck, wenn das
@@ -806,6 +839,61 @@ def container_targets(directory: str) -> tuple[list[ScanTarget], list[SkippedTar
     return targets, skipped
 
 
+def agent_targets(directory: str) -> tuple[list[ScanTarget], list[SkippedTarget],
+                                           dict[str, timedelta | None]]:
+    """Die abgeholten Berichte anderer Server: je Server der Host und seine
+    Container, dazu das Alter der letzten Abholung."""
+    try:
+        names = sorted(item for item in os.listdir(directory)
+                       if os.path.isdir(os.path.join(directory, item))
+                       and not item.startswith("."))
+    except OSError as exc:
+        return [], [SkippedTarget("", f"Ablage der Agenten nicht lesbar ({directory}): {exc}")], {}
+
+    targets: list[ScanTarget] = []
+    skipped: list[SkippedTarget] = []
+    ages: dict[str, timedelta | None] = {}
+    for server in names:
+        base = os.path.join(directory, server)
+        ages[server] = file_age(os.path.join(base, AGENT_RECEIVED_FILE))
+        host = read_container_list(base, AGENT_HOST_DIR)
+        # read_container_list nennt das Ziel nach dem Verzeichnis - hier ist
+        # es der Server selbst, also ohne Containernamen.
+        (targets if isinstance(host, ScanTarget) else skipped).append(
+            replace(host, name="", server=server))
+        containers = os.path.join(base, AGENT_CONTAINERS_DIR)
+        if os.path.isdir(containers):
+            found, missed = container_targets(containers)
+            targets.extend(replace(t, server=server) for t in found)
+            skipped.extend(replace(t, server=server) for t in missed)
+    return targets, skipped, ages
+
+
+def stale_agent_entry(server: str, age: timedelta | None, now: datetime) -> Entry:
+    alter = "nie abgeholt" if age is None else f"{int(age.total_seconds() // 3600)} Stunden alt"
+    return Entry(
+        source=f"Server {server}",
+        title=f"Bericht von {server} veraltet ({alter})",
+        link="",
+        published=now,
+        summary=f"Der Bericht des Agenten auf {server} wurde nicht mehr abgeholt - "
+                "die Funde dieses Servers beschreiben einen alten Stand. Pruefen auf "
+                "diesem Rechner: systemctl status securityfeed-agents.service, "
+                f"auf {server}: systemctl status securityfeed-agent.timer",
+        advisory=True,
+        local=True,
+        key=f"local:agent:{server}:veraltet:{now.date().isoformat()}",
+    )
+
+
+def file_age(path: str) -> timedelta | None:
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        return None
+    return datetime.now(timezone.utc) - datetime.fromtimestamp(stamp, timezone.utc)
+
+
 def container_list_age(directory: str) -> timedelta | None:
     """Wie alt der letzte Lauf des Dump-Skripts ist. None = kein Zeitstempel."""
     try:
@@ -935,11 +1023,13 @@ def local_entry(target: ScanTarget, package: Package, cves: list[str], unfixed: 
     if fixable and not truncated:
         update = "sudo apt update && sudo apt install --only-upgrade " + " ".join(binaries[:6])
         # Im Container hilft kein apt auf dem Host - dort ist das Image dran.
-        summary += (
-            f" Beheben ueber ein neues Image: das Basisimage von '{target.name}' "
-            "aktualisieren und neu bauen."
-            if target.name else f" Beheben mit: {update}"
-        )
+        if target.name:
+            summary += (f" Beheben ueber ein neues Image: das Basisimage von '{target.name}' "
+                        "aktualisieren und neu bauen.")
+        elif target.server:
+            summary += f" Beheben auf {target.server} mit: {update}"
+        else:
+            summary += f" Beheben mit: {update}"
 
     # Der Link zeigt fuer ein Paket immer auf dieselbe Tracker-Seite. Ohne
     # Ziel, Anzahl und juengste CVE in der Identitaet bliebe jede spaeter dazu
@@ -947,7 +1037,7 @@ def local_entry(target: ScanTarget, package: Package, cves: list[str], unfixed: 
     # Container waere derselbe Eintrag. Das Fenster kommt nur in den
     # Zustandsschluessel: es sorgt dafuer, dass ein ungepatchter Fund
     # wiederkommt statt zu verschwinden.
-    identity = (f"local:{target.name or 'host'}:{package.name}:{len(cves)}:"
+    identity = (f"local:{target.key}:{package.name}:{len(cves)}:"
                 f"{max(cves) if cves else package.version}")
     return Entry(
         source=target.label,
@@ -970,11 +1060,11 @@ def unscanned_entry(skipped: SkippedTarget, now: datetime,
                     window: str = "einmalig") -> Entry:
     """Ein Ziel, das sich nicht pruefen liess. Ohne diesen Eintrag saehe ein
     unpruefbarer Container aus wie ein unauffaelliger."""
-    what = f"Container {skipped.name}" if skipped.name else "Lokales System"
+    what = system_label(skipped.name, skipped.server)
     # Ein blinder Fleck bleibt einer, bis sich etwas aendert - deshalb
     # dieselbe Wiedervorlage wie bei den Funden. Und er laesst sich akzeptieren:
     # ein distroless-Container ohne Paketdatenbank ist eine bewusste Wahl.
-    identity = f"local:{skipped.name or 'host'}:ungeprueft:{skipped.reason}"
+    identity = f"local:{system_key(skipped.name, skipped.server)}:ungeprueft:{skipped.reason}"
     title = f"{what}: nicht pruefbar"
     summary = (f"{skipped.reason}. Dieses System steckt in keiner der obigen "
                "Bewertungen - es wurde nicht geprueft, nicht fuer unauffaellig "
@@ -1064,6 +1154,10 @@ def gather_targets(opts: LocalOptions, timeout: float
         found, missed = container_targets(opts.containers)
         targets.extend(found)
         skipped.extend(missed)
+    if opts.agents:
+        found, missed, _ = agent_targets(opts.agents)
+        targets.extend(found)
+        skipped.extend(missed)
     return targets, skipped, host_error
 
 
@@ -1073,7 +1167,7 @@ def scan_local(opts: LocalOptions, timeout: float) -> tuple[list[Entry], str | N
     targets, skipped, host_error = gather_targets(opts, timeout)
     if not targets:
         reasons = [f"Host: {host_error}"] if host_error else []
-        reasons += [f"{s.name or 'Host'}: {s.reason}" for s in skipped]
+        reasons += [f"{system_label(s.name, s.server)}: {s.reason}" for s in skipped]
         raise LocalScanError("Kein pruefbares System gefunden. " + "; ".join(reasons))
 
     # Je Paket zwei Abfragen: die echte Version und der Sentinel. Was beide
@@ -1098,6 +1192,11 @@ def scan_local(opts: LocalOptions, timeout: float) -> tuple[list[Entry], str | N
         age = container_list_age(opts.containers)
         if age is None or age > CONTAINER_STAMP_MAX_AGE:
             entries.append(stale_lists_entry(age, opts.containers, now))
+    if opts.agents:
+        _, _, ages = agent_targets(opts.agents)
+        for server, age in ages.items():
+            if age is None or age > CONTAINER_STAMP_MAX_AGE:
+                entries.append(stale_agent_entry(server, age, now))
 
     position = 0
     for target in targets:
@@ -1586,12 +1685,14 @@ def notice_counts(entries: list[Entry]) -> list[tuple[int, str]]:
     """Was die Kurz-Mail vom Paketscan nur zaehlt, statt es aufzulisten.
     Nur Zeilen mit Treffern."""
     findings = [e for e in entries if e.local and e.cves]
-    host = [e for e in findings if not e.source.startswith("Container ")]
+    host = [e for e in findings if e.source == "Lokales System"]
+    servers = [e for e in findings if e.source.startswith("Server ")]
     containers = [e for e in findings if e.source.startswith("Container ")]
     notes = [e for e in entries if e.local and not e.cves]
     newer = [e for e in notes if e.title.endswith(NEWER_IMAGE_SUFFIX)]
     rows = [
         (len(host), "Paket(e) mit bekannten Schwachstellen auf diesem System"),
+        (len(servers), "Paket(e) mit bekannten Schwachstellen auf anderen Servern"),
         (len(containers), "Paket(e) mit bekannten Schwachstellen in Containern"),
         (len(newer), "nicht pruefbare(r) Container mit neuerem Image in der Registry"),
         (len(notes) - len(newer), "Hinweis(e) zum Paketscan, z.B. nicht pruefbare Container"),
@@ -1838,6 +1939,11 @@ def build_parser() -> argparse.ArgumentParser:
                            "pruefen, je Container ein Unterverzeichnis. Befuellt wird "
                            "das Verzeichnis auf dem Host von "
                            "deploy/dump-container-packages.sh (SECFEED_CONTAINER_LISTS).")
+    scan.add_argument("--agents-dir", metavar="VERZEICHNIS",
+                      help="Zusaetzlich die Berichte anderer Server pruefen, je Server "
+                           "ein Unterverzeichnis. Abgeholt werden sie auf dem Host von "
+                           "deploy/fetch-agents.sh, erzeugt auf dem Server von "
+                           "deploy/agent/securityfeed-agent.sh (SECFEED_AGENTS_DIR).")
     scan.add_argument("--debian-release", metavar="N",
                       help="Debian-Hauptversion erzwingen, z.B. 12, falls sie sich nicht "
                            "aus /etc/os-release ergibt (SECFEED_DEBIAN_RELEASE).")
@@ -1960,6 +2066,7 @@ def local_options(args: argparse.Namespace) -> LocalOptions:
         release=pick(args.debian_release, "SECFEED_DEBIAN_RELEASE"),
         unfixed=args.local_unfixed or env_flag("SECFEED_LOCAL_UNFIXED"),
         containers=pick(args.container_lists, "SECFEED_CONTAINER_LISTS"),
+        agents=pick(args.agents_dir, "SECFEED_AGENTS_DIR"),
         remind_days=remind,
         host_os_release=pick(args.host_os_release, "SECFEED_HOST_OS_RELEASE"),
     )

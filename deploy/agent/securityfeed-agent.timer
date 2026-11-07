@@ -1,0 +1,12 @@
+[Unit]
+Description=Bericht fuer SecurityFeed regelmaessig erneuern
+Documentation=https://github.com/zOnkxlMax/SecurityFeed
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+OnBootSec=5min
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

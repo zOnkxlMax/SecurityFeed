@@ -348,13 +348,65 @@ jobs:
           test ! -d /tmp/ci-container-lists/ci-alpine
           test ! -d /tmp/ci-container-lists/ci-busybox
 
+      - name: Agent-Bericht erzeugen und einspielen
+        # Der Agent fuer weitere Server und die Abholseite, ohne SSH: Bericht
+        # erzeugen, ueber den Pruefpfad von fetch-agents.sh einspielen, und
+        # manipulierte Berichte muessen abgewiesen werden, ohne Spuren.
+        run: |
+          docker run -d --name ci-agent-alpine alpine:3 sleep 300
+          sudo groupadd -f securityfeed-agent
+          sudo sh deploy/agent/securityfeed-agent.sh /tmp/ci-agent-out securityfeed-agent
+          test "$(sudo stat -c %a /tmp/ci-agent-out/report.tar.gz)" = "640"
+          sudo tar -tzf /tmp/ci-agent-out/report.tar.gz | head -20
+
+          sudo sh deploy/fetch-agents.sh --ingest ci /tmp/ci-agent-out/report.tar.gz /tmp/ci-agents "$(id -u):$(id -g)"
+          test -s /tmp/ci-agents/ci/host/status
+          grep -q "^ID=" /tmp/ci-agents/ci/host/os-release
+          test -s /tmp/ci-agents/ci/containers/ci-agent-alpine/apk-installed
+          test -f /tmp/ci-agents/ci/received
+          test "$(stat -c %a /tmp/ci-agents/ci)" = "750"
+          test "$(stat -c %a /tmp/ci-agents/ci/host/status)" = "640"
+
+          # Der Scanner liest die Ablage und benennt die Ziele nach dem Server.
+          python3 - <<'ENDE'
+          import vulnfeed as vf
+          targets, skipped, ages = vf.agent_targets("/tmp/ci-agents")
+          labels = {t.label for t in targets} | {vf.system_label(s.name, s.server) for s in skipped}
+          print(sorted(labels))
+          assert "Container ci-agent-alpine auf ci" in labels, labels
+          assert "Server ci" in labels, labels
+          assert ages["ci"] is not None
+          ENDE
+
+          # Manipulierte Berichte: Pfad nach draussen, Link, fremde Datei, Muell.
+          mkdir -p /tmp/mal/a/host /tmp/mal/b/host /tmp/mal/c/host
+          echo x > /tmp/mal/a/host/status
+          tar -czf /tmp/mal/traversal.tar.gz -C /tmp/mal/a --transform 's|^\./host/status|../../tmp/ci-evil|' ./host/status
+          ln -s /etc/shadow /tmp/mal/b/host/status
+          tar -czf /tmp/mal/link.tar.gz -C /tmp/mal/b .
+          echo x > /tmp/mal/c/host/status; echo x > /tmp/mal/c/host/extra.sh
+          tar -czf /tmp/mal/extra.tar.gz -C /tmp/mal/c .
+          head -c 1000 /dev/urandom > /tmp/mal/garbage.tar.gz
+          for f in traversal link extra garbage; do
+            if sudo sh deploy/fetch-agents.sh --ingest evil /tmp/mal/$f.tar.gz /tmp/ci-agents "$(id -u):$(id -g)"; then
+              echo "$f wurde angenommen"; exit 1
+            fi
+          done
+          if sudo sh deploy/fetch-agents.sh --ingest "../x" /tmp/ci-agent-out/report.tar.gz /tmp/ci-agents; then
+            echo "boeser Name angenommen"; exit 1
+          fi
+          test ! -e /tmp/ci-evil
+          test ! -e /tmp/ci-agents/evil
+          test "$(ls -A /tmp/ci-agents)" = "ci"
+
       - name: Aufräumen
         # Muss auch nach einem Fehlschlag laufen, sonst sammeln sich auf einem
         # self-hosted Runner Container, Volumes und Images an.
         if: always()
         run: |
           docker compose down -v --remove-orphans || true
-          docker rm -f sf-sched ci-alpine ci-busybox 2>/dev/null || true
+          docker rm -f sf-sched ci-alpine ci-busybox ci-agent-alpine 2>/dev/null || true
+          sudo rm -rf /tmp/ci-agent-out /tmp/ci-agents /tmp/mal /tmp/ci-evil
           sudo rm -rf /tmp/ci-container-lists
           rm -f .env
 

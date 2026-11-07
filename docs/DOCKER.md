@@ -424,6 +424,88 @@ Zwei Dinge, die das Verfahren bewusst anders macht als ein stiller Scanner:
   Stunden „Container-Paketlisten veraltet" in der Mail, statt einen alten Stand
   als aktuell auszugeben.
 
+### Weitere Server prüfen
+
+Andere Rechner — ein VPS, ein zweiter Pi — prüft SecurityFeed über einen
+kleinen Agenten. Er sammelt dort die Paketlisten des Servers und seiner
+Container, genau wie das Sammelskript hier, und legt sie als Bericht ab. Der
+Rechner mit SecurityFeed **holt** den Bericht per SSH ab; der Server schickt
+nichts los.
+
+Die Richtung ist Absicht. Ein Server im Internet soll nicht ins Heimnetz
+dürfen, und eine Tailnet-Richtlinie, die das verbietet, bleibt so, wie sie
+ist. Umgekehrt bekommt SecurityFeed auf dem Server keinen Zugang: Sein
+Schlüssel darf dort genau einen Befehl — den Bericht ausgeben. Was er sonst
+verlangt, wird ignoriert; Terminal und Weiterleitungen sind gesperrt
+(`command="…",restrict` in `authorized_keys`). Und was zurückkommt, wird wie
+fremde Daten behandelt: nur bekannte Dateinamen, keine Links, keine Pfade
+nach draußen, höchstens 50 MiB — sonst wird der ganze Bericht verworfen.
+
+**1. Schlüssel auf dem Rechner mit SecurityFeed erzeugen:**
+
+```bash
+sudo install -d -m 0700 /etc/securityfeed
+sudo ssh-keygen -t ed25519 -N "" -C "securityfeed@$(hostname)" -f /etc/securityfeed/agent_key
+```
+
+**2. Agent auf dem Server einrichten** — `deploy/agent/` und
+`deploy/dump-container-packages.sh` dorthin kopieren, dazu den öffentlichen
+Schlüssel, dann einmal als root:
+
+```bash
+sudo sh agent/install-agent.sh agent_key.pub
+```
+
+Das legt den Benutzer `securityfeed-agent` an (kein Passwort, nur dieser
+Schlüssel), installiert Agent und Timer (stündlich) und erzeugt den ersten
+Bericht unter `/var/lib/securityfeed-agent/report.tar.gz`. Der Agent läuft als
+root, weil er Docker fragen muss; die systemd-Unit härtet ihn wie das
+Sammelskript.
+
+**3. Server eintragen** — Name (a-z, 0-9, -), Ziel, optional Port:
+
+```bash
+echo "netcup securityfeed-agent@203.0.113.10" | sudo tee /etc/securityfeed/agents
+```
+
+Den Host-Schlüssel des Servers hinterlegen und dabei mit dem
+Fingerabdruck vergleichen, den du auf dem Server mit `ssh-keygen -lf
+/etc/ssh/ssh_host_ed25519_key.pub` siehst — ohne passenden Eintrag holt das
+Skript nichts ab:
+
+```bash
+ssh-keyscan -t ed25519 203.0.113.10 | sudo tee /etc/securityfeed/agent_known_hosts | ssh-keygen -lf -
+```
+
+**4. Abholen einrichten und einhängen:**
+
+```bash
+sudo install -m 0755 deploy/fetch-agents.sh /opt/securityfeed/
+sudo install -m 0644 deploy/securityfeed-agents.service deploy/securityfeed-agents.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now securityfeed-agents.timer
+sudo systemctl start securityfeed-agents.service && ls /var/lib/securityfeed/agents
+```
+
+In die `compose.override.yaml` zum Scanner-Dienst:
+
+```yaml
+      - /var/lib/securityfeed/agents:/host/agents:ro
+```
+
+und in die `.env`:
+
+```bash
+SECFEED_AGENTS_DIR=/host/agents
+```
+
+Dann `docker compose up -d`. Die Funde heißen danach „Server netcup" oder
+„Container web auf netcup", mit eigener Identität: ein Container `web` hier
+und einer auf netcup sind zwei Probleme, auch beim Akzeptieren. Wird ein
+Bericht 48 Stunden lang nicht abgeholt, steht „Bericht von netcup veraltet" in
+der Mail. Ein Server, der aus `/etc/securityfeed/agents` verschwindet,
+verschwindet beim nächsten Abholen auch aus der Ablage.
+
 ## Funde im Browser akzeptieren
 
 Die Mail meldet einen Fund — und wiederholt ihn wöchentlich, solange er
